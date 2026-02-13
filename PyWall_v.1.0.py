@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.0 - Professional Windows Firewall Management Suite
+PyWall v1.0 - Professional Windows Firewall Management Suite
 =================================================================
 A comprehensive, standalone Windows firewall management tool that
 takes full control of Windows Firewall, providing application-level
