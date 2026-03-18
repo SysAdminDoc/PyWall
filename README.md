@@ -18,9 +18,6 @@
 
 ---
 
-
-![Screenshot](screenshot.png)
-
 ## What Is This
 
 PyWall is a desktop application that sits between you and Windows Firewall. It monitors every network connection in real time, shows you exactly what's talking to the internet, and lets you create or manage firewall rules without ever opening `wf.msc`.
