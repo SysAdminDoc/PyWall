@@ -1,0 +1,5 @@
+psutil
+PyQt5
+PyQt6
+requests
+urllib.request
