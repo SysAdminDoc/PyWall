@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.2 - Windows Firewall & Network Command Center
+PyWall v4.1.3 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.2"
+APP_VERSION = "4.1.3"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -1304,9 +1304,12 @@ class HeadlessMonitor(QObject):
         self._last_status = "starting"
         self._last_connection_count = 0
         self._started = time.time()
+        self._config_mtime = None
+        self._last_config_reload = ""
 
     def start(self):
         _service_log(f"Headless monitor starting; auto_block={self.auto_block}")
+        self._reload_config_if_changed(force=True)
         self._dns_w.start(); self._who_w.start(); self._geo_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
         self._dns_mon.blocked_event.connect(self._on_dns_blocked)
@@ -1363,12 +1366,53 @@ class HeadlessMonitor(QObject):
             "auto_blocked_ips": len(self._blocked_ips),
             "threats": threats.get_stats(),
             "pipe": IPC_PIPE_NAME,
+            "config_path": CONFIG_PATH,
+            "last_config_reload": self._last_config_reload,
         }
+
+    def _reload_config_if_changed(self, force=False):
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH)
+        except FileNotFoundError:
+            if force:
+                self._config_mtime = None
+                self._last_config_reload = "missing"
+            return
+        except Exception as e:
+            _service_log(f"Config stat failed: {e}", "WARNING")
+            return
+        if not force and self._config_mtime == mtime:
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if not isinstance(cfg, dict):
+                raise ValueError("config root must be an object")
+        except Exception as e:
+            _service_log(f"Config reload failed: {e}", "WARNING")
+            self._config_mtime = mtime
+            self._last_config_reload = f"failed: {datetime.datetime.now().isoformat(timespec='seconds')}"
+            return
+        old_auto = self.auto_block
+        old_poll = self.poll_seconds
+        if "service_auto_block" in cfg:
+            self.auto_block = bool(cfg.get("service_auto_block"))
+        elif "threat_auto_block" in cfg:
+            self.auto_block = bool(cfg.get("threat_auto_block"))
+        if "service_poll_seconds" in cfg:
+            try: self.poll_seconds = max(float(cfg.get("service_poll_seconds")), 1.0)
+            except: pass
+        if self._timer.isActive() and self.poll_seconds != old_poll:
+            self._timer.setInterval(int(self.poll_seconds * 1000))
+        self._config_mtime = mtime
+        self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
 
     def _tick(self):
+        self._reload_config_if_changed()
         self._enforce_threats()
         now = time.time()
         if now - self._last_summary >= 60:
@@ -2452,7 +2496,8 @@ class ToolsTab(QWidget):
         s=resp.get("status",{})
         mins=int(s.get("uptime_sec",0))//60
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
-             f"live {s.get('live_connections',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)}")
+             f"live {s.get('live_connections',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
+             f"config {s.get('last_config_reload','')}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):

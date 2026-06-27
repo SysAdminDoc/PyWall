@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.2-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.2"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.3-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.3"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -131,7 +131,7 @@ If PyWall is terminated while monitoring, it auto-resumes on next launch.
 
 ## Service Mode
 
-PyWall can run its DNS, connection, event-log, history, enrichment, and high-severity threat auto-blocking monitors without opening the GUI. The GUI can query a running service through the local pywin32 named pipe `\\.\pipe\PyWallService`.
+PyWall can run its DNS, connection, event-log, history, enrichment, and high-severity threat auto-blocking monitors without opening the GUI. The GUI can query a running service through the local pywin32 named pipe `\\.\pipe\PyWallService`, and the service reloads supported `config.json` changes while running.
 
 ```bash
 python PyWall.py service-run
@@ -160,6 +160,8 @@ Settings live in `%APPDATA%/PyWall/config.json`. Key options:
 | `start_monitoring` | `false` | Auto-start monitor on launch |
 | `history_days` | `30` | Connection history retention |
 | `threat_auto_block` | `false` | Auto-block detected threats |
+| `service_auto_block` | `true` | Override service-mode high-severity auto-blocking without restart |
+| `service_poll_seconds` | `2` | Override service-mode monitor/config polling interval without restart |
 | `auto_block_inbound` | `true` | Block unsolicited inbound connections |
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
@@ -222,7 +224,7 @@ plugins/        User and example plugin scripts
 | `RuleScheduler` | Cron-like rule enable/disable scheduling |
 | `NetworkProfileManager` | Auto-switching between Domain/Private/Public |
 | `PluginManager` | Dynamic plugin loading and event dispatch |
-| `HeadlessMonitor` | Service-mode DNS, connection, event, history, IPC, and threat auto-block loop |
+| `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
 | `MainWindow` | PyQt5 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
@@ -234,7 +236,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Headless config reload** -- detect config file changes while the service is running
+- **Crash/reboot resume** -- restore service monitoring state after service restart or reboot
 - **Per-connection byte tracking** -- integrate `psutil` process IO counters
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support

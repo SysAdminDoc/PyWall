@@ -30,7 +30,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.2"])
+        self.assertEqual(versions, ["4.1.3"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -39,6 +39,9 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("--no-auto-block", TEXT)
         self.assertIn("IPC_PIPE_NAME", TEXT)
         self.assertIn("Refresh Service Status", TEXT)
+        self.assertIn("_reload_config_if_changed", TEXT)
+        self.assertIn("service_auto_block", TEXT)
+        self.assertIn("service_poll_seconds", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())
