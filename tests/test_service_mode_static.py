@@ -14,9 +14,11 @@ class ServiceModeStaticTests(unittest.TestCase):
         classes = {node.name for node in TREE.body if isinstance(node, ast.ClassDef)}
         funcs = {node.name for node in TREE.body if isinstance(node, ast.FunctionDef)}
         self.assertIn("HeadlessMonitor", classes)
+        self.assertIn("ServiceIPCServer", classes)
         self.assertIn("run_headless_service", funcs)
         self.assertIn("_dispatch_cli", funcs)
         self.assertIn("_build_cli_parser", funcs)
+        self.assertIn("_service_ipc_request", funcs)
 
     def test_version_is_current_delivery(self):
         versions = [
@@ -28,13 +30,15 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.1"])
+        self.assertEqual(versions, ["4.1.2"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
             self.assertIn(f'"{action}"', TEXT)
         self.assertIn("service-run", TEXT)
         self.assertIn("--no-auto-block", TEXT)
+        self.assertIn("IPC_PIPE_NAME", TEXT)
+        self.assertIn("Refresh Service Status", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())

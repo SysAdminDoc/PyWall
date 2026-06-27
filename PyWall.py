@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.1 - Windows Firewall & Network Command Center
+PyWall v4.1.2 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -9,7 +9,7 @@ multiprocessing.freeze_support()
 
 import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io
 import tempfile, webbrowser, socket, datetime, ipaddress, logging
-import argparse, signal
+import argparse, signal, hmac, secrets
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.1.2"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -148,7 +148,12 @@ os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True)
 SERVICE_NAME = "PyWallService"
 SERVICE_DISPLAY_NAME = "PyWall Background Service"
 SERVICE_DESCRIPTION = "Headless PyWall connection monitor and threat auto-blocker."
-SERVICE_LOG_PATH = os.path.join(CONFIG_DIR, "service.log")
+SERVICE_STATE_DIR = os.path.join(os.environ.get("PROGRAMDATA", CONFIG_DIR), APP_NAME) if sys.platform == "win32" else CONFIG_DIR
+try: os.makedirs(SERVICE_STATE_DIR, exist_ok=True)
+except: SERVICE_STATE_DIR = CONFIG_DIR
+SERVICE_LOG_PATH = os.path.join(SERVICE_STATE_DIR, "service.log")
+IPC_PIPE_NAME = r"\\.\pipe\PyWallService"
+IPC_TOKEN_PATH = os.path.join(SERVICE_STATE_DIR, "service.token")
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -158,9 +163,9 @@ def _service_log(msg, level="INFO"):
     getattr(log, level.lower(), log.info)(msg)
 
 try:
-    import win32serviceutil, win32service, servicemanager
+    import win32serviceutil, win32service, servicemanager, win32pipe, win32file, pywintypes
 except ImportError:
-    win32serviceutil = win32service = servicemanager = None
+    win32serviceutil = win32service = servicemanager = win32pipe = win32file = pywintypes = None
 
 if win32serviceutil is not None:
     class PyWallWindowsService(win32serviceutil.ServiceFramework):
@@ -1149,6 +1154,134 @@ class RuleScanWorker(QThread):
         except Exception as e:
             log.warning(f"RuleScanWorker error: {e}"); s.ready.emit([])
 
+def _get_ipc_token(create=False):
+    try:
+        if os.path.exists(IPC_TOKEN_PATH):
+            with open(IPC_TOKEN_PATH, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+                if token: return token
+        if not create: return ""
+        os.makedirs(os.path.dirname(IPC_TOKEN_PATH), exist_ok=True)
+        token = secrets.token_urlsafe(32)
+        with open(IPC_TOKEN_PATH, "w", encoding="utf-8") as f:
+            f.write(token)
+        return token
+    except Exception as e:
+        _service_log(f"IPC token unavailable: {e}", "ERROR")
+        return ""
+
+def _service_ipc_request(command="status", payload=None, timeout=2.0):
+    if sys.platform != "win32" or win32file is None or win32pipe is None:
+        return {"ok": False, "error": "Named-pipe IPC requires pywin32 on Windows"}
+    token = _get_ipc_token(create=False)
+    if not token:
+        return {"ok": False, "error": "Service token not found"}
+    request = json.dumps({"token": token, "command": command, "payload": payload or {}}).encode("utf-8")
+    deadline = time.time() + max(timeout, 0.1)
+    handle = None
+    while time.time() < deadline:
+        try:
+            handle = win32file.CreateFile(
+                IPC_PIPE_NAME,
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0, None, win32file.OPEN_EXISTING, 0, None)
+            break
+        except pywintypes.error as e:
+            if getattr(e, "winerror", None) in (2, 231):
+                time.sleep(0.05); continue
+            return {"ok": False, "error": str(e)}
+    if handle is None:
+        return {"ok": False, "error": "Service pipe unavailable"}
+    try:
+        try: win32pipe.SetNamedPipeHandleState(handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
+        except: pass
+        win32file.WriteFile(handle, request)
+        parts = []
+        while True:
+            try:
+                _, data = win32file.ReadFile(handle, 65536)
+                parts.append(data)
+                if data.endswith(b"\n"): break
+            except pywintypes.error as e:
+                if getattr(e, "winerror", None) == 109: break
+                raise
+        raw = b"".join(parts).decode("utf-8", errors="replace").strip()
+        return json.loads(raw) if raw else {"ok": False, "error": "Empty IPC response"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        try: win32file.CloseHandle(handle)
+        except: pass
+
+class ServiceIPCServer:
+    def __init__(self, monitor):
+        self.monitor = monitor
+        self._stop = TEvent()
+        self._thread = None
+        self._token = ""
+
+    def start(self):
+        if sys.platform != "win32" or win32pipe is None or win32file is None:
+            _service_log("Named-pipe IPC disabled; pywin32 pipe modules unavailable", "WARNING")
+            return
+        self._token = _get_ipc_token(create=True)
+        if not self._token:
+            _service_log("Named-pipe IPC disabled; token could not be created", "ERROR")
+            return
+        self._thread = threading.Thread(target=self._run, name="PyWallServiceIPC", daemon=True)
+        self._thread.start()
+        _service_log(f"Named-pipe IPC listening at {IPC_PIPE_NAME}")
+
+    def stop(self):
+        self._stop.set()
+        try: _service_ipc_request("ping", timeout=0.5)
+        except: pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _run(self):
+        while not self._stop.is_set():
+            pipe = None
+            try:
+                pipe = win32pipe.CreateNamedPipe(
+                    IPC_PIPE_NAME,
+                    win32pipe.PIPE_ACCESS_DUPLEX,
+                    win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+                    5, 65536, 65536, 1000, None)
+                try:
+                    win32pipe.ConnectNamedPipe(pipe, None)
+                except pywintypes.error as e:
+                    if getattr(e, "winerror", None) != 535:
+                        raise
+                if self._stop.is_set(): break
+                _, data = win32file.ReadFile(pipe, 65536)
+                response = self._handle(data)
+                win32file.WriteFile(pipe, (json.dumps(response) + "\n").encode("utf-8"))
+                try: win32pipe.DisconnectNamedPipe(pipe)
+                except: pass
+            except Exception as e:
+                if not self._stop.is_set():
+                    _service_log(f"IPC request failed: {e}", "WARNING")
+                    time.sleep(0.2)
+            finally:
+                if pipe is not None:
+                    try: win32file.CloseHandle(pipe)
+                    except: pass
+
+    def _handle(self, raw):
+        try:
+            req = json.loads(raw.decode("utf-8", errors="replace").strip())
+        except Exception:
+            return {"ok": False, "error": "Invalid JSON"}
+        if not hmac.compare_digest(str(req.get("token", "")), self._token):
+            return {"ok": False, "error": "Unauthorized"}
+        cmd = req.get("command", "status")
+        if cmd == "ping":
+            return {"ok": True, "pong": True}
+        if cmd == "status":
+            return {"ok": True, "status": self.monitor.snapshot()}
+        return {"ok": False, "error": f"Unknown command: {cmd}"}
+
 class HeadlessMonitor(QObject):
     def __init__(self, auto_block=True, poll_seconds=2.0):
         super().__init__()
@@ -1164,9 +1297,13 @@ class HeadlessMonitor(QObject):
         self._conn_w = ConnWorker(self.db)
         self._evt_w = EvtWorker()
         self._timer = QTimer(self)
+        self._ipc = ServiceIPCServer(self)
         self._processed_threats = set()
         self._blocked_ips = set()
         self._last_summary = 0
+        self._last_status = "starting"
+        self._last_connection_count = 0
+        self._started = time.time()
 
     def start(self):
         _service_log(f"Headless monitor starting; auto_block={self.auto_block}")
@@ -1179,12 +1316,14 @@ class HeadlessMonitor(QObject):
         self._conn_w.need_geo.connect(self._geo_w.add)
         self._evt_w.new_block.connect(self._on_fw_blocked)
         self._dns_mon.start(); self._conn_w.start(); self._evt_w.start()
+        self._ipc.start()
         self._timer.timeout.connect(self._tick)
         self._timer.start(int(self.poll_seconds * 1000))
 
     def stop(self):
         _service_log("Headless monitor stopping")
         self._timer.stop()
+        self._ipc.stop()
         for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w):
             try: worker.stop()
             except: pass
@@ -1196,6 +1335,7 @@ class HeadlessMonitor(QObject):
         _service_log("Headless monitor stopped")
 
     def _on_status(self, msg):
+        self._last_status = msg
         _service_log(msg)
 
     def _on_dns_blocked(self, ev):
@@ -1203,9 +1343,27 @@ class HeadlessMonitor(QObject):
         self.db.log_event(domain, "blocked", ev.get("process", ""), "Blocked by hosts file in service mode")
 
     def _on_connections(self, conns):
+        self._last_connection_count = len(conns)
         live = [c for c in conns if c.ra and c.ra != "*" and c.dir != "Listen"]
         if live: self.conn_db.insert_batch(live)
         self._enforce_threats()
+
+    def snapshot(self):
+        stats = self.conn_db.get_stats()
+        return {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "status": self._last_status,
+            "uptime_sec": int(time.time() - self._started),
+            "auto_block": self.auto_block,
+            "live_connections": self._last_connection_count,
+            "history_total": stats["total"],
+            "history_blocked": stats["blocked"],
+            "unique_ips": stats["unique_ips"],
+            "auto_blocked_ips": len(self._blocked_ips),
+            "threats": threats.get_stats(),
+            "pipe": IPC_PIPE_NAME,
+        }
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -2252,6 +2410,13 @@ class ToolsTab(QWidget):
         super().__init__(); self.db=db; self.hm=hm; self._build()
     def _build(self):
         lo=QVBoxLayout(self); lo.setContentsMargins(20,16,20,16); lo.setSpacing(10)
+        # Background service tools
+        g0=QGroupBox("Background Service"); g0l=QHBoxLayout(g0)
+        self.service_lbl=QLabel("Service status unknown")
+        self.service_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;")
+        g0l.addWidget(self.service_lbl,1)
+        g0l.addWidget(_make_toolbar_btn("Refresh Service Status","primary",self._service_status))
+        lo.addWidget(g0)
         # DNS + System tools
         g1=QGroupBox("DNS & System"); g1l=QHBoxLayout(g1)
         g1l.addWidget(_make_toolbar_btn("Flush DNS Cache","primary",self._flush))
@@ -2279,6 +2444,17 @@ class ToolsTab(QWidget):
         bb.addWidget(_make_toolbar_btn("Import to DB Only","dim",self._import_db)); bb.addStretch(); g4l.addLayout(bb); lo.addWidget(g4)
         self.slbl=QLabel(""); self.slbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;"); lo.addWidget(self.slbl)
         lo.addStretch()
+    def _service_status(self):
+        resp=_service_ipc_request("status",timeout=1.5)
+        if not resp.get("ok"):
+            msg=f"Service offline: {resp.get('error','unknown')}"
+            self.service_lbl.setText(msg); self.slbl.setText(msg); return
+        s=resp.get("status",{})
+        mins=int(s.get("uptime_sec",0))//60
+        msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
+             f"live {s.get('live_connections',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)}")
+        self.service_lbl.setText(msg)
+        self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
         if sys.platform=='win32':
             subprocess.run(['ipconfig','/flushdns'],capture_output=True,timeout=10,creationflags=NOWIN)

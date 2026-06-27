@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.1-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.1"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.2-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.2"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -131,7 +131,7 @@ If PyWall is terminated while monitoring, it auto-resumes on next launch.
 
 ## Service Mode
 
-PyWall can run its DNS, connection, event-log, history, enrichment, and high-severity threat auto-blocking monitors without opening the GUI:
+PyWall can run its DNS, connection, event-log, history, enrichment, and high-severity threat auto-blocking monitors without opening the GUI. The GUI can query a running service through the local pywin32 named pipe `\\.\pipe\PyWallService`.
 
 ```bash
 python PyWall.py service-run
@@ -143,7 +143,7 @@ python PyWall.py service stop
 python PyWall.py service remove
 ```
 
-Service logs are written to `%APPDATA%/PyWall/service.log`. High-severity detector hits are blocked in both inbound and outbound directions with `PW_` firewall rules; existing `HG_` rules from older builds remain visible as PyWall-managed rules.
+Service logs and the IPC token are written to `%ProgramData%/PyWall/`. High-severity detector hits are blocked in both inbound and outbound directions with `PW_` firewall rules; existing `HG_` rules from older builds remain visible as PyWall-managed rules.
 
 ---
 
@@ -202,7 +202,8 @@ PyWall.py  (~2,600 lines, single file)
 pywall.db       Domain/feed/log SQLite database
 connections.db  Connection history SQLite database
 config.json     Settings, app profiles, blocklists
-service.log     Background service status and auto-block log
+service.log     Background service status and auto-block log (%ProgramData%/PyWall on Windows)
+service.token   Local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 plugins/        User and example plugin scripts
 ```
 
@@ -221,7 +222,8 @@ plugins/        User and example plugin scripts
 | `RuleScheduler` | Cron-like rule enable/disable scheduling |
 | `NetworkProfileManager` | Auto-switching between Domain/Private/Public |
 | `PluginManager` | Dynamic plugin loading and event dispatch |
-| `HeadlessMonitor` | Service-mode DNS, connection, event, history, and threat auto-block loop |
+| `HeadlessMonitor` | Service-mode DNS, connection, event, history, IPC, and threat auto-block loop |
+| `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
 | `MainWindow` | PyQt5 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
 
@@ -232,7 +234,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Service IPC** -- named pipe or localhost TLS control between service and tray GUI
+- **Headless config reload** -- detect config file changes while the service is running
 - **Per-connection byte tracking** -- integrate `psutil` process IO counters
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
