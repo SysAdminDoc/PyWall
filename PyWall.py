@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.3 - Windows Firewall & Network Command Center
+PyWall v4.1.4 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.3"
+APP_VERSION = "4.1.4"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -154,6 +154,7 @@ except: SERVICE_STATE_DIR = CONFIG_DIR
 SERVICE_LOG_PATH = os.path.join(SERVICE_STATE_DIR, "service.log")
 IPC_PIPE_NAME = r"\\.\pipe\PyWallService"
 IPC_TOKEN_PATH = os.path.join(SERVICE_STATE_DIR, "service.token")
+SERVICE_STATE_PATH = os.path.join(SERVICE_STATE_DIR, "service_state.json")
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -1298,8 +1299,9 @@ class HeadlessMonitor(QObject):
         self._evt_w = EvtWorker()
         self._timer = QTimer(self)
         self._ipc = ServiceIPCServer(self)
+        self._restored_state = self._load_service_state()
         self._processed_threats = set()
-        self._blocked_ips = set()
+        self._blocked_ips = set(self._restored_state.get("auto_blocked_ip_values", []))
         self._last_summary = 0
         self._last_status = "starting"
         self._last_connection_count = 0
@@ -1309,7 +1311,10 @@ class HeadlessMonitor(QObject):
 
     def start(self):
         _service_log(f"Headless monitor starting; auto_block={self.auto_block}")
+        if self._restored_state:
+            _service_log(f"Restored prior service state: saved_at={self._restored_state.get('saved_at','?')}, clean_shutdown={self._restored_state.get('clean_shutdown')}")
         self._reload_config_if_changed(force=True)
+        self._save_service_state(clean_shutdown=False)
         self._dns_w.start(); self._who_w.start(); self._geo_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
         self._dns_mon.blocked_event.connect(self._on_dns_blocked)
@@ -1335,6 +1340,7 @@ class HeadlessMonitor(QObject):
             except: pass
         try: self.conn_db.prune(30)
         except: pass
+        self._save_service_state(clean_shutdown=True)
         _service_log("Headless monitor stopped")
 
     def _on_status(self, msg):
@@ -1368,7 +1374,37 @@ class HeadlessMonitor(QObject):
             "pipe": IPC_PIPE_NAME,
             "config_path": CONFIG_PATH,
             "last_config_reload": self._last_config_reload,
+            "state_path": SERVICE_STATE_PATH,
+            "previous_clean_shutdown": self._restored_state.get("clean_shutdown") if self._restored_state else None,
+            "previous_saved_at": self._restored_state.get("saved_at") if self._restored_state else "",
         }
+
+    def _load_service_state(self):
+        try:
+            if not os.path.exists(SERVICE_STATE_PATH):
+                return {}
+            with open(SERVICE_STATE_PATH, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except Exception as e:
+            _service_log(f"Service state restore failed: {e}", "WARNING")
+            return {}
+
+    def _save_service_state(self, clean_shutdown=False):
+        try:
+            state = self.snapshot()
+            state.update({
+                "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "clean_shutdown": bool(clean_shutdown),
+                "auto_blocked_ip_values": sorted(self._blocked_ips),
+            })
+            tmp = SERVICE_STATE_PATH + ".tmp"
+            os.makedirs(os.path.dirname(SERVICE_STATE_PATH), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, sort_keys=True)
+            os.replace(tmp, SERVICE_STATE_PATH)
+        except Exception as e:
+            _service_log(f"Service state save failed: {e}", "WARNING")
 
     def _reload_config_if_changed(self, force=False):
         try:
@@ -1419,6 +1455,7 @@ class HeadlessMonitor(QObject):
             self._last_summary = now
             stats = self.conn_db.get_stats()
             _service_log(f"Service heartbeat: {stats['total']} connections, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs")
+            self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
         for evt in threats.get_events(100):
@@ -2495,9 +2532,11 @@ class ToolsTab(QWidget):
             self.service_lbl.setText(msg); self.slbl.setText(msg); return
         s=resp.get("status",{})
         mins=int(s.get("uptime_sec",0))//60
+        prev=s.get("previous_clean_shutdown")
+        prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"config {s.get('last_config_reload','')}")
+             f"config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
