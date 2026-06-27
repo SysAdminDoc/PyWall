@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-HostsGuard v2.1.0 — Hosts File Firewall & Network Command Center
+PyWall v4.1.1 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
+import multiprocessing
+multiprocessing.freeze_support()
+
 import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io
 import tempfile, webbrowser, socket, datetime, ipaddress, logging
+import argparse, signal
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -14,7 +18,6 @@ from threading import Lock, Event as TEvent
 import urllib.request, urllib.error
 
 
-# codex-branding:start
 def _branding_icon_path() -> Path:
     candidates = []
     if getattr(sys, "frozen", False):
@@ -29,7 +32,6 @@ def _branding_icon_path() -> Path:
         if candidate.exists():
             return candidate
     return Path("icon.png")
-# codex-branding:end
 
 
 # ─── DPI Awareness ───────────────────────────────────────────────────────────
@@ -44,8 +46,11 @@ if hasattr(sys, 'getwindowsversion'):
 # ─── Bootstrap ───────────────────────────────────────────────────────────────
 NOWIN = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
 
+def _is_frozen():
+    return getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS")
+
 def _kill_remnants():
-    """Kill leftover HostsGuard python/powershell processes from prior runs."""
+    """Kill leftover PyWall python/powershell processes from prior runs."""
     if sys.platform != 'win32': return
     my_pid = os.getpid()
     my_script = os.path.abspath(__file__).lower()
@@ -59,8 +64,8 @@ def _kill_remnants():
                 # Kill python processes running this script
                 if 'python' in name and my_script in cmdline:
                     proc.kill()
-                # Kill orphaned powershell spawned by HostsGuard
-                elif 'powershell' in name and ('hostsguard' in cmdline or 'get-dnsclientcache' in cmdline
+                # Kill orphaned powershell spawned by PyWall.
+                elif 'powershell' in name and (('pywall' in cmdline or 'hostsguard' in cmdline) or 'get-dnsclientcache' in cmdline
                         or 'get-netfirewallrule' in cmdline or 'get-winevent' in cmdline):
                     proc.kill()
             except: continue
@@ -88,15 +93,20 @@ def _bootstrap():
                 if hwnd: ctypes.windll.user32.ShowWindow(hwnd, 0)
             except: pass
             ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, f'"{os.path.abspath(__file__)}"', None, 1)
+                None, "runas", sys.executable,
+                " ".join([f'"{os.path.abspath(__file__)}"'] + [f'"{a}"' for a in sys.argv[1:]]), None, 1)
             os._exit(0)
     # We're admin now — kill remnants from prior crashed runs
     _kill_remnants()
     if sys.version_info < (3, 8):
         print("Python 3.8+ required"); sys.exit(1)
-    for pkg in ['PyQt5', 'psutil']:
-        try: __import__(pkg if pkg == 'psutil' else 'PyQt5')
+    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil')]
+    if sys.platform == 'win32':
+        deps.append(('pywin32', 'win32serviceutil'))
+    for pkg, mod in deps:
+        try: __import__(mod)
         except ImportError:
+            if _is_frozen(): continue
             for f in [[], ['--user'], ['--break-system-packages']]:
                 try:
                     subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'] + f,
@@ -107,24 +117,77 @@ _bootstrap()
 import psutil
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
-from PyQt5.QtGui import *, QIcon
+from PyQt5.QtGui import *
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
-log = logging.getLogger("HostsGuard"); logging.basicConfig(level=logging.WARNING)
+log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
-APP_NAME = "HostsGuard"
-APP_VERSION = "2.1.0"
-FW_PFX = "HG_"  # Firewall rule prefix
+APP_NAME = "PyWall"
+APP_VERSION = "4.1.1"
+FW_PFX = "PW_"  # Firewall rule prefix
+LEGACY_FW_PFX = ("HG_",)
+FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts" if sys.platform == 'win32' else "/etc/hosts"
 BLOCK_IPS = {"0.0.0.0", "127.0.0.1", "::0", "::1"}
 CONFIG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP_NAME)
-DB_PATH = os.path.join(CONFIG_DIR, "hostsguard.db")
+LEGACY_CONFIG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), "HostsGuard")
+if not os.path.exists(CONFIG_DIR) and os.path.isdir(LEGACY_CONFIG_DIR):
+    try: shutil.copytree(LEGACY_CONFIG_DIR, CONFIG_DIR, dirs_exist_ok=True)
+    except Exception as e: log.warning(f"Config migration skipped: {e}")
+DB_PATH = os.path.join(CONFIG_DIR, "pywall.db")
+LEGACY_DB_PATH = os.path.join(CONFIG_DIR, "hostsguard.db")
+if not os.path.exists(DB_PATH) and os.path.exists(LEGACY_DB_PATH):
+    try: shutil.copy2(LEGACY_DB_PATH, DB_PATH)
+    except Exception as e: log.warning(f"DB migration skipped: {e}")
 CONN_DB_PATH = os.path.join(CONFIG_DIR, "connections.db")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
 os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True)
+SERVICE_NAME = "PyWallService"
+SERVICE_DISPLAY_NAME = "PyWall Background Service"
+SERVICE_DESCRIPTION = "Headless PyWall connection monitor and threat auto-blocker."
+SERVICE_LOG_PATH = os.path.join(CONFIG_DIR, "service.log")
+
+def _service_log(msg, level="INFO"):
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
+    try:
+        with open(SERVICE_LOG_PATH, "a", encoding="utf-8") as f: f.write(line + "\n")
+    except: pass
+    getattr(log, level.lower(), log.info)(msg)
+
+try:
+    import win32serviceutil, win32service, servicemanager
+except ImportError:
+    win32serviceutil = win32service = servicemanager = None
+
+if win32serviceutil is not None:
+    class PyWallWindowsService(win32serviceutil.ServiceFramework):
+        _svc_name_ = SERVICE_NAME
+        _svc_display_name_ = SERVICE_DISPLAY_NAME
+        _svc_description_ = SERVICE_DESCRIPTION
+
+        def __init__(self, args):
+            win32serviceutil.ServiceFramework.__init__(self, args)
+            self._stop_event = threading.Event()
+
+        def SvcStop(self):
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            self._stop_event.set()
+
+        def SvcDoRun(self):
+            servicemanager.LogInfoMsg(f"{SERVICE_DISPLAY_NAME} starting")
+            try:
+                run_headless_service(stop_event=self._stop_event, auto_block=True)
+            except Exception as e:
+                _service_log(f"Service crashed: {e}", "ERROR")
+                servicemanager.LogErrorMsg(f"{SERVICE_DISPLAY_NAME} crashed: {e}")
+                raise
+            finally:
+                servicemanager.LogInfoMsg(f"{SERVICE_DISPLAY_NAME} stopped")
+else:
+    PyWallWindowsService = None
 
 IGNORED_DOMAINS = {'localhost','localhost.localdomain','local','broadcasthost','ip6-localhost','ip6-loopback','wpad','isatap'}
 DOMAIN_RE = re.compile(r'^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$')
@@ -385,7 +448,7 @@ def clean_hosts_content(lines, whitelist_set):
         if norm in seen: stats["dupes"]+=1; continue
         seen.add(norm); kept.append(norm)
         if changed: stats["transformed"]+=1
-    header = WINDOWS_HEADER + [f"# --- {len(kept)} active entries managed by HostsGuard v{APP_VERSION} ---"]
+    header = WINDOWS_HEADER + [f"# --- {len(kept)} active entries managed by PyWall v{APP_VERSION} ---"]
     result = header + sorted(kept) + [""]; stats["active"] = len(kept)
     return result, stats
 
@@ -421,6 +484,9 @@ def _ps(cmd, t=20):
             capture_output=True, text=True, timeout=t, creationflags=NOWIN)
         return (r.returncode==0, r.stdout.strip())
     except Exception as e: return (False, str(e))
+
+def _is_managed_rule_name(name):
+    return any(str(name or "").startswith(pfx) for pfx in FW_RULE_PREFIXES)
 
 # NT device path -> DOS path mapping
 _drive_map = None
@@ -667,7 +733,7 @@ class FirewallEngine:
                     return str(v)
                 for r in data:
                     try:
-                        src="hostsguard" if str(r.get("DN","") or "").startswith(FW_PFX) else "system"
+                        src="pywall" if _is_managed_rule_name(r.get("DN","")) else "system"
                         rules.append(FWRule(name=_j(r.get("DN","")),desc=_j(r.get("Desc","")),
                             direction="Inbound" if r.get("Dir") in (1,"1") else "Outbound",
                             action="Block" if r.get("Act") in (2,"2") else "Allow",
@@ -681,19 +747,19 @@ class FirewallEngine:
     def block_ip(self,ip,direction="Outbound"):
         safe=ip.replace(":","-").replace("/","_"); nm=f"{FW_PFX}Block_{safe}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
-        return self.create_rule(nm,direction,"Block",remote_addr=ip,desc=f"Blocked by HostsGuard at {datetime.datetime.now():%Y-%m-%d %H:%M}")
+        return self.create_rule(nm,direction,"Block",remote_addr=ip,desc=f"Blocked by PyWall at {datetime.datetime.now():%Y-%m-%d %H:%M}")
     def allow_ip(self,ip,direction="Outbound"):
         safe=ip.replace(":","-").replace("/","_"); nm=f"{FW_PFX}Allow_{safe}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
-        return self.create_rule(nm,direction,"Allow",remote_addr=ip,desc="Allowed by HostsGuard")
+        return self.create_rule(nm,direction,"Allow",remote_addr=ip,desc="Allowed by PyWall")
     def block_program(self,prog_path,direction="Outbound"):
         safe=Path(prog_path).stem[:30]; nm=f"{FW_PFX}Block_{safe}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
-        return self.create_rule(nm,direction,"Block",program=prog_path,desc="Program blocked by HostsGuard")
+        return self.create_rule(nm,direction,"Block",program=prog_path,desc="Program blocked by PyWall")
     def block_port(self,port,proto="TCP",direction="Outbound"):
         nm=f"{FW_PFX}Block_Port{port}_{proto}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
-        return self.create_rule(nm,direction,"Block",remote_port=str(port),protocol=proto,desc="Port blocked by HostsGuard")
+        return self.create_rule(nm,direction,"Block",remote_port=str(port),protocol=proto,desc="Port blocked by PyWall")
     def get_profile_status(self):
         ok,out=_ps("Get-NetFirewallProfile | Select-Object Name, Enabled | ConvertTo-Json -Compress",15)
         result={"Domain":True,"Private":True,"Public":True}
@@ -1061,7 +1127,7 @@ class ImportWorker(QThread):
             if self._stop: self.cancelled.emit(); return
             self.progress.emit(i,len(self.sources),name)
             try:
-                req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 HostsGuard/2.0'})
+                req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 PyWall/4.1'})
                 with urllib.request.urlopen(req,timeout=20) as resp: raw=resp.read().decode('utf-8',errors='ignore').splitlines()
                 if self.normalize:
                     for line in raw:
@@ -1082,6 +1148,191 @@ class RuleScanWorker(QThread):
             s.ready.emit(rules)
         except Exception as e:
             log.warning(f"RuleScanWorker error: {e}"); s.ready.emit([])
+
+class HeadlessMonitor(QObject):
+    def __init__(self, auto_block=True, poll_seconds=2.0):
+        super().__init__()
+        self.auto_block = auto_block
+        self.poll_seconds = max(float(poll_seconds or 2.0), 1.0)
+        self.db = HostsDB()
+        self.hm = HostsFileManager()
+        self.conn_db = ConnDB()
+        self._dns_w = DNSResolveWorker()
+        self._who_w = WhoWorker()
+        self._geo_w = GeoIPWorker()
+        self._dns_mon = DNSMonitorThread(self.hm, self.db)
+        self._conn_w = ConnWorker(self.db)
+        self._evt_w = EvtWorker()
+        self._timer = QTimer(self)
+        self._processed_threats = set()
+        self._blocked_ips = set()
+        self._last_summary = 0
+
+    def start(self):
+        _service_log(f"Headless monitor starting; auto_block={self.auto_block}")
+        self._dns_w.start(); self._who_w.start(); self._geo_w.start()
+        self._dns_mon.status_changed.connect(self._on_status)
+        self._dns_mon.blocked_event.connect(self._on_dns_blocked)
+        self._conn_w.ready.connect(self._on_connections)
+        self._conn_w.need_dns.connect(self._dns_w.add)
+        self._conn_w.need_who.connect(self._who_w.add)
+        self._conn_w.need_geo.connect(self._geo_w.add)
+        self._evt_w.new_block.connect(self._on_fw_blocked)
+        self._dns_mon.start(); self._conn_w.start(); self._evt_w.start()
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(int(self.poll_seconds * 1000))
+
+    def stop(self):
+        _service_log("Headless monitor stopping")
+        self._timer.stop()
+        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w):
+            try: worker.stop()
+            except: pass
+        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w):
+            try: worker.wait(5000)
+            except: pass
+        try: self.conn_db.prune(30)
+        except: pass
+        _service_log("Headless monitor stopped")
+
+    def _on_status(self, msg):
+        _service_log(msg)
+
+    def _on_dns_blocked(self, ev):
+        domain = ev.get("domain", "")
+        self.db.log_event(domain, "blocked", ev.get("process", ""), "Blocked by hosts file in service mode")
+
+    def _on_connections(self, conns):
+        live = [c for c in conns if c.ra and c.ra != "*" and c.dir != "Listen"]
+        if live: self.conn_db.insert_batch(live)
+        self._enforce_threats()
+
+    def _on_fw_blocked(self, ci):
+        self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
+
+    def _tick(self):
+        self._enforce_threats()
+        now = time.time()
+        if now - self._last_summary >= 60:
+            self._last_summary = now
+            stats = self.conn_db.get_stats()
+            _service_log(f"Service heartbeat: {stats['total']} connections, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs")
+
+    def _enforce_threats(self):
+        for evt in threats.get_events(100):
+            key = f"{evt.ts}|{evt.type}|{evt.source_ip}"
+            if key in self._processed_threats: continue
+            self._processed_threats.add(key)
+            self.db.log_event(evt.source_ip, "threat", "PyWallService", f"{evt.type}: {evt.details}")
+            if self.auto_block and evt.severity == "high":
+                self._block_ip_all_directions(evt.source_ip, evt.type)
+
+    def _block_ip_all_directions(self, ip, reason):
+        if not ip or ip in self._blocked_ips or PRIV_RE.match(ip): return
+        ok_any = False
+        messages = []
+        for direction in ("Inbound", "Outbound"):
+            ok, out = fw.block_ip(ip, direction)
+            ok_any = ok_any or ok
+            messages.append(f"{direction}={'ok' if ok else out}")
+        self._blocked_ips.add(ip)
+        action = "fw_blocked" if ok_any else "error"
+        self.db.log_event(ip, action, "PyWallService", f"Auto-block {reason}: {'; '.join(messages)}")
+        _service_log(f"Auto-blocked {ip} for {reason}: {'; '.join(messages)}")
+
+def run_headless_service(stop_event=None, auto_block=True, poll_seconds=2.0):
+    app = QCoreApplication.instance()
+    if app is None:
+        app = QCoreApplication([APP_NAME, "service-run"])
+    monitor = HeadlessMonitor(auto_block=auto_block, poll_seconds=poll_seconds)
+    guard = QTimer()
+
+    def _check_stop():
+        if stop_event is not None and stop_event.is_set():
+            app.quit()
+
+    if stop_event is not None:
+        guard.timeout.connect(_check_stop)
+        guard.start(1000)
+    monitor.start()
+    try:
+        return app.exec_()
+    finally:
+        guard.stop()
+        monitor.stop()
+
+def _run_service_foreground(auto_block=True, poll_seconds=2.0):
+    stop_event = threading.Event()
+    def _stop(*_):
+        stop_event.set()
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try: signal.signal(sig, _stop)
+            except: pass
+    return run_headless_service(stop_event=stop_event, auto_block=auto_block, poll_seconds=poll_seconds)
+
+def _service_status_text():
+    if win32serviceutil is None or win32service is None:
+        return None
+    try:
+        status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)[1]
+    except Exception as e:
+        return f"{SERVICE_NAME}: unavailable ({e})"
+    names = {
+        win32service.SERVICE_STOPPED: "STOPPED",
+        win32service.SERVICE_START_PENDING: "START_PENDING",
+        win32service.SERVICE_STOP_PENDING: "STOP_PENDING",
+        win32service.SERVICE_RUNNING: "RUNNING",
+        win32service.SERVICE_CONTINUE_PENDING: "CONTINUE_PENDING",
+        win32service.SERVICE_PAUSE_PENDING: "PAUSE_PENDING",
+        win32service.SERVICE_PAUSED: "PAUSED",
+    }
+    return f"{SERVICE_NAME}: {names.get(status, status)}"
+
+def _build_cli_parser():
+    parser = argparse.ArgumentParser(prog="PyWall.py", description=f"{APP_NAME} v{APP_VERSION}")
+    sub = parser.add_subparsers(dest="command")
+    service = sub.add_parser("service", help="Install, control, or run the Windows background service")
+    service.add_argument("action", choices=["install","remove","start","stop","restart","status","run"])
+    service.add_argument("--startup", choices=["auto","manual","disabled","delayed"], default="auto")
+    service.add_argument("--no-auto-block", action="store_true", help="Monitor without creating firewall blocks for high-severity threats")
+    service.add_argument("--poll-seconds", type=float, default=2.0)
+    run = sub.add_parser("service-run", help="Run the headless monitor in the foreground")
+    run.add_argument("--no-auto-block", action="store_true")
+    run.add_argument("--poll-seconds", type=float, default=2.0)
+    return parser
+
+def _dispatch_cli(argv):
+    if not argv: return None
+    if argv[0] not in ("service", "service-run", "-h", "--help"): return None
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+    if args.command == "service-run" or (args.command == "service" and args.action == "run"):
+        return _run_service_foreground(auto_block=not args.no_auto_block, poll_seconds=args.poll_seconds)
+    if args.command == "service":
+        if sys.platform != "win32":
+            print("Windows service control is only available on Windows.", file=sys.stderr)
+            return 2
+        if PyWallWindowsService is None or win32serviceutil is None:
+            print("pywin32 is required for Windows service control. Run pip install pywin32.", file=sys.stderr)
+            return 2
+        if args.action == "status":
+            print(_service_status_text())
+            return 0
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = [old_argv[0], args.action]
+            if args.action == "install":
+                sys.argv.extend(["--startup", args.startup])
+            win32serviceutil.HandleCommandLine(PyWallWindowsService)
+            return 0
+        except SystemExit as e:
+            return e.code if isinstance(e.code, int) else 0
+        finally:
+            sys.argv = old_argv
+    parser.print_help()
+    return 0
 
 
 # ─── UI Helpers ──────────────────────────────────────────────────────────────
@@ -1207,8 +1458,8 @@ class DashboardTab(QWidget):
             lines=[]; lines.append(f"Threats detected: {threats.get_stats()['total']}")
             cached=fw._rule_cache
             if cached:
-                hg_ct=sum(1 for r in cached if r.source=="hostsguard")
-                lines.append(f"HostsGuard FW rules: {hg_ct}")
+                hg_ct=sum(1 for r in cached if r.source=="pywall")
+                lines.append(f"PyWall FW rules: {hg_ct}")
                 lines.append(f"Total FW rules: {len(cached)}")
             else:
                 lines.append("FW rules: loading...")
@@ -1495,7 +1746,7 @@ class DomainTab(QWidget):
         self._dr()
     def _sync(self):
         bl=set(d[0] for d in self.db.get_domains(status='blocked')); wl=set(d[0] for d in self.db.get_domains(status='whitelisted'))
-        lines=WINDOWS_HEADER+[f"# --- {len(bl)} blocked by HostsGuard ---"]
+        lines=WINDOWS_HEADER+[f"# --- {len(bl)} blocked by PyWall ---"]
         for d in sorted(bl): lines.append(f"0.0.0.0 {d}")
         for d in sorted(wl): lines.append(f"# WHITELISTED: 0.0.0.0 {d}")
         err=self.hm.write_full('\n'.join(lines))
@@ -1540,7 +1791,7 @@ class ConnectionsTab(QWidget):
         self.btn_kill=QPushButton("Kill Process"); self.btn_kill.setProperty("class","dim"); self.btn_kill.clicked.connect(self._kill_sel); ab.addWidget(self.btn_kill)
         rl.addLayout(ab)
         # HG rules mini-panel
-        rl.addWidget(QLabel("HostsGuard FW Rules"))
+        rl.addWidget(QLabel("PyWall FW Rules"))
         self.rules_tbl=QTableWidget(0,4); self.rules_tbl.setHorizontalHeaderLabels(["Name","Action","Direction","Addr"])
         self.rules_tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch); self.rules_tbl.verticalHeader().setVisible(False)
         self.rules_tbl.setEditTriggers(QTableWidget.NoEditTriggers); self.rules_tbl.setMaximumHeight(200)
@@ -1602,7 +1853,7 @@ class ConnectionsTab(QWidget):
         menu.exec_(self.rules_tbl.viewport().mapToGlobal(pos))
     def _del_rule(self,name): fw.delete_rule(name); self._refresh_rules()
     def _refresh_rules(self):
-        rules=[r for r in fw.get_all_rules() if r.source=="hostsguard"]
+        rules=[r for r in fw.get_all_rules() if r.source=="pywall"]
         self.rules_tbl.setRowCount(len(rules))
         for i,r in enumerate(rules):
             self.rules_tbl.setItem(i,0,QTableWidgetItem(r.name)); self.rules_tbl.setItem(i,1,QTableWidgetItem(r.action))
@@ -1642,12 +1893,12 @@ class FirewallTab(QWidget):
         lo=QVBoxLayout(self); lo.setContentsMargins(12,12,12,12); lo.setSpacing(8)
         hdr=QLabel("Windows Firewall Rules"); hdr.setStyleSheet(f"font-size:14px;font-weight:800;color:{C['blue']};")
         lo.addWidget(hdr)
-        desc=QLabel("Manage all Windows Firewall rules. HostsGuard-created rules are prefixed with 'HG_'. Right-click to edit/delete.")
+        desc=QLabel("Manage all Windows Firewall rules. PyWall-created rules are prefixed with 'PW_' and legacy 'HG_' rules remain visible. Right-click to edit/delete.")
         desc.setWordWrap(True); desc.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(desc)
         tb=QHBoxLayout(); tb.setSpacing(6)
         self.search=QLineEdit(); self.search.setPlaceholderText("Search rules..."); self.search.setFixedWidth(250)
         self.search.returnPressed.connect(self._do_search); tb.addWidget(self.search)
-        self.filt=QComboBox(); self.filt.addItems(["All Rules","HostsGuard Only","System Only","Block Only","Allow Only"])
+        self.filt=QComboBox(); self.filt.addItems(["All Rules","PyWall Only","System Only","Block Only","Allow Only"])
         # NOTE: connect signal AFTER table creation below
         tb.addWidget(self.filt)
         tb.addStretch()
@@ -1676,7 +1927,7 @@ class FirewallTab(QWidget):
     def _apply_filter(self):
         try:
             f=self.filt.currentText(); rules=list(self._rules)
-            if "HostsGuard" in f: rules=[r for r in rules if r.source=="hostsguard"]
+            if "PyWall" in f: rules=[r for r in rules if r.source=="pywall"]
             elif "System" in f: rules=[r for r in rules if r.source=="system"]
             elif "Block" in f: rules=[r for r in rules if r.action=="Block"]
             elif "Allow" in f: rules=[r for r in rules if r.action=="Allow"]
@@ -1694,8 +1945,8 @@ class FirewallTab(QWidget):
                 except: prog=r.program or ""
                 self.table.setItem(i,6,QTableWidgetItem(prog)); self.table.setItem(i,7,QTableWidgetItem(r.source or ""))
             self.table.setSortingEnabled(True)
-            hg_ct=sum(1 for r in self._rules if r.source=="hostsguard")
-            self.slbl.setText(f"{len(rules)} shown  |  {len(self._rules)} total  |  {hg_ct} HostsGuard rules")
+            hg_ct=sum(1 for r in self._rules if r.source=="pywall")
+            self.slbl.setText(f"{len(rules)} shown  |  {len(self._rules)} total  |  {hg_ct} PyWall rules")
         except Exception as e:
             self.slbl.setText(f"Error loading rules: {e}"); log.warning(f"_apply_filter error: {e}")
     def _ctx_menu(self,pos):
@@ -1720,7 +1971,7 @@ class FirewallTab(QWidget):
         except Exception as e: log.warning(f"Delete rule error: {e}")
         self._do_search()
     def _delete_all_hg(self):
-        hg=[r.name for r in self._rules if r.source=="hostsguard" and r.name]
+        hg=[r.name for r in self._rules if r.source=="pywall" and r.name]
         for name in hg:
             try: fw.delete_rule(name)
             except: pass
@@ -1759,7 +2010,7 @@ class NewRuleDialog(QDialog):
         ok,out=fw.create_rule(full_name,self.dir_cb.currentText(),self.act_cb.currentText(),
             remote_addr=self.addr_ed.text().strip(),remote_port=self.port_ed.text().strip(),
             protocol=proto_arg,program=self.prog_ed.text().strip(),
-            desc=f"Created by HostsGuard at {datetime.datetime.now():%Y-%m-%d %H:%M}")
+            desc=f"Created by PyWall at {datetime.datetime.now():%Y-%m-%d %H:%M}")
         if ok: self.accept()
 
 
@@ -1815,7 +2066,7 @@ class LogTab(QWidget):
     def _act_root(self,d,st):
         self.db.add_root_domain(d,st,'log'); (self.hm.add_block if st=='blocked' else self.hm.remove_block)(get_root_domain(d)); self._dr()
     def _export(self):
-        p,_=QFileDialog.getSaveFileName(self,"Export Log","hostsguard_log.csv","CSV (*.csv)")
+        p,_=QFileDialog.getSaveFileName(self,"Export Log","pywall_log.csv","CSV (*.csv)")
         if p:
             rows=self.db.get_log(50000)
             with open(p,'w',newline='',encoding='utf-8') as f:
@@ -2245,7 +2496,7 @@ class MainWindow(QMainWindow):
         now = time.time()
         if domain in self._notif_cooldown and now - self._notif_cooldown[domain] < 60: return
         self._notif_cooldown[domain] = now
-        self._tray.showMessage("HostsGuard", f"Blocked: {domain}", QSystemTrayIcon.Warning, 2000)
+        self._tray.showMessage(APP_NAME, f"Blocked: {domain}", QSystemTrayIcon.Warning, 2000)
 
     # ── Connection Monitor ──
     def _start_conn_monitor(self):
@@ -2288,7 +2539,7 @@ class MainWindow(QMainWindow):
         now = time.time()
         if key in self._notif_cooldown and now - self._notif_cooldown[key] < 60: return
         self._notif_cooldown[key] = now
-        self._tray.showMessage("HostsGuard", f"FW Blocked: {ci.proc} \u2192 {ci.ra}", QSystemTrayIcon.Warning, 2000)
+        self._tray.showMessage(APP_NAME, f"FW Blocked: {ci.proc} \u2192 {ci.ra}", QSystemTrayIcon.Warning, 2000)
 
     def _update_status(self,msg):
         active=self._monitoring or self._conn_monitoring
@@ -2330,6 +2581,10 @@ class MainWindow(QMainWindow):
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
+    cli_rc = _dispatch_cli(sys.argv[1:])
+    if cli_rc is not None:
+        sys.exit(cli_rc)
+
     # Global crash handler for unhandled exceptions in Qt slots
     _orig_hook = sys.excepthook
     def _crash_handler(exc_type, exc_val, exc_tb):
@@ -2380,10 +2635,10 @@ def main():
         try:
             from PyQt5.QtWidgets import QMessageBox, QApplication as QApp2
             if not QApp2.instance(): QApp2(sys.argv)
-            QMessageBox.critical(None, "HostsGuard — Crash", f"Fatal error:\n\n{e}\n\nDetails written to:\n{crash_path}")
+            QMessageBox.critical(None, f"{APP_NAME} - Crash", f"Fatal error:\n\n{e}\n\nDetails written to:\n{crash_path}")
         except: pass
         # Also print to stderr in case IDE captures it
-        print(f"HOSTSGUARD CRASH: {e}\n{tb}", file=sys.stderr)
+        print(f"PYWALL CRASH: {e}\n{tb}", file=sys.stderr)
         sys.exit(1)
 
 if __name__=="__main__":

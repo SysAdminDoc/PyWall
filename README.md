@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.0-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.0"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.1-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.1"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white" alt="Windows"/>
   <img src="https://img.shields.io/badge/License-MIT-22C55E" alt="License"/>
-  <img src="https://img.shields.io/badge/Lines-~6.9k-F59E0B" alt="Lines"/>
+  <img src="https://img.shields.io/badge/Lines-~2.6k-F59E0B" alt="Lines"/>
 </p>
 
 ---
@@ -35,7 +35,7 @@ cd PyWall
 python PyWall.py
 ```
 
-Dependencies (`PyQt6`, `psutil`, `requests`) auto-install on first launch. PyWall also auto-elevates to admin and configures Windows firewall audit logging automatically.
+Dependencies (`PyQt5`, `psutil`, `requests`, and `pywin32` on Windows) auto-install on first launch. PyWall also auto-elevates to admin and configures Windows firewall audit logging automatically.
 
 ---
 
@@ -129,23 +129,21 @@ If PyWall is terminated while monitoring, it auto-resumes on next launch.
 
 ---
 
-## CLI Mode
+## Service Mode
 
-PyWall works headless from the command line:
+PyWall can run its DNS, connection, event-log, history, enrichment, and high-severity threat auto-blocking monitors without opening the GUI:
 
 ```bash
-python PyWall.py block-ip 10.0.0.5 --dir Both
-python PyWall.py allow-ip 8.8.8.8 --dir Outbound
-python PyWall.py block-port 3389 --proto TCP
-python PyWall.py allow-port 443 --proto TCP
-python PyWall.py block-program "C:\Path\to\app.exe"
-python PyWall.py allow-program "C:\Path\to\app.exe"
-python PyWall.py list-rules
-python PyWall.py health-check
-python PyWall.py status
-python PyWall.py export backup.json
-python PyWall.py import backup.json
+python PyWall.py service-run
+python PyWall.py service-run --no-auto-block
+python PyWall.py service install --startup auto
+python PyWall.py service start
+python PyWall.py service status
+python PyWall.py service stop
+python PyWall.py service remove
 ```
+
+Service logs are written to `%APPDATA%/PyWall/service.log`. High-severity detector hits are blocked in both inbound and outbound directions with `PW_` firewall rules; existing `HG_` rules from older builds remain visible as PyWall-managed rules.
 
 ---
 
@@ -183,26 +181,28 @@ Full config export/import with diff preview is available in Settings.
 
 | Package | Purpose |
 |---------|---------|
-| `PyQt6` | GUI |
+| `PyQt5` | GUI |
 | `psutil` | Process and connection enumeration |
 | `requests` | GeoIP, WHOIS, VirusTotal, plugin HTTP |
+| `pywin32` | Windows Service install/start/stop/status control |
 
-All three auto-install on first run if missing.
+Runtime dependencies auto-install on first run if missing when PyWall is not running from a frozen executable.
 
 ---
 
 ## Architecture
 
 ```
-PyWall.py  (~6,900 lines, single file)
+PyWall.py  (~2,600 lines, single file)
 ```
 
 **Runtime files** (auto-created in `%APPDATA%/PyWall/`):
 
 ```
+pywall.db       Domain/feed/log SQLite database
+connections.db  Connection history SQLite database
 config.json     Settings, app profiles, blocklists
-history.db      SQLite connection history
-sessions.db     SQLite session tracking
+service.log     Background service status and auto-block log
 plugins/        User and example plugin scripts
 ```
 
@@ -221,7 +221,9 @@ plugins/        User and example plugin scripts
 | `RuleScheduler` | Cron-like rule enable/disable scheduling |
 | `NetworkProfileManager` | Auto-switching between Domain/Private/Public |
 | `PluginManager` | Dynamic plugin loading and event dispatch |
-| `MainWindow` | PyQt6 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
+| `HeadlessMonitor` | Service-mode DNS, connection, event, history, and threat auto-block loop |
+| `PyWallWindowsService` | pywin32 Windows Service wrapper |
+| `MainWindow` | PyQt5 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
 
 ---
 
@@ -230,7 +232,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Windows Service mode** -- background monitoring without the GUI
+- **Service IPC** -- named pipe or localhost TLS control between service and tray GUI
 - **Per-connection byte tracking** -- integrate `psutil` process IO counters
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
@@ -249,7 +251,7 @@ PRs welcome. Open an issue first for larger changes.
 ## Acknowledgments
 
 - [psutil](https://github.com/giampaolo/psutil) -- process and network utilities
-- [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) -- Qt6 Python bindings
+- [PyQt5](https://www.riverbankcomputing.com/software/pyqt/) -- Qt5 Python bindings
 - [ip-api.com](http://ip-api.com) -- GeoIP lookups
 - [VirusTotal](https://www.virustotal.com) -- file reputation API
 - Inspired by [Windows Firewall Control](https://www.binisoft.org/wfc) by Malwarebytes
