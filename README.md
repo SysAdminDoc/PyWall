@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.9-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.9"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.10-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.10"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -75,6 +75,7 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 - Port scan detection (configurable unique-port threshold within a time window)
 - Brute force detection (repeated blocked connection attempts)
 - MITRE ATT&CK mapping on detector hits (`T1046` network service discovery and `T1110` brute force)
+- Optional TLS SNI ingestion from mitmproxy/Lumen-style JSONL, CSV, or text logs
 - Custom IP/domain blocklist enforcement
 - VirusTotal hash lookups (bring your own API key)
 - Digital signature verification
@@ -169,6 +170,9 @@ Settings live in `%APPDATA%/PyWall/config.json`. Key options:
 | `service_auto_block` | `true` | Override service-mode high-severity auto-blocking without restart |
 | `service_poll_seconds` | `2` | Override service-mode monitor/config polling interval without restart |
 | `bandwidth_quotas` | `{}` | App quota map, for example `{ "chrome.exe": { "limit": "5 GB", "window": "day" } }` |
+| `tls_sni_enabled` | `false` | Opt in to tailing an external TLS SNI log file |
+| `tls_sni_log_path` | `""` | Path to a mitmproxy/Lumen JSONL, CSV, or text log containing SNI/host/domain fields |
+| `tls_sni_read_existing` | `false` | Start reading the SNI log from the beginning instead of tailing only new lines |
 | `auto_block_inbound` | `true` | Block unsolicited inbound connections |
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
@@ -229,6 +233,7 @@ plugins/        User and example plugin scripts
 | `DNSWorker` / `WhoWorker` / `GeoIPWorker` | Async resolution with LRU caches |
 | `ThreatDetector` | Port scan and brute force heuristics |
 | `MITRE_MAPPINGS` | ATT&CK tactic/technique metadata attached to detector events |
+| `TLSLogWorker` | Opt-in mitmproxy/Lumen-style TLS SNI log tailer that feeds observed domains into the DNS feed |
 | `AnomalyDetector` | GeoIP novelty, unusual hours, baseline deviation |
 | `ReputationScorer` | Multi-signal scoring (VT, signatures, blocklists, GeoIP) |
 | `TrafficCategorizer` | Hostname/process classification into categories |

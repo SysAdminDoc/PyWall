@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.9 - Windows Firewall & Network Command Center
+PyWall v4.1.10 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -15,7 +15,7 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from queue import Queue, Empty
 from threading import Lock, Event as TEvent
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 
 
 def _branding_icon_path() -> Path:
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.9"
+APP_VERSION = "4.1.10"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -1301,6 +1301,109 @@ class GeoIPWorker(QThread):
             s._stop.wait(2)
     def stop(s): s._stop.set()
 
+class TLSLogWorker(QThread):
+    status_changed=pyqtSignal(str); feed_updated=pyqtSignal()
+    def __init__(s,db):
+        super().__init__(); s.db=db; s._stop=TEvent(); s._lock=Lock()
+        s._enabled=False; s._path=""; s._offset=None; s._read_existing=False
+        s._config_mtime=None; s._seen=0; s._last_domain=""; s._last_status=""
+    def configure(s,cfg=None,mtime=None):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        enabled = bool(cfg.get("tls_sni_enabled", False))
+        path = str(cfg.get("tls_sni_log_path", "") or "").strip()
+        read_existing = bool(cfg.get("tls_sni_read_existing", False))
+        with s._lock:
+            if path != s._path or read_existing != s._read_existing:
+                s._offset = 0 if read_existing else None
+            s._enabled=enabled; s._path=path; s._read_existing=read_existing; s._config_mtime=mtime
+    def run(s):
+        while not s._stop.is_set():
+            try:
+                s._reload_config_if_changed(); s._poll()
+            except Exception as e:
+                s._emit_status(f"TLS SNI hook error: {e}")
+            s._stop.wait(2.0)
+    def _reload_config_if_changed(s):
+        try: mtime=os.path.getmtime(CONFIG_PATH)
+        except FileNotFoundError:
+            if s._config_mtime is not None: s.configure({}, None)
+            return
+        except: return
+        with s._lock:
+            if s._config_mtime == mtime: return
+        try:
+            with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
+            s.configure(cfg if isinstance(cfg,dict) else {}, mtime)
+        except Exception as e: s._emit_status(f"TLS SNI config failed: {e}")
+    def _poll(s):
+        with s._lock:
+            enabled,path,offset=s._enabled,s._path,s._offset
+        if not enabled or not path: return
+        if not os.path.exists(path):
+            s._emit_status("TLS SNI log missing"); return
+        with open(path,"r",encoding="utf-8",errors="replace") as f:
+            if offset is None:
+                f.seek(0, os.SEEK_END); s._set_offset(f.tell()); return
+            f.seek(offset); lines=f.readlines(256000); s._set_offset(f.tell())
+        new_ct=0
+        for line in lines:
+            domain=s._extract_sni(line)
+            if not domain: continue
+            is_new=s.db.feed_upsert(domain,"tls-sni")
+            if is_new:
+                s.db.log_event(domain,"tls_sni","TLSLogWorker",f"SNI observed from {os.path.basename(path)}")
+                new_ct+=1
+            s._last_domain=domain; s._seen+=1
+        if new_ct:
+            s.feed_updated.emit(); s._emit_status(f"TLS SNI captured {new_ct} new domains")
+    def _set_offset(s,offset):
+        with s._lock: s._offset=offset
+    def _emit_status(s,msg):
+        if msg == s._last_status: return
+        s._last_status=msg; s.status_changed.emit(msg)
+    def _extract_sni(s,line):
+        line=(line or "").strip()
+        if not line: return ""
+        try:
+            domain=s._extract_obj(json.loads(line))
+            if domain: return domain
+        except: pass
+        for pat in (r'(?:sni|server_name|servername|host|hostname|domain)\s*[:=]\s*["\']?([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+                    r'\b([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)\b'):
+            for m in re.finditer(pat,line,re.I):
+                domain=s._clean_domain(m.group(1))
+                if domain: return domain
+        return ""
+    def _extract_obj(s,obj):
+        if isinstance(obj,dict):
+            for k,v in obj.items():
+                if str(k).lower() in ("sni","server_name","servername","tls_sni","host","hostname","domain"):
+                    domain=s._clean_domain(v)
+                    if domain: return domain
+            for v in obj.values():
+                domain=s._extract_obj(v)
+                if domain: return domain
+        elif isinstance(obj,list):
+            for v in obj:
+                domain=s._extract_obj(v)
+                if domain: return domain
+        elif isinstance(obj,str):
+            return s._clean_domain(obj)
+        return ""
+    def _clean_domain(s,value):
+        text=str(value or "").strip().strip("\"'[]()")
+        if "://" in text:
+            try: text=urllib.parse.urlparse(text).hostname or ""
+            except: text=""
+        if ":" in text and not text.count(".") >= 1: return ""
+        text=text.split(":")[0].strip(".").lower()
+        if text.startswith("*."): text=text[2:]
+        return text if looks_like_domain(text) else ""
+    def snapshot(s):
+        with s._lock:
+            return {"enabled":s._enabled,"path":s._path,"seen":s._seen,"last_domain":s._last_domain}
+    def stop(s): s._stop.set()
+
 class DNSMonitorThread(QThread):
     dns_event=pyqtSignal(dict); blocked_event=pyqtSignal(dict)
     status_changed=pyqtSignal(str); new_domain=pyqtSignal(str); feed_updated=pyqtSignal()
@@ -1624,6 +1727,7 @@ class HeadlessMonitor(QObject):
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
+        self._tls_w = TLSLogWorker(self.db)
         self._dns_mon = DNSMonitorThread(self.hm, self.db)
         self._conn_w = ConnWorker(self.db)
         self._evt_w = EvtWorker()
@@ -1645,8 +1749,9 @@ class HeadlessMonitor(QObject):
             _service_log(f"Restored prior service state: saved_at={self._restored_state.get('saved_at','?')}, clean_shutdown={self._restored_state.get('clean_shutdown')}")
         self._reload_config_if_changed(force=True)
         self._save_service_state(clean_shutdown=False)
-        self._dns_w.start(); self._who_w.start(); self._geo_w.start()
+        self._dns_w.start(); self._who_w.start(); self._geo_w.start(); self._tls_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
+        self._tls_w.status_changed.connect(self._on_status)
         self._dns_mon.blocked_event.connect(self._on_dns_blocked)
         self._conn_w.ready.connect(self._on_connections)
         self._conn_w.need_dns.connect(self._dns_w.add)
@@ -1662,10 +1767,10 @@ class HeadlessMonitor(QObject):
         _service_log("Headless monitor stopping")
         self._timer.stop()
         self._ipc.stop()
-        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w):
+        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._tls_w):
             try: worker.stop()
             except: pass
-        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w):
+        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._tls_w):
             try: worker.wait(5000)
             except: pass
         try: self.conn_db.prune(30)
@@ -1711,6 +1816,7 @@ class HeadlessMonitor(QObject):
             "config_path": CONFIG_PATH,
             "last_config_reload": self._last_config_reload,
             "bandwidth_quotas": self._quota.snapshot(),
+            "tls_sni": self._tls_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
             "previous_clean_shutdown": self._restored_state.get("clean_shutdown") if self._restored_state else None,
             "previous_saved_at": self._restored_state.get("saved_at") if self._restored_state else "",
@@ -1751,6 +1857,7 @@ class HeadlessMonitor(QObject):
                 self._config_mtime = None
                 self._last_config_reload = "missing"
                 self._quota.load_config({})
+                self._tls_w.configure({})
             return
         except Exception as e:
             _service_log(f"Config stat failed: {e}", "WARNING")
@@ -1779,9 +1886,10 @@ class HeadlessMonitor(QObject):
         if self._timer.isActive() and self.poll_seconds != old_poll:
             self._timer.setInterval(int(self.poll_seconds * 1000))
         self._quota.load_config(cfg, mtime)
+        self._tls_w.configure(cfg, mtime)
         self._config_mtime = mtime
         self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -2903,9 +3011,10 @@ class ToolsTab(QWidget):
         prev=s.get("previous_clean_shutdown")
         prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
         q=s.get("bandwidth_quotas",{}) if isinstance(s.get("bandwidth_quotas",{}),dict) else {}
+        tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -2996,10 +3105,14 @@ class MainWindow(QMainWindow):
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
         self._who_w=WhoWorker(); self._who_w.start()
         self._geo_w=GeoIPWorker(); self._geo_w.start()
+        self._tls_w=TLSLogWorker(self.db)
         self._conn_w=None; self._evt_w=None
 
         self._build_ui()
         self._build_tray()
+        self._tls_w.status_changed.connect(lambda msg:self._sbar_msg.setText(msg))
+        self._tls_w.feed_updated.connect(self._feed.refresh)
+        self._tls_w.start()
 
         # Auto-start DNS monitor
         QTimer.singleShot(300,self._start_dns_monitor)
@@ -3219,7 +3332,7 @@ class MainWindow(QMainWindow):
         if self._monitoring and hasattr(self,'_dns_mon'): self._dns_mon.stop()
         if self._conn_w: self._conn_w.stop()
         if self._evt_w: self._evt_w.stop()
-        self._dns_w.stop(); self._who_w.stop(); self._geo_w.stop()
+        self._dns_w.stop(); self._who_w.stop(); self._geo_w.stop(); self._tls_w.stop()
         try: self.conn_db.prune(30)
         except: pass
         QApplication.quit()

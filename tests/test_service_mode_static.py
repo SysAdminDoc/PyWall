@@ -30,7 +30,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.9"])
+        self.assertEqual(versions, ["4.1.10"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -66,6 +66,11 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("mitre_technique", TEXT)
         self.assertIn("T1046 Network Service Discovery", TEXT)
         self.assertIn("T1110 Brute Force", TEXT)
+        self.assertIn("TLSLogWorker", TEXT)
+        self.assertIn("tls_sni_enabled", TEXT)
+        self.assertIn("tls_sni_log_path", TEXT)
+        self.assertIn("tls_sni_read_existing", TEXT)
+        self.assertIn("tls_sni", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())
