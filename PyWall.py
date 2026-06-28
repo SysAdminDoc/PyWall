@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.4 - Windows Firewall & Network Command Center
+PyWall v4.1.5 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.4"
+APP_VERSION = "4.1.5"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -646,15 +646,18 @@ class ConnDB:
     def __init__(self):
         self._lock=Lock(); self._conn=sqlite3.connect(CONN_DB_PATH,check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL"); self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
+        self._conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
+        cols={r[1] for r in self._conn.execute("PRAGMA table_info(connections)").fetchall()}
+        if "bytes_sent" not in cols: self._conn.execute("ALTER TABLE connections ADD COLUMN bytes_sent INTEGER DEFAULT 0")
+        if "bytes_recv" not in cols: self._conn.execute("ALTER TABLE connections ADD COLUMN bytes_recv INTEGER DEFAULT 0")
         for idx in ["CREATE INDEX IF NOT EXISTS idx_ts ON connections(ts)","CREATE INDEX IF NOT EXISTS idx_proc ON connections(proc)","CREATE INDEX IF NOT EXISTS idx_ra ON connections(ra)"]:
             self._conn.execute(idx)
         self._conn.commit()
     def insert_batch(self,items):
         with self._lock:
             try:
-                self._conn.executemany("INSERT OR IGNORE INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,stat,country,cc,category) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [(c.ts,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.state,c.org,c.stat,c.country,c.cc,c.category) for c in items])
+                self._conn.executemany("INSERT OR IGNORE INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,stat,country,cc,category,bytes_sent,bytes_recv) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(c.ts,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv) for c in items])
                 self._conn.commit()
             except: pass
     def search(self,query="",limit=500,offset=0):
@@ -663,7 +666,7 @@ class ConnDB:
                 w,p=[],[]
                 if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ?)"); p.extend([f"%{query}%"]*4)
                 where=" WHERE "+" AND ".join(w) if w else ""
-                sql=f"SELECT ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,stat,country,cc,category FROM connections{where} ORDER BY id DESC LIMIT ? OFFSET ?"
+                sql=f"SELECT ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,country,stat,bytes_sent,bytes_recv FROM connections{where} ORDER BY id DESC LIMIT ? OFFSET ?"
                 p.extend([limit,offset]); return self._conn.execute(sql,p).fetchall()
             except: return []
     def get_stats(self):
@@ -672,8 +675,10 @@ class ConnDB:
                 total=self._conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
                 blocked=self._conn.execute("SELECT COUNT(*) FROM connections WHERE stat LIKE '%BLOCK%'").fetchone()[0]
                 unique_ips=self._conn.execute("SELECT COUNT(DISTINCT ra) FROM connections").fetchone()[0]
-                return {"total":total,"blocked":blocked,"unique_ips":unique_ips}
-            except: return {"total":0,"blocked":0,"unique_ips":0}
+                sent=self._conn.execute("SELECT COALESCE(SUM(bytes_sent),0) FROM connections").fetchone()[0]
+                recv=self._conn.execute("SELECT COALESCE(SUM(bytes_recv),0) FROM connections").fetchone()[0]
+                return {"total":total,"blocked":blocked,"unique_ips":unique_ips,"bytes_sent":sent,"bytes_recv":recv}
+            except: return {"total":0,"blocked":0,"unique_ips":0,"bytes_sent":0,"bytes_recv":0}
     def prune(self,days=30):
         with self._lock:
             try:
@@ -891,6 +896,15 @@ class BandwidthTracker:
         return f"{bps:.1f} TB/s"
 bw_tracker = BandwidthTracker()
 
+def _fmt_bytes(n):
+    try: n = int(n or 0)
+    except: n = 0
+    for unit in ("B","KB","MB","GB","TB"):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
 # ─── Threat Detector ─────────────────────────────────────────────────────────
 class ThreatDetector:
     def __init__(self):
@@ -1028,7 +1042,7 @@ class DNSMonitorThread(QThread):
 
 class ConnWorker(QThread):
     ready=pyqtSignal(list); need_dns=pyqtSignal(str); need_who=pyqtSignal(str); need_geo=pyqtSignal(str)
-    def __init__(s,hosts_db): super().__init__(); s._stop=TEvent(); s._hosts_db=hosts_db
+    def __init__(s,hosts_db): super().__init__(); s._stop=TEvent(); s._hosts_db=hosts_db; s._io_prev={}
     def run(s):
         while not s._stop.is_set():
             try:
@@ -1036,7 +1050,7 @@ class ConnWorker(QThread):
             except: pass
             s._stop.wait(2.0)
     def _scan(s):
-        out=[]; now=datetime.datetime.now().strftime("%H:%M:%S")
+        out=[]; now=datetime.datetime.now().strftime("%H:%M:%S"); seen_pids=set()
         blocked_domains={d[0] for d in s._hosts_db.get_domains(status='blocked')}
         for c in psutil.net_connections(kind='all'):
             try:
@@ -1044,7 +1058,9 @@ class ConnWorker(QThread):
                 la=c.laddr.ip if c.laddr else ""; lp=str(c.laddr.port) if c.laddr else ""
                 ra=c.raddr.ip if c.raddr else ""; rp=str(c.raddr.port) if c.raddr else ""
                 d="Listen" if not ra else "Out"; pid=c.pid or 0
+                if pid>0: seen_pids.add(pid)
                 pn,pp=s._proc(pid); st=c.status if hasattr(c,'status') and c.status else "?"
+                bs,br=s._proc_io(pid)
                 key=f"L|{proto}|{la}:{lp}|{ra}:{rp}|{pid}"
                 h=dns_c.get(ra,"..."); o=who_c.get(ra,"...")
                 geo=geo_c.get(ra); cc=""; country="-"
@@ -1062,10 +1078,21 @@ class ConnWorker(QThread):
                     if who_c.get(ra) is None: s.need_who.emit(ra)
                     if geo_c.get(ra) is None: s.need_geo.emit(ra)
                 ci=CI(key=key,ts=now,src="Live",dir=d,proto=proto,la=la,lp=lp,ra=ra or "*",rp=rp or "*",
-                    host=h or "-",proc=pn,pid=pid,state=st,path=pp,org=o or "-",stat=rs,country=country,cc=cc,category=cat)
+                    host=h or "-",proc=pn,pid=pid,state=st,path=pp,org=o or "-",stat=rs,country=country,cc=cc,category=cat,bytes_sent=bs,bytes_recv=br)
                 out.append(ci)
             except: continue
+        for pid in list(s._io_prev):
+            if pid not in seen_pids: s._io_prev.pop(pid,None)
         return out
+    def _proc_io(s,pid):
+        if pid<=0: return (0,0)
+        try:
+            io=psutil.Process(pid).io_counters()
+            cur=(int(getattr(io,"write_bytes",0) or 0),int(getattr(io,"read_bytes",0) or 0))
+            prev=s._io_prev.get(pid); s._io_prev[pid]=cur
+            if not prev: return (0,0)
+            return (max(0,cur[0]-prev[0]),max(0,cur[1]-prev[1]))
+        except: return (0,0)
     def _proc(s,pid):
         if pid<=0: return ("System","-")
         c=prc_c.get(pid)
@@ -1369,6 +1396,8 @@ class HeadlessMonitor(QObject):
             "history_total": stats["total"],
             "history_blocked": stats["blocked"],
             "unique_ips": stats["unique_ips"],
+            "bytes_sent": stats.get("bytes_sent",0),
+            "bytes_recv": stats.get("bytes_recv",0),
             "auto_blocked_ips": len(self._blocked_ips),
             "threats": threats.get_stats(),
             "pipe": IPC_PIPE_NAME,
@@ -1454,7 +1483,7 @@ class HeadlessMonitor(QObject):
         if now - self._last_summary >= 60:
             self._last_summary = now
             stats = self.conn_db.get_stats()
-            _service_log(f"Service heartbeat: {stats['total']} connections, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs")
+            _service_log(f"Service heartbeat: {stats['total']} connections, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
             self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
@@ -2010,12 +2039,12 @@ class ConnectionsTab(QWidget):
         self.count_lbl=QLabel("0 connections"); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
         splitter=QSplitter(Qt.Horizontal)
-        self.table=QTableWidget(0,14)
-        cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Owner","Country","Category","Status"]
+        self.table=QTableWidget(0,16)
+        cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Owner","Country","Category","Sent","Recv","Status"]
         self.table.setHorizontalHeaderLabels(cols); self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False); self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setIconSize(QSize(16,16))
-        widths=[58,35,38,100,50,110,50,150,100,42,90,65,75,90]
+        widths=[58,35,38,100,50,110,50,150,100,42,90,65,75,70,70,90]
         for i,w in enumerate(widths): self.table.setColumnWidth(i,w)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self._ctx_menu)
         self.table.currentCellChanged.connect(self._on_select); splitter.addWidget(self.table)
@@ -2048,6 +2077,7 @@ class ConnectionsTab(QWidget):
         port_name=PORTS.get(int(ci.rp),ci.rp) if ci.rp and ci.rp.isdigit() else ci.rp
         self.detail.setPlainText(f"Process:  {ci.proc} (PID {ci.pid})\nPath:     {ci.path}\nRemote:   {ci.ra}:{ci.rp} ({port_name})\n"
             f"Hostname: {ci.host}\nOwner:    {ci.org}\nCountry:  {ci.country} ({ci.cc})\nCategory: {ci.category}\nProtocol: {ci.proto} | State: {ci.state}\nStatus:   {ci.stat}")
+        self.detail.append(f"I/O delta: {_fmt_bytes(ci.bytes_sent)} sent / {_fmt_bytes(ci.bytes_recv)} received")
     def _ctx_menu(self,pos):
         ci=self._get_sel_ci()
         if not ci: return
@@ -2115,7 +2145,7 @@ class ConnectionsTab(QWidget):
         for i,ci in enumerate(filtered):
             sc={"-":C['text'],"HOSTS:BLOCK":C['peach'],"FW:BLOCKED":C['red'],"POLICY:BLOCK":C['red']}
             color=QColor(sc.get(ci.stat,C['red'] if "BLOCK" in ci.stat else C['text']))
-            vals=[ci.ts,ci.dir,ci.proto,ci.la,ci.lp,ci.ra,ci.rp,ci.host,ci.proc,str(ci.pid),ci.org,f"{ci.country}",ci.category,ci.stat]
+            vals=[ci.ts,ci.dir,ci.proto,ci.la,ci.lp,ci.ra,ci.rp,ci.host,ci.proc,str(ci.pid),ci.org,f"{ci.country}",ci.category,_fmt_bytes(ci.bytes_sent),_fmt_bytes(ci.bytes_recv),ci.stat]
             for j,v in enumerate(vals):
                 it=QTableWidgetItem(v)
                 if ci.stat!="-": it.setForeground(color)
@@ -2460,8 +2490,8 @@ class HistoryTab(QWidget):
         tb.addWidget(_make_toolbar_btn("Search","primary",self._do_search)); tb.addStretch()
         self.count_lbl=QLabel(""); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
-        self.table=QTableWidget(0,15)
-        cols=["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","State","Owner","Country","Status"]
+        self.table=QTableWidget(0,17)
+        cols=["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","State","Owner","Country","Status","Sent","Recv"]
         self.table.setHorizontalHeaderLabels(cols); self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True); self.table.setAlternatingRowColors(True)
@@ -2480,7 +2510,9 @@ class HistoryTab(QWidget):
         rows=self.cdb.search(self.search.text().strip(),500,self._offset)
         self.table.setRowCount(len(rows))
         for i,r in enumerate(rows):
-            for j,v in enumerate(r[:15]): self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
+            for j,v in enumerate(r[:17]):
+                if j in (15,16): v=_fmt_bytes(v)
+                self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
         self.count_lbl.setText(f"{len(rows)} results"); self.total_lbl.setText(f"Total: {self.cdb.count()}")
 
@@ -2536,7 +2568,7 @@ class ToolsTab(QWidget):
         prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"config {s.get('last_config_reload','')} | {prev_txt}")
+             f"bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
