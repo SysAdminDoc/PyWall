@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.6 - Windows Firewall & Network Command Center
+PyWall v4.1.7 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -9,7 +9,7 @@ multiprocessing.freeze_support()
 
 import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io
 import tempfile, webbrowser, socket, datetime, ipaddress, logging
-import argparse, signal, hmac, secrets
+import argparse, signal, hmac, secrets, fnmatch
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.6"
+APP_VERSION = "4.1.7"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -155,6 +155,7 @@ SERVICE_LOG_PATH = os.path.join(SERVICE_STATE_DIR, "service.log")
 IPC_PIPE_NAME = r"\\.\pipe\PyWallService"
 IPC_TOKEN_PATH = os.path.join(SERVICE_STATE_DIR, "service.token")
 SERVICE_STATE_PATH = os.path.join(SERVICE_STATE_DIR, "service_state.json")
+QUOTA_STATE_PATH = os.path.join(CONFIG_DIR, "quota_state.json")
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -396,6 +397,11 @@ class FWRule:
 class ThreatEvent:
     ts:str=""; type:str=""; severity:str="medium"; source_ip:str=""
     details:str=""; action_taken:str=""; blocked:bool=False
+
+@dataclass
+class QuotaEvent:
+    key:str=""; period:str=""; app:str=""; path:str=""
+    limit:int=0; used:int=0; blocked:bool=False; message:str=""
 
 # ─── LRU Cache ──────────────────────────────────────────────────────────────
 class LRU:
@@ -942,6 +948,191 @@ def _fmt_duration(seconds):
     if m: return f"{m}m {s:02d}s"
     return f"{s}s"
 
+def _parse_bytes_limit(value):
+    if isinstance(value, (int, float)): return max(0, int(value))
+    if not isinstance(value, str): return 0
+    text = value.strip().lower().replace(" ", "")
+    m = re.match(r'^(\d+(?:\.\d+)?)(b|byte|bytes|kb|kib|mb|mib|gb|gib|tb|tib)?$', text)
+    if not m: return 0
+    n = float(m.group(1)); unit = m.group(2) or "b"
+    mult = {"b":1,"byte":1,"bytes":1,"kb":1024,"kib":1024,"mb":1024**2,"mib":1024**2,
+            "gb":1024**3,"gib":1024**3,"tb":1024**4,"tib":1024**4}.get(unit, 1)
+    return max(0, int(n * mult))
+
+class BandwidthQuotaEnforcer:
+    def __init__(s, owner="PyWall"):
+        s.owner = owner; s._lock = Lock(); s._quotas = {}; s._config_mtime = None
+        s._state = None; s._last_config_reload = ""; s._last_event = ""; s._blocked_count = 0
+
+    def load_config(s, cfg, mtime=None):
+        raw = cfg.get("bandwidth_quotas", {}) if isinstance(cfg, dict) else {}
+        quotas = {}
+        if isinstance(raw, list):
+            pairs = [(x.get("app") or x.get("match") or x.get("process") or x.get("path"), x) for x in raw if isinstance(x, dict)]
+        elif isinstance(raw, dict):
+            pairs = list(raw.items())
+        else:
+            pairs = []
+        for match, spec in pairs:
+            if not match: continue
+            spec = spec if isinstance(spec, dict) else {"limit": spec}
+            if spec.get("enabled", True) is False: continue
+            limit = _parse_bytes_limit(spec.get("limit", spec.get("bytes", spec.get("quota"))))
+            if limit <= 0: continue
+            key = s._norm(match)
+            quotas[key] = {
+                "key": key, "match": str(match), "limit": limit,
+                "window": str(spec.get("window", "day")).lower(),
+                "direction": str(spec.get("direction", "both")).lower(),
+                "action": str(spec.get("action", "block")).lower(),
+            }
+        with s._lock:
+            s._quotas = quotas; s._config_mtime = mtime
+            s._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds") if quotas else "none"
+
+    def reload_config_if_changed(s, force=False):
+        try: mtime = os.path.getmtime(CONFIG_PATH)
+        except FileNotFoundError:
+            if force or s._config_mtime is not None: s.load_config({}, None)
+            return
+        except Exception as e:
+            log.warning(f"Quota config stat failed: {e}"); return
+        if not force and s._config_mtime == mtime: return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f: cfg = json.load(f)
+            if not isinstance(cfg, dict): cfg = {}
+            s.load_config(cfg, mtime)
+        except Exception as e:
+            log.warning(f"Quota config reload failed: {e}")
+
+    def check(s, conns, db=None):
+        s.reload_config_if_changed()
+        with s._lock: quotas = list(s._quotas.items())
+        if not quotas or not conns: return []
+        s._ensure_state()
+        buckets = {}
+        now = datetime.datetime.now()
+        for c in conns:
+            for key, quota in quotas:
+                if not s._matches(quota, c): continue
+                delta = s._conn_delta(c, quota.get("direction", "both"))
+                if delta <= 0: continue
+                period = s._period(quota.get("window", "day"), now)
+                bucket = buckets.setdefault((period, key), {"quota": quota, "delta": 0, "samples": []})
+                bucket["delta"] += delta; bucket["samples"].append(c)
+        if not buckets: return []
+        pending = []
+        with s._lock:
+            usage = s._state.setdefault("usage", {})
+            blocked = s._state.setdefault("blocked", {})
+            for state_key, bucket in buckets.items():
+                period, key = state_key; quota = bucket["quota"]
+                sk = f"{period}|{key}"
+                used = int(usage.get(sk, 0) or 0) + int(bucket["delta"])
+                usage[sk] = used
+                if used >= quota["limit"] and sk not in blocked:
+                    blocked[sk] = {"at": now.isoformat(timespec="seconds"), "used": used, "limit": quota["limit"], "match": quota["match"], "blocked": False}
+                    pending.append((sk, period, key, quota, used, bucket["samples"]))
+            s._state["saved_at"] = now.isoformat(timespec="seconds")
+            s._save_state_locked()
+        events = []
+        for sk, period, key, quota, used, samples in pending:
+            ev = s._enforce(sk, period, key, quota, used, samples, db)
+            events.append(ev)
+        if events:
+            with s._lock:
+                blocked = s._state.setdefault("blocked", {})
+                for ev in events:
+                    rec = blocked.get(f"{ev.period}|{ev.key}", {})
+                    rec.update({"blocked": ev.blocked, "message": ev.message, "used": ev.used})
+                    blocked[f"{ev.period}|{ev.key}"] = rec
+                    s._last_event = f"{ev.app}: {_fmt_bytes(ev.used)}/{_fmt_bytes(ev.limit)}"
+                s._blocked_count = sum(1 for x in blocked.values() if x.get("blocked"))
+                s._save_state_locked()
+        return events
+
+    def snapshot(s):
+        s._ensure_state()
+        with s._lock:
+            return {"configured": len(s._quotas), "blocked": s._blocked_count, "last_event": s._last_event, "last_config_reload": s._last_config_reload, "state_path": QUOTA_STATE_PATH}
+
+    def _enforce(s, sk, period, key, quota, used, samples, db):
+        app = s._label(quota, samples); path = s._first_path(samples)
+        limit = quota["limit"]; messages = []; ok_any = False
+        if quota.get("action") not in ("notify", "warn", "log"):
+            if path:
+                ok, out = fw.block_program(path, "Outbound"); ok_any = ok_any or ok
+                messages.append(f"program={'ok' if ok else out}")
+            for ip in s._remote_ips(samples)[:6]:
+                ok, out = fw.block_ip(ip, "Outbound"); ok_any = ok_any or ok
+                messages.append(f"{ip}={'ok' if ok else out}")
+        else:
+            messages.append("notify only")
+        msg = "; ".join(messages) if messages else "no active program path or remote IP to block"
+        ev = QuotaEvent(key=key, period=period, app=app, path=path, limit=limit, used=used, blocked=ok_any, message=msg)
+        if db:
+            try: db.log_event(app, "quota_block" if ok_any else "quota_exceeded", s.owner, f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}; {msg}")
+            except: pass
+        return ev
+
+    def _ensure_state(s):
+        with s._lock:
+            if s._state is not None: return
+            try:
+                with open(QUOTA_STATE_PATH, "r", encoding="utf-8") as f: state = json.load(f)
+                if not isinstance(state, dict): state = {}
+            except: state = {}
+            state.setdefault("usage", {}); state.setdefault("blocked", {})
+            s._state = state; s._blocked_count = sum(1 for x in state.get("blocked", {}).values() if isinstance(x, dict) and x.get("blocked"))
+
+    def _save_state_locked(s):
+        try:
+            tmp = QUOTA_STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f: json.dump(s._state, f, indent=2, sort_keys=True)
+            os.replace(tmp, QUOTA_STATE_PATH)
+        except Exception as e: log.warning(f"Quota state save failed: {e}")
+
+    def _conn_delta(s, c, direction):
+        sent = int(getattr(c, "bytes_sent", 0) or 0); recv = int(getattr(c, "bytes_recv", 0) or 0)
+        if direction in ("sent", "send", "upload", "out", "outbound"): return sent
+        if direction in ("recv", "receive", "download", "in", "inbound"): return recv
+        return sent + recv
+
+    def _matches(s, quota, c):
+        key = quota["key"]
+        proc = s._norm(getattr(c, "proc", ""))
+        path = s._norm(getattr(c, "path", ""))
+        base = s._norm(os.path.basename(path)) if path else ""
+        values = [v for v in (proc, base, path) if v and v not in ("-", "?")]
+        return any(fnmatch.fnmatchcase(v, key) for v in values)
+
+    def _period(s, window, now):
+        if window in ("week", "weekly"):
+            iso = now.isocalendar(); return f"week:{iso.year}-W{iso.week:02d}"
+        if window in ("forever", "lifetime", "total"): return "lifetime"
+        return f"day:{now.date().isoformat()}"
+
+    def _label(s, quota, samples):
+        for c in samples:
+            if getattr(c, "proc", "") not in ("", "-", "?"): return c.proc
+        return quota.get("match", quota.get("key", "app"))
+
+    def _first_path(s, samples):
+        for c in samples:
+            path = getattr(c, "path", "")
+            if path and path not in ("-", "N/A"): return path
+        return ""
+
+    def _remote_ips(s, samples):
+        out = []
+        for c in samples:
+            ip = getattr(c, "ra", "")
+            if ip and ip not in ("*", "-") and not PRIV_RE.match(ip) and ip not in out: out.append(ip)
+        return out
+
+    def _norm(s, value):
+        return str(value or "").strip().lower().replace("/", "\\")
+
 # ─── Threat Detector ─────────────────────────────────────────────────────────
 class ThreatDetector:
     def __init__(self):
@@ -1355,6 +1546,7 @@ class HeadlessMonitor(QObject):
         self.db = HostsDB()
         self.hm = HostsFileManager()
         self.conn_db = ConnDB()
+        self._quota = BandwidthQuotaEnforcer("PyWallService")
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -1419,6 +1611,8 @@ class HeadlessMonitor(QObject):
         self._last_connection_count = len(conns)
         live = [c for c in conns if c.ra and c.ra != "*" and c.dir != "Listen"]
         if live: self.conn_db.insert_batch(live)
+        for ev in self._quota.check(live, db=self.db):
+            _service_log(f"Quota exceeded for {ev.app}: {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}; blocked={ev.blocked}; {ev.message}")
         self._enforce_threats()
 
     def snapshot(self):
@@ -1442,6 +1636,7 @@ class HeadlessMonitor(QObject):
             "pipe": IPC_PIPE_NAME,
             "config_path": CONFIG_PATH,
             "last_config_reload": self._last_config_reload,
+            "bandwidth_quotas": self._quota.snapshot(),
             "state_path": SERVICE_STATE_PATH,
             "previous_clean_shutdown": self._restored_state.get("clean_shutdown") if self._restored_state else None,
             "previous_saved_at": self._restored_state.get("saved_at") if self._restored_state else "",
@@ -1481,6 +1676,7 @@ class HeadlessMonitor(QObject):
             if force:
                 self._config_mtime = None
                 self._last_config_reload = "missing"
+                self._quota.load_config({})
             return
         except Exception as e:
             _service_log(f"Config stat failed: {e}", "WARNING")
@@ -1508,9 +1704,10 @@ class HeadlessMonitor(QObject):
             except: pass
         if self._timer.isActive() and self.poll_seconds != old_poll:
             self._timer.setInterval(int(self.poll_seconds * 1000))
+        self._quota.load_config(cfg, mtime)
         self._config_mtime = mtime
         self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -1522,7 +1719,8 @@ class HeadlessMonitor(QObject):
         if now - self._last_summary >= 60:
             self._last_summary = now
             stats = self.conn_db.get_stats()
-            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
+            qstats = self._quota.snapshot()
+            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
             self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
@@ -2620,9 +2818,10 @@ class ToolsTab(QWidget):
         mins=int(s.get("uptime_sec",0))//60
         prev=s.get("previous_clean_shutdown")
         prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
+        q=s.get("bandwidth_quotas",{}) if isinstance(s.get("bandwidth_quotas",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -2700,7 +2899,7 @@ class MainWindow(QMainWindow):
         self._notif_cooldown={}  # Rate-limit: domain -> last_notify_time
 
         # Core objects
-        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB()
+        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI")
 
         # Background workers
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
@@ -2872,10 +3071,22 @@ class MainWindow(QMainWindow):
         # Store to history DB
         live=[c for c in conns if c.ra and c.ra!="*" and c.dir!="Listen"]
         if live: self.conn_db.insert_batch(live)
+        for ev in self._quota.check(live, db=self.db):
+            self._on_quota_event(ev)
 
     def _on_evt_batch(self,evts):
         # Merge event worker data into connections view
         pass
+
+    def _on_quota_event(self,ev):
+        self._update_status(f"Quota blocked {ev.app}" if ev.blocked else f"Quota hit {ev.app}")
+        if not (hasattr(self,'_tray') and self._tray): return
+        key=f"quota:{ev.period}:{ev.key}"
+        now=time.time()
+        if key in self._notif_cooldown and now-self._notif_cooldown[key]<300: return
+        self._notif_cooldown[key]=now
+        title="Bandwidth quota blocked" if ev.blocked else "Bandwidth quota exceeded"
+        self._tray.showMessage(APP_NAME, f"{title}: {ev.app} {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}", QSystemTrayIcon.Warning, 4000)
 
     def _on_fw_block(self,ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra,'fw_blocked',ci.proc,f'FW blocked: {ci.ra}:{ci.rp}')

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.6-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.6"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.7-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.7"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -92,6 +92,10 @@ Per-app Allow / Block / Ask policies. See which apps are making connections, the
 
 SQLite-backed connection log with full-text search and filters (process, country, time range). Per-process sent/received byte deltas are captured from `psutil` I/O counters and rolled into per-connection sessions with first/last seen, duration, samples, and cumulative totals. Auto-pruning by configurable retention period.
 
+### Bandwidth Quotas
+
+Optional app quotas in `config.json` enforce daily, weekly, or lifetime byte caps by process name or executable path. When an app crosses its cap, PyWall records the event, shows a tray toast in GUI mode, creates an outbound program block when the executable path is known, and falls back to blocking active remote IPs.
+
 ### Scheduling
 
 Time-based rule scheduling -- enable or disable rules on a cron-like schedule. Network profile auto-switching. DNS-level blocking. Bandwidth quota monitoring.
@@ -162,6 +166,7 @@ Settings live in `%APPDATA%/PyWall/config.json`. Key options:
 | `threat_auto_block` | `false` | Auto-block detected threats |
 | `service_auto_block` | `true` | Override service-mode high-severity auto-blocking without restart |
 | `service_poll_seconds` | `2` | Override service-mode monitor/config polling interval without restart |
+| `bandwidth_quotas` | `{}` | App quota map, for example `{ "chrome.exe": { "limit": "5 GB", "window": "day" } }` |
 | `auto_block_inbound` | `true` | Block unsolicited inbound connections |
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
@@ -207,6 +212,7 @@ config.json     Settings, app profiles, blocklists
 service.log     Background service status and auto-block log (%ProgramData%/PyWall on Windows)
 service.token   Local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state
+quota_state.json  Persisted app quota counters and enforced-cap records
 plugins/        User and example plugin scripts
 ```
 
@@ -223,6 +229,7 @@ plugins/        User and example plugin scripts
 | `ReputationScorer` | Multi-signal scoring (VT, signatures, blocklists, GeoIP) |
 | `TrafficCategorizer` | Hostname/process classification into categories |
 | `RuleScheduler` | Cron-like rule enable/disable scheduling |
+| `BandwidthQuotaEnforcer` | Config-driven app byte caps with persisted counters, tray/service notifications, and firewall enforcement |
 | `NetworkProfileManager` | Auto-switching between Domain/Private/Public |
 | `PluginManager` | Dynamic plugin loading and event dispatch |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
@@ -237,7 +244,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Bandwidth quota enforcement** -- enforce app-level usage caps with toast feedback and firewall drops
+- **Daily/weekly reports** -- export app and connection usage as CSV and HTML
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic
