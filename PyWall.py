@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.12 - Windows Firewall & Network Command Center
+PyWall v4.1.13 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.12"
+APP_VERSION = "4.1.13"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -145,6 +145,7 @@ CONN_DB_PATH = os.path.join(CONFIG_DIR, "connections.db")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
 REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
+IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
 os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True)
 SERVICE_NAME = "PyWallService"
 SERVICE_DISPLAY_NAME = "PyWall Background Service"
@@ -409,6 +410,11 @@ class QuotaEvent:
 class DoHEvent:
     endpoint:str=""; host:str=""; app:str=""; action:str="warn"
     blocked:bool=False; message:str=""
+
+@dataclass
+class IDSRule:
+    name:str=""; severity:str="medium"; description:str=""; condition:str=""
+    action:str="warn"; mitre_tactic:str=""; mitre_technique:str=""; mitre_url:str=""
 
 # ─── LRU Cache ──────────────────────────────────────────────────────────────
 class LRU:
@@ -1221,6 +1227,113 @@ class DoHDetector:
     def snapshot(s):
         with s._lock: return {"enabled":s._enabled,"action":s._action,"detected":s._detected,"blocked":s._blocked}
 
+class IDSRuleEngine:
+    def __init__(s, owner="PyWall"):
+        s.owner=owner; s._lock=Lock(); s._enabled=True; s._path=IDS_RULES_PATH; s._rules=[]; s._rules_mtime=None; s._config_mtime=None; s._seen={}; s._hits=0; s._blocked=0
+    def configure(s,cfg=None,mtime=None):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        enabled=bool(cfg.get("ids_rules_enabled", True)); path=str(cfg.get("ids_rules_path", IDS_RULES_PATH) or IDS_RULES_PATH)
+        with s._lock:
+            if path != s._path: s._rules=[]; s._rules_mtime=None
+            s._enabled=enabled; s._path=path; s._config_mtime=mtime
+    def reload(s):
+        try: cmtime=os.path.getmtime(CONFIG_PATH)
+        except FileNotFoundError:
+            if s._config_mtime is not None: s.configure({}, None)
+            cmtime=None
+        except: cmtime=None
+        if cmtime is not None:
+            with s._lock:
+                same_config = s._config_mtime == cmtime
+            if not same_config:
+                try:
+                    with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
+                    s.configure(cfg if isinstance(cfg,dict) else {}, cmtime)
+                except: pass
+        with s._lock:
+            enabled,path,last=s._enabled,s._path,s._rules_mtime
+        if not enabled or not path or not os.path.exists(path): return
+        try: rmtime=os.path.getmtime(path)
+        except: return
+        if last == rmtime: return
+        try:
+            with open(path,"r",encoding="utf-8",errors="replace") as f: rules=s._parse_rules(f.read())
+            with s._lock: s._rules=rules; s._rules_mtime=rmtime
+        except Exception as e: log.warning(f"IDS rule load failed: {e}")
+    def check(s,conns,db=None):
+        s.reload()
+        with s._lock: rules=list(s._rules); enabled=s._enabled
+        if not enabled or not rules or not conns: return []
+        now=time.time(); hits=[]
+        for ci in conns:
+            for rule in rules:
+                if not s._match_rule(rule,ci): continue
+                key=f"{rule.name}|{ci.proc}|{ci.ra}|{ci.rp}"
+                with s._lock:
+                    if key in s._seen and now-s._seen[key]<300: continue
+                    s._seen[key]=now; s._hits+=1
+                blocked=False; msg="matched"
+                if rule.action=="block" and ci.ra and not PRIV_RE.match(ci.ra):
+                    ok,out=fw.block_ip(ci.ra,"Outbound"); blocked=ok; msg="blocked" if ok else out
+                    if ok:
+                        with s._lock: s._blocked+=1
+                threats.add_ids_hit(rule,ci,blocked)
+                target=ci.host if ci.host not in ("","-","...") else ci.ra
+                if db:
+                    try: db.log_event(target,"ids_block" if blocked else "ids_match",s.owner,f"{rule.name}: {msg}")
+                    except: pass
+                hits.append({"rule":rule.name,"app":ci.proc,"endpoint":ci.ra,"blocked":blocked,"message":msg})
+        return hits
+    def _parse_rules(s,text):
+        rules=[]; cur=None; in_cond=False
+        for raw in text.splitlines():
+            line=raw.strip()
+            if not line or line.startswith(("#","//")): continue
+            m=re.match(r'^rule\s+([A-Za-z0-9_.-]+)\s*\{?$',line,re.I)
+            if m:
+                cur={"name":m.group(1),"meta":{},"cond":[]}; in_cond=False; continue
+            if cur is None: continue
+            if line.startswith("}"):
+                cond=" ".join(cur["cond"]).strip().rstrip(";")
+                if cond: rules.append(s._build_rule(cur["name"],cur["meta"],cond))
+                cur=None; in_cond=False; continue
+            if line.lower().startswith("condition:"):
+                in_cond=True; rest=line.split(":",1)[1].strip()
+                if rest: cur["cond"].append(rest.rstrip(";"))
+                continue
+            if in_cond:
+                cur["cond"].append(line.rstrip(";")); continue
+            if "=" in line:
+                k,v=line.split("=",1); cur["meta"][k.strip().lower()]=v.strip().strip("\"'")
+        return rules
+    def _build_rule(s,name,meta,cond):
+        return IDSRule(name=name,severity=meta.get("severity","medium").lower(),description=meta.get("description",""),
+            condition=cond,action=meta.get("action","warn").lower(),mitre_tactic=meta.get("mitre_tactic",""),
+            mitre_technique=meta.get("mitre_technique",meta.get("mitre","")),mitre_url=meta.get("mitre_url",""))
+    def _match_rule(s,rule,ci):
+        for term in re.split(r'\s+and\s+',rule.condition,flags=re.I):
+            if term and not s._match_term(term.strip(),ci): return False
+        return True
+    def _match_term(s,term,ci):
+        fields={"host":ci.host,"proc":ci.proc,"process":ci.proc,"path":ci.path,"ip":ci.ra,"ra":ci.ra,"rp":ci.rp,
+            "port":ci.rp,"country":ci.country,"org":ci.org,"category":ci.category,"stat":ci.stat,"proto":ci.proto,"dir":ci.dir}
+        for op in ("contains","matches","==","!=","in"):
+            if op in term:
+                left,right=term.split(op,1); field=left.strip().lower(); val=str(fields.get(field,""))
+                rhs=right.strip().strip("\"'")
+                if op=="contains": return rhs.lower() in val.lower()
+                if op=="matches":
+                    try: return re.search(rhs,val,re.I) is not None
+                    except: return False
+                if op=="==": return val.lower()==rhs.lower()
+                if op=="!=": return val.lower()!=rhs.lower()
+                if op=="in":
+                    vals=[x.strip().strip("\"'") for x in rhs.strip("()[]").split(",")]
+                    return val.lower() in {x.lower() for x in vals}
+        return False
+    def snapshot(s):
+        with s._lock: return {"enabled":s._enabled,"path":s._path,"rules":len(s._rules),"hits":s._hits,"blocked":s._blocked}
+
 def export_usage_reports(report_dir=None):
     report_dir = report_dir or REPORT_DIR
     os.makedirs(report_dir, exist_ok=True)
@@ -1323,8 +1436,13 @@ class ThreatDetector:
         if cat=="Ads / Tracking": return True,"ads/tracking category"
         if host in ("","-","...") and org in ("","-","..."): return True,"unattributed endpoint"
         return False,""
-    def _add_event(self,etype,severity,ip,details):
-        mitre=_mitre_for_event(etype)
+    def add_ids_hit(self,rule,ci,blocked=False):
+        mitre={"tactic":rule.mitre_tactic or "Detection","technique":rule.mitre_technique or "IDS-lite Rule","url":rule.mitre_url or ""}
+        suffix="; blocked" if blocked else ""
+        with self._lock:
+            self._add_event("IDS_RULE",rule.severity,ci.ra,f"{rule.name}: {rule.description or rule.condition} ({ci.proc} -> {ci.ra}:{ci.rp}){suffix}",mitre)
+    def _add_event(self,etype,severity,ip,details,mitre=None):
+        mitre=mitre or _mitre_for_event(etype)
         evt=ThreatEvent(ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),type=etype,severity=severity,source_ip=ip,details=details,action_taken="Logged",
             mitre_tactic=mitre.get("tactic",""),mitre_technique=mitre.get("technique",""),mitre_url=mitre.get("url",""))
         self._events.append(evt)
@@ -1829,6 +1947,7 @@ class HeadlessMonitor(QObject):
         self.conn_db = ConnDB()
         self._quota = BandwidthQuotaEnforcer("PyWallService")
         self._doh = DoHDetector("PyWallService")
+        self._ids = IDSRuleEngine("PyWallService")
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -1899,6 +2018,8 @@ class HeadlessMonitor(QObject):
             _service_log(f"Quota exceeded for {ev.app}: {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}; blocked={ev.blocked}; {ev.message}")
         for ev in self._doh.check(live, db=self.db):
             _service_log(f"DoH {ev.action}: {ev.app} -> {ev.endpoint}; blocked={ev.blocked}; {ev.message}")
+        for hit in self._ids.check(live, db=self.db):
+            _service_log(f"IDS {hit['rule']}: {hit['app']} -> {hit['endpoint']}; blocked={hit['blocked']}; {hit['message']}")
         self._enforce_threats()
 
     def snapshot(self):
@@ -1924,6 +2045,7 @@ class HeadlessMonitor(QObject):
             "last_config_reload": self._last_config_reload,
             "bandwidth_quotas": self._quota.snapshot(),
             "doh": self._doh.snapshot(),
+            "ids": self._ids.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
             "previous_clean_shutdown": self._restored_state.get("clean_shutdown") if self._restored_state else None,
@@ -1966,6 +2088,7 @@ class HeadlessMonitor(QObject):
                 self._last_config_reload = "missing"
                 self._quota.load_config({})
                 self._doh.configure({})
+                self._ids.configure({})
                 self._tls_w.configure({})
             return
         except Exception as e:
@@ -1996,10 +2119,11 @@ class HeadlessMonitor(QObject):
             self._timer.setInterval(int(self.poll_seconds * 1000))
         self._quota.load_config(cfg, mtime)
         self._doh.configure(cfg, mtime)
+        self._ids.configure(cfg, mtime)
         self._tls_w.configure(cfg, mtime)
         self._config_mtime = mtime
         self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -2013,7 +2137,8 @@ class HeadlessMonitor(QObject):
             stats = self.conn_db.get_stats()
             qstats = self._quota.snapshot()
             dstats = self._doh.snapshot()
-            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
+            istats = self._ids.snapshot()
+            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {istats.get('hits',0)} IDS hits, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
             self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
@@ -3123,10 +3248,11 @@ class ToolsTab(QWidget):
         prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
         q=s.get("bandwidth_quotas",{}) if isinstance(s.get("bandwidth_quotas",{}),dict) else {}
         doh=s.get("doh",{}) if isinstance(s.get("doh",{}),dict) else {}
+        ids=s.get("ids",{}) if isinstance(s.get("ids",{}),dict) else {}
         tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -3211,7 +3337,7 @@ class MainWindow(QMainWindow):
         self._notif_cooldown={}  # Rate-limit: domain -> last_notify_time
 
         # Core objects
-        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI")
+        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI")
 
         # Background workers
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
@@ -3391,6 +3517,8 @@ class MainWindow(QMainWindow):
             self._on_quota_event(ev)
         for ev in self._doh.check(live, db=self.db):
             self._on_doh_event(ev)
+        for hit in self._ids.check(live, db=self.db):
+            self._on_ids_hit(hit)
 
     def _on_evt_batch(self,evts):
         # Merge event worker data into connections view
@@ -3415,6 +3543,16 @@ class MainWindow(QMainWindow):
         self._notif_cooldown[key]=now
         title="DoH endpoint blocked" if ev.blocked else "DoH endpoint detected"
         self._tray.showMessage(APP_NAME, f"{title}: {ev.app} -> {ev.endpoint}", QSystemTrayIcon.Warning, 4000)
+
+    def _on_ids_hit(self,hit):
+        self._update_status(f"IDS {hit.get('rule','rule')}")
+        if not (hasattr(self,'_tray') and self._tray): return
+        key=f"ids:{hit.get('rule')}:{hit.get('endpoint')}:{hit.get('app')}"
+        now=time.time()
+        if key in self._notif_cooldown and now-self._notif_cooldown[key]<300: return
+        self._notif_cooldown[key]=now
+        title="IDS rule blocked" if hit.get("blocked") else "IDS rule matched"
+        self._tray.showMessage(APP_NAME, f"{title}: {hit.get('rule')} {hit.get('app')} -> {hit.get('endpoint')}", QSystemTrayIcon.Warning, 4000)
 
     def _on_fw_block(self,ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra,'fw_blocked',ci.proc,f'FW blocked: {ci.ra}:{ci.rp}')

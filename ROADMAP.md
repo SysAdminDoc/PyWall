@@ -4,9 +4,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Planned Features
 
-### Detection
-- IDS-lite YARA-style rule file for connection metadata
-
 ### UI & Workflow
 - QAbstractTableModel migration for big rule sets (README TODO)
 - Per-rule scheduling UI parity with `RuleScheduler`

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.12-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.12"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.13-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.13"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -78,6 +78,7 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 - Optional TLS SNI ingestion from mitmproxy/Lumen-style JSONL, CSV, or text logs
 - DNS-over-HTTPS endpoint detection with configurable `warn`, `block`, or `ignore` action
 - Periodic outbound beacon detection for low-reputation or unattributed endpoints
+- IDS-lite YARA-style rule file for connection metadata matches
 - Custom IP/domain blocklist enforcement
 - VirusTotal hash lookups (bring your own API key)
 - Digital signature verification
@@ -177,10 +178,25 @@ Settings live in `%APPDATA%/PyWall/config.json`. Key options:
 | `tls_sni_read_existing` | `false` | Start reading the SNI log from the beginning instead of tailing only new lines |
 | `detect_doh` | `true` | Detect known DNS-over-HTTPS endpoints on HTTPS/TLS DNS ports |
 | `doh_action` | `warn` | DoH response: `warn`, `block`, or `ignore` |
+| `ids_rules_enabled` | `true` | Enable IDS-lite connection metadata rules |
+| `ids_rules_path` | `%APPDATA%/PyWall/ids_rules.yaral` | YARA-style rule file path |
 | `auto_block_inbound` | `true` | Block unsolicited inbound connections |
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
 | `vt_api_key` | `""` | VirusTotal API key |
+
+IDS-lite rule example:
+
+```text
+rule suspicious_powershell {
+  severity = high
+  action = block
+  mitre_tactic = Command and Control
+  mitre = T1071 Application Layer Protocol
+  condition:
+    proc contains "powershell" and rp in ("443","4444")
+}
+```
 
 Full config export/import with diff preview is available in Settings.
 
@@ -239,6 +255,7 @@ plugins/        User and example plugin scripts
 | `MITRE_MAPPINGS` | ATT&CK tactic/technique metadata attached to detector events |
 | `TLSLogWorker` | Opt-in mitmproxy/Lumen-style TLS SNI log tailer that feeds observed domains into the DNS feed |
 | `DoHDetector` | Known endpoint detector with warn/block policy for DNS-over-HTTPS and DNS-over-TLS connections |
+| `IDSRuleEngine` | YARA-style metadata rule loader/evaluator for live connection rows |
 | `AnomalyDetector` | GeoIP novelty, unusual hours, baseline deviation |
 | `ReputationScorer` | Multi-signal scoring (VT, signatures, blocklists, GeoIP) |
 | `TrafficCategorizer` | Hostname/process classification into categories |
@@ -259,7 +276,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **IDS-lite rules** -- YARA-style metadata rules for connection events
+- **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic

@@ -30,7 +30,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.12"])
+        self.assertEqual(versions, ["4.1.13"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -80,6 +80,11 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("_beacon_hits", TEXT)
         self.assertIn("BEACON", TEXT)
         self.assertIn("T1071 Application Layer Protocol", TEXT)
+        self.assertIn("IDSRuleEngine", TEXT)
+        self.assertIn("IDS_RULE", TEXT)
+        self.assertIn("ids_rules_path", TEXT)
+        self.assertIn("ids_rules.yaral", TEXT)
+        self.assertIn("ids_match", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())
