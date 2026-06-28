@@ -5,7 +5,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 ## Planned Features
 
 ### Detection
-- MITRE ATT&CK mapping on detector hits
 - SSL-MITM via Lumen / mitmproxy hook for TLS SNI logging (opt-in)
 - DNS-over-HTTPS detection with warn or block
 - Beacon detection (periodic outbound to low-reputation IP)

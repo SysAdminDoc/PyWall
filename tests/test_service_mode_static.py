@@ -30,7 +30,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.8"])
+        self.assertEqual(versions, ["4.1.9"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -61,6 +61,11 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("export_usage_reports", TEXT)
         self.assertIn("Export Usage Reports", TEXT)
         self.assertIn('"report"', TEXT)
+        self.assertIn("MITRE_MAPPINGS", TEXT)
+        self.assertIn("mitre_tactic", TEXT)
+        self.assertIn("mitre_technique", TEXT)
+        self.assertIn("T1046 Network Service Discovery", TEXT)
+        self.assertIn("T1110 Brute Force", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.8 - Windows Firewall & Network Command Center
+PyWall v4.1.9 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.8"
+APP_VERSION = "4.1.9"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -398,6 +398,7 @@ class FWRule:
 class ThreatEvent:
     ts:str=""; type:str=""; severity:str="medium"; source_ip:str=""
     details:str=""; action_taken:str=""; blocked:bool=False
+    mitre_tactic:str=""; mitre_technique:str=""; mitre_url:str=""
 
 @dataclass
 class QuotaEvent:
@@ -1188,6 +1189,22 @@ def export_usage_reports(report_dir=None):
         exports.append({"period": period, "csv": csv_path, "html": html_path, "rows": len(rows)})
     return exports
 
+MITRE_MAPPINGS = {
+    "PORT_SCAN": {
+        "tactic": "Discovery",
+        "technique": "T1046 Network Service Discovery",
+        "url": "https://attack.mitre.org/techniques/T1046/",
+    },
+    "BRUTE_FORCE": {
+        "tactic": "Credential Access",
+        "technique": "T1110 Brute Force",
+        "url": "https://attack.mitre.org/techniques/T1110/",
+    },
+}
+
+def _mitre_for_event(etype):
+    return MITRE_MAPPINGS.get(etype, {"tactic": "Unmapped", "technique": "Unmapped", "url": ""})
+
 # ─── Threat Detector ─────────────────────────────────────────────────────────
 class ThreatDetector:
     def __init__(self):
@@ -1207,7 +1224,9 @@ class ThreatDetector:
                     self._add_event("BRUTE_FORCE","high",ip,f"Brute force: {len(self._block_hits[ip])} blocked in 60s")
                     self._block_hits[ip].clear()
     def _add_event(self,etype,severity,ip,details):
-        evt=ThreatEvent(ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),type=etype,severity=severity,source_ip=ip,details=details,action_taken="Logged")
+        mitre=_mitre_for_event(etype)
+        evt=ThreatEvent(ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),type=etype,severity=severity,source_ip=ip,details=details,action_taken="Logged",
+            mitre_tactic=mitre.get("tactic",""),mitre_technique=mitre.get("technique",""),mitre_url=mitre.get("url",""))
         self._events.append(evt)
         if len(self._events)>self._max: self._events.pop(0)
     def get_events(self,n=100):
@@ -1783,7 +1802,8 @@ class HeadlessMonitor(QObject):
             key = f"{evt.ts}|{evt.type}|{evt.source_ip}"
             if key in self._processed_threats: continue
             self._processed_threats.add(key)
-            self.db.log_event(evt.source_ip, "threat", "PyWallService", f"{evt.type}: {evt.details}")
+            mitre = f"{evt.mitre_tactic} / {evt.mitre_technique}" if evt.mitre_technique else "Unmapped"
+            self.db.log_event(evt.source_ip, "threat", "PyWallService", f"{evt.type} [{mitre}]: {evt.details}")
             if self.auto_block and evt.severity == "high":
                 self._block_ip_all_directions(evt.source_ip, evt.type)
 
@@ -2729,10 +2749,10 @@ class SecurityTab(QWidget):
         tb=QHBoxLayout()
         tb.addWidget(_make_toolbar_btn("Refresh","dim",self.refresh))
         tb.addWidget(_make_toolbar_btn("Clear Events","danger",self._clear)); tb.addStretch(); lo.addLayout(tb)
-        self.table=QTableWidget(0,5)
-        self.table.setHorizontalHeaderLabels(["Time","Type","Severity","Source IP","Details"])
-        self.table.horizontalHeader().setSectionResizeMode(4,QHeaderView.Stretch)
-        for i,w in [(0,140),(1,100),(2,80),(3,120)]: self.table.setColumnWidth(i,w)
+        self.table=QTableWidget(0,6)
+        self.table.setHorizontalHeaderLabels(["Time","Type","Severity","Source IP","MITRE","Details"])
+        self.table.horizontalHeader().setSectionResizeMode(5,QHeaderView.Stretch)
+        for i,w in [(0,140),(1,100),(2,80),(3,120),(4,210)]: self.table.setColumnWidth(i,w)
         self.table.setAlternatingRowColors(True); self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.verticalHeader().setVisible(False)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self._ctx)
@@ -2756,7 +2776,9 @@ class SecurityTab(QWidget):
             self.table.setItem(i,0,QTableWidgetItem(e.ts)); self.table.setItem(i,1,QTableWidgetItem(e.type))
             si=QTableWidgetItem(e.severity.upper()); si.setForeground(QColor(C['red'] if e.severity=='high' else C['peach']))
             self.table.setItem(i,2,si); self.table.setItem(i,3,QTableWidgetItem(e.source_ip))
-            self.table.setItem(i,4,QTableWidgetItem(e.details))
+            mi=QTableWidgetItem(e.mitre_technique or "Unmapped")
+            if e.mitre_url: mi.setToolTip(e.mitre_url)
+            self.table.setItem(i,4,mi); self.table.setItem(i,5,QTableWidgetItem(e.details))
     def _bg_profile(self):
         try: self._last_prof=fw.get_profile_status()
         except: pass

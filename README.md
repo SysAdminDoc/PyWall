@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.8-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.8"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.9-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.9"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -74,6 +74,7 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 
 - Port scan detection (configurable unique-port threshold within a time window)
 - Brute force detection (repeated blocked connection attempts)
+- MITRE ATT&CK mapping on detector hits (`T1046` network service discovery and `T1110` brute force)
 - Custom IP/domain blocklist enforcement
 - VirusTotal hash lookups (bring your own API key)
 - Digital signature verification
@@ -227,6 +228,7 @@ plugins/        User and example plugin scripts
 | `EvtWorker` | Windows Security Event Log monitor (audit events) |
 | `DNSWorker` / `WhoWorker` / `GeoIPWorker` | Async resolution with LRU caches |
 | `ThreatDetector` | Port scan and brute force heuristics |
+| `MITRE_MAPPINGS` | ATT&CK tactic/technique metadata attached to detector events |
 | `AnomalyDetector` | GeoIP novelty, unusual hours, baseline deviation |
 | `ReputationScorer` | Multi-signal scoring (VT, signatures, blocklists, GeoIP) |
 | `TrafficCategorizer` | Hostname/process classification into categories |
@@ -247,7 +249,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **MITRE mapping** -- map detector hits to ATT&CK tactics and techniques
+- **DoH detection** -- warn or block DNS-over-HTTPS endpoints
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic
