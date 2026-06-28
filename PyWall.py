@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.11 - Windows Firewall & Network Command Center
+PyWall v4.1.12 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.11"
+APP_VERSION = "4.1.12"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -1269,6 +1269,11 @@ MITRE_MAPPINGS = {
         "technique": "T1110 Brute Force",
         "url": "https://attack.mitre.org/techniques/T1110/",
     },
+    "BEACON": {
+        "tactic": "Command and Control",
+        "technique": "T1071 Application Layer Protocol",
+        "url": "https://attack.mitre.org/techniques/T1071/",
+    },
 }
 
 def _mitre_for_event(etype):
@@ -1277,7 +1282,7 @@ def _mitre_for_event(etype):
 # ─── Threat Detector ─────────────────────────────────────────────────────────
 class ThreatDetector:
     def __init__(self):
-        self._lock=Lock(); self._port_hits=defaultdict(list); self._block_hits=defaultdict(list)
+        self._lock=Lock(); self._port_hits=defaultdict(list); self._block_hits=defaultdict(list); self._beacon_hits=defaultdict(list); self._beacon_alerts={}
         self._events=[]; self._max=500
     def record(self,ip,port,blocked=False):
         with self._lock:
@@ -1292,6 +1297,32 @@ class ThreatDetector:
                 if len(self._block_hits[ip])>=10:
                     self._add_event("BRUTE_FORCE","high",ip,f"Brute force: {len(self._block_hits[ip])} blocked in 60s")
                     self._block_hits[ip].clear()
+    def record_beacon(self,ci):
+        ip=getattr(ci,"ra","")
+        if not ip or ip in ("*","-") or PRIV_RE.match(ip) or getattr(ci,"dir","")!="Out": return
+        low,reason=self._low_rep_reason(ci)
+        if not low: return
+        now=time.time(); key=f"{getattr(ci,'proc','?')}|{ip}|{getattr(ci,'rp','')}"
+        with self._lock:
+            hits=self._beacon_hits[key]
+            if hits and now-hits[-1] < 10: return
+            hits.append(now); hits[:]=[t for t in hits if now-t<1800][-10:]
+            if len(hits)<5: return
+            recent=hits[-5:]; intervals=[recent[i]-recent[i-1] for i in range(1,len(recent))]
+            avg=sum(intervals)/len(intervals)
+            if avg<20: return
+            drift=max(abs(x-avg) for x in intervals)/avg if avg else 1
+            if drift>0.35: return
+            if key in self._beacon_alerts and now-self._beacon_alerts[key]<1800: return
+            self._beacon_alerts[key]=now
+            self._add_event("BEACON","high",ip,f"Periodic outbound beacon from {ci.proc} to {ip}:{ci.rp} every ~{int(avg)}s ({reason})")
+    def _low_rep_reason(self,ci):
+        stat=(getattr(ci,"stat","") or "").upper(); cat=getattr(ci,"category","") or ""
+        host=getattr(ci,"host","") or ""; org=getattr(ci,"org","") or ""
+        if "BLOCK" in stat or "DOH" in stat: return True,"flagged endpoint"
+        if cat=="Ads / Tracking": return True,"ads/tracking category"
+        if host in ("","-","...") and org in ("","-","..."): return True,"unattributed endpoint"
+        return False,""
     def _add_event(self,etype,severity,ip,details):
         mitre=_mitre_for_event(etype)
         evt=ThreatEvent(ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),type=etype,severity=severity,source_ip=ip,details=details,action_taken="Logged",
@@ -1556,6 +1587,7 @@ class ConnWorker(QThread):
                     if geo_c.get(ra) is None: s.need_geo.emit(ra)
                 ci=CI(key=key,ts=now,src="Live",dir=d,proto=proto,la=la,lp=lp,ra=ra or "*",rp=rp or "*",
                     host=h or "-",proc=pn,pid=pid,state=st,path=pp,org=o or "-",stat=rs,country=country,cc=cc,category=cat,bytes_sent=bs,bytes_recv=br)
+                if ra and ra!="*" and d!="Listen": threats.record_beacon(ci)
                 out.append(ci)
             except: continue
         for pid in list(s._io_prev):

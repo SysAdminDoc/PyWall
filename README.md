@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.11-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.11"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.12-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.12"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -77,6 +77,7 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 - MITRE ATT&CK mapping on detector hits (`T1046` network service discovery and `T1110` brute force)
 - Optional TLS SNI ingestion from mitmproxy/Lumen-style JSONL, CSV, or text logs
 - DNS-over-HTTPS endpoint detection with configurable `warn`, `block`, or `ignore` action
+- Periodic outbound beacon detection for low-reputation or unattributed endpoints
 - Custom IP/domain blocklist enforcement
 - VirusTotal hash lookups (bring your own API key)
 - Digital signature verification
@@ -234,7 +235,7 @@ plugins/        User and example plugin scripts
 | `ConnWorker` | Background thread polling `psutil.net_connections()` |
 | `EvtWorker` | Windows Security Event Log monitor (audit events) |
 | `DNSWorker` / `WhoWorker` / `GeoIPWorker` | Async resolution with LRU caches |
-| `ThreatDetector` | Port scan and brute force heuristics |
+| `ThreatDetector` | Port scan, brute force, and periodic beacon heuristics |
 | `MITRE_MAPPINGS` | ATT&CK tactic/technique metadata attached to detector events |
 | `TLSLogWorker` | Opt-in mitmproxy/Lumen-style TLS SNI log tailer that feeds observed domains into the DNS feed |
 | `DoHDetector` | Known endpoint detector with warn/block policy for DNS-over-HTTPS and DNS-over-TLS connections |
@@ -258,7 +259,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Beacon detection** -- identify periodic outbound traffic to low-reputation endpoints
+- **IDS-lite rules** -- YARA-style metadata rules for connection events
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic
