@@ -5,7 +5,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 ## Planned Features
 
 ### UI & Workflow
-- QAbstractTableModel migration for big rule sets (README TODO)
 - Per-rule scheduling UI parity with `RuleScheduler`
 - Full rule dependency graph view ("if I delete this, what breaks?")
 - Bulk rule edit (pattern match, set action, apply)

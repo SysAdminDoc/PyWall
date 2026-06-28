@@ -30,7 +30,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.13"])
+        self.assertEqual(versions, ["4.1.14"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -85,6 +85,10 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("ids_rules_path", TEXT)
         self.assertIn("ids_rules.yaral", TEXT)
         self.assertIn("ids_match", TEXT)
+        self.assertIn("FirewallRuleTableModel", TEXT)
+        self.assertIn("QTableView", TEXT)
+        self.assertIn("set_rules", TEXT)
+        self.assertIn("QAbstractTableModel", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())

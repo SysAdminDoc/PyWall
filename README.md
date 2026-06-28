@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.13-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.13"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.14-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.14"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -267,6 +267,7 @@ plugins/        User and example plugin scripts
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
+| `FirewallRuleTableModel` | QAbstractTableModel-backed firewall rule table for large rule sets |
 | `MainWindow` | PyQt5 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
 
 ---
@@ -276,7 +277,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
+- **Rule scheduling UI** -- parity with the existing `RuleScheduler`
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic

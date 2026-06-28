@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.13 - Windows Firewall & Network Command Center
+PyWall v4.1.14 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.13"
+APP_VERSION = "4.1.14"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -348,9 +348,9 @@ QTabBar::tab:hover:!selected {{ color:{C['text']}; background:rgba(122,162,247,0
 QTabBar::tab:first {{ margin-left:8px; }}
 
 /* ── Tables ── */
-QTableWidget {{ background:{C['mantle']}; alternate-background-color:rgba(20,20,34,0.5); color:{C['text']}; border:1px solid {C['surface0']}; border-radius:10px;
+QTableWidget,QTableView {{ background:{C['mantle']}; alternate-background-color:rgba(20,20,34,0.5); color:{C['text']}; border:1px solid {C['surface0']}; border-radius:10px;
     gridline-color:rgba(58,58,92,0.3); selection-background-color:{C['sel_bg']}; selection-color:{C['text']}; outline:none; }}
-QTableWidget::item {{ padding:5px 10px; border:none; }} QTableWidget::item:selected {{ background:{C['sel_bg']}; }}
+QTableWidget::item,QTableView::item {{ padding:5px 10px; border:none; }} QTableWidget::item:selected,QTableView::item:selected {{ background:{C['sel_bg']}; }}
 QHeaderView {{ background:transparent; }}
 QHeaderView::section {{ background:{C['crust']}; color:{C['overlay']}; border:none; border-bottom:1px solid {C['surface0']}; border-right:1px solid rgba(58,58,92,0.3);
     padding:9px 12px; font-weight:700; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; }}
@@ -2816,6 +2816,51 @@ class ConnectionsTab(QWidget):
         self.count_lbl.setText(f"{len(filtered)}/{len(self._data)} connections")
 
 
+class FirewallRuleTableModel(QAbstractTableModel):
+    HEADERS=["Enabled","Name","Direction","Action","Protocol","Remote Addr","Program","Source"]
+    def __init__(self,parent=None):
+        super().__init__(parent); self._rules=[]
+    def set_rules(self,rules):
+        self.beginResetModel(); self._rules=list(rules or []); self.endResetModel()
+    def rowCount(self,parent=QModelIndex()): return 0 if parent.isValid() else len(self._rules)
+    def columnCount(self,parent=QModelIndex()): return 0 if parent.isValid() else len(self.HEADERS)
+    def data(self,index,role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        try: r=self._rules[index.row()]
+        except: return None
+        col=index.column()
+        if role in (Qt.DisplayRole,Qt.ToolTipRole):
+            return self._value(r,col,tooltip=(role==Qt.ToolTipRole))
+        if role==Qt.ForegroundRole:
+            if col==0: return QColor(C['green'] if r.enabled else C['red'])
+            if col==3: return QColor(C['red'] if r.action=="Block" else C['green'])
+        return None
+    def headerData(self,section,orientation,role=Qt.DisplayRole):
+        if role==Qt.DisplayRole and orientation==Qt.Horizontal and 0<=section<len(self.HEADERS): return self.HEADERS[section]
+        return None
+    def sort(self,column,order=Qt.AscendingOrder):
+        rev=order==Qt.DescendingOrder
+        self.layoutAboutToBeChanged.emit()
+        self._rules.sort(key=lambda r:str(self._value(r,column,tooltip=True)).lower(), reverse=rev)
+        self.layoutChanged.emit()
+    def rule_at(self,row):
+        return self._rules[row] if 0<=row<len(self._rules) else None
+    def _value(self,r,col,tooltip=False):
+        if col==0: return "ON" if r.enabled else "OFF"
+        if col==1: return r.name or ""
+        if col==2: return r.direction or ""
+        if col==3: return r.action or ""
+        if col==4: return r.protocol or ""
+        if col==5:
+            addr=(r.remote_addr or "") if (r.remote_addr or "") not in ("Any","*","") else "Any"
+            return addr if tooltip else addr[:50]
+        if col==6:
+            if tooltip: return r.program or ""
+            try: return Path(r.program).name if r.program else ""
+            except: return r.program or ""
+        if col==7: return r.source or ""
+        return ""
+
 # ─── Firewall Rules Tab ─────────────────────────────────────────────────────
 class FirewallTab(QWidget):
     def __init__(self):
@@ -2838,8 +2883,9 @@ class FirewallTab(QWidget):
         self.del_all_btn=_make_toolbar_btn("Delete All HG","danger",self._delete_all_hg); tb.addWidget(self.del_all_btn)
         lo.addLayout(tb)
         self.prog_lbl=QLabel(""); self.prog_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;"); lo.addWidget(self.prog_lbl)
-        self.table=QTableWidget(0,8)
-        self.table.setHorizontalHeaderLabels(["Enabled","Name","Direction","Action","Protocol","Remote Addr","Program","Source"])
+        self._model=FirewallRuleTableModel(self)
+        self.table=QTableView()
+        self.table.setModel(self._model)
         self.table.horizontalHeader().setSectionResizeMode(1,QHeaderView.Stretch)
         for i,w in [(0,55),(2,75),(3,60),(4,60),(5,160),(6,180),(7,80)]: self.table.setColumnWidth(i,w)
         self.table.setAlternatingRowColors(True); self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -2862,32 +2908,19 @@ class FirewallTab(QWidget):
             elif "System" in f: rules=[r for r in rules if r.source=="system"]
             elif "Block" in f: rules=[r for r in rules if r.action=="Block"]
             elif "Allow" in f: rules=[r for r in rules if r.action=="Allow"]
-            self.table.setSortingEnabled(False); self.table.setRowCount(len(rules))
-            for i,r in enumerate(rules):
-                en_item=QTableWidgetItem("ON" if r.enabled else "OFF")
-                en_item.setForeground(QColor(C['green'] if r.enabled else C['red'])); self.table.setItem(i,0,en_item)
-                self.table.setItem(i,1,QTableWidgetItem(r.name or ""))
-                self.table.setItem(i,2,QTableWidgetItem(r.direction or ""))
-                ai=QTableWidgetItem(r.action or ""); ai.setForeground(QColor(C['red'] if r.action=="Block" else C['green'])); self.table.setItem(i,3,ai)
-                self.table.setItem(i,4,QTableWidgetItem(r.protocol or ""))
-                addr=(r.remote_addr or "") if (r.remote_addr or "") not in ("Any","*","") else "Any"
-                self.table.setItem(i,5,QTableWidgetItem(addr[:50]))
-                try: prog=Path(r.program).name if r.program else ""
-                except: prog=r.program or ""
-                self.table.setItem(i,6,QTableWidgetItem(prog)); self.table.setItem(i,7,QTableWidgetItem(r.source or ""))
-            self.table.setSortingEnabled(True)
+            self.table.setSortingEnabled(False); self._model.set_rules(rules); self.table.setSortingEnabled(True)
             hg_ct=sum(1 for r in self._rules if r.source=="pywall")
             self.slbl.setText(f"{len(rules)} shown  |  {len(self._rules)} total  |  {hg_ct} PyWall rules")
         except Exception as e:
             self.slbl.setText(f"Error loading rules: {e}"); log.warning(f"_apply_filter error: {e}")
     def _ctx_menu(self,pos):
-        r=self.table.currentRow()
-        if r<0: return
-        name_item=self.table.item(r,1)
-        if not name_item: return
-        name=name_item.text()
+        idx=self.table.currentIndex()
+        if not idx.isValid(): return
+        rule=self._model.rule_at(idx.row())
+        if not rule: return
+        name=rule.name
         if not name: return
-        en_item=self.table.item(r,0); is_on=en_item and en_item.text()=="ON"
+        is_on=bool(rule.enabled)
         menu=QMenu(self); menu.setStyleSheet(_CTX_STYLE)
         menu.addAction("Disable" if is_on else "Enable").triggered.connect(lambda:self._toggle_rule(name,not is_on))
         menu.addAction("Delete Rule").triggered.connect(lambda:self._delete_rule(name))
