@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.5-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.5"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.6-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.6"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -90,7 +90,7 @@ Per-app Allow / Block / Ask policies. See which apps are making connections, the
 
 ### History & Timeline
 
-SQLite-backed connection log with full-text search and filters (process, country, time range). Per-process sent/received byte deltas are captured from `psutil` I/O counters and displayed in live/history views. Auto-pruning by configurable retention period.
+SQLite-backed connection log with full-text search and filters (process, country, time range). Per-process sent/received byte deltas are captured from `psutil` I/O counters and rolled into per-connection sessions with first/last seen, duration, samples, and cumulative totals. Auto-pruning by configurable retention period.
 
 ### Scheduling
 
@@ -237,7 +237,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Per-connection duration totals** -- roll live connection observations into stable session totals
+- **Bandwidth quota enforcement** -- enforce app-level usage caps with toast feedback and firewall drops
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic

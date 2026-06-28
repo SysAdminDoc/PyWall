@@ -5,7 +5,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 ## Planned Features
 
 ### Accounting
-- Per-connection duration + data totals
 - Bandwidth quota per app with toast + enforced drop
 - Daily/weekly usage report (CSV + HTML)
 
