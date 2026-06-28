@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.10 - Windows Firewall & Network Command Center
+PyWall v4.1.11 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.10"
+APP_VERSION = "4.1.11"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -405,6 +405,11 @@ class QuotaEvent:
     key:str=""; period:str=""; app:str=""; path:str=""
     limit:int=0; used:int=0; blocked:bool=False; message:str=""
 
+@dataclass
+class DoHEvent:
+    endpoint:str=""; host:str=""; app:str=""; action:str="warn"
+    blocked:bool=False; message:str=""
+
 # ─── LRU Cache ──────────────────────────────────────────────────────────────
 class LRU:
     def __init__(s,c=5000): s._d=OrderedDict(); s._l=Lock(); s._c=c
@@ -479,6 +484,21 @@ def categorize_traffic(host, ip, port):
     if p in (53,5353): return "DNS"
     if p in (25,110,143,465,587,993,995): return "Email"
     return ""
+
+DOH_IPS = {
+    "1.1.1.1","1.0.0.1","2606:4700:4700::1111","2606:4700:4700::1001",
+    "8.8.8.8","8.8.4.4","2001:4860:4860::8888","2001:4860:4860::8844",
+    "9.9.9.9","149.112.112.112","2620:fe::fe","2620:fe::9",
+    "94.140.14.14","94.140.15.15","208.67.222.222","208.67.220.220",
+}
+DOH_HOST_PATTERNS = ("dns.google","cloudflare-dns.com","mozilla.cloudflare-dns.com","dns.quad9.net","dns.adguard.com","doh.opendns.com","dns.nextdns.io","doh.")
+
+def detect_doh_endpoint(host, ip, port):
+    try: p = int(str(port).split(",")[0])
+    except: p = 0
+    if p not in (443, 853): return False
+    text = (host or "").lower()
+    return (ip in DOH_IPS) or any(pat in text for pat in DOH_HOST_PATTERNS)
 
 def open_research(domain):
     root = get_root_domain(domain)
@@ -1152,6 +1172,55 @@ class BandwidthQuotaEnforcer:
     def _norm(s, value):
         return str(value or "").strip().lower().replace("/", "\\")
 
+class DoHDetector:
+    def __init__(s, owner="PyWall"):
+        s.owner=owner; s._lock=Lock(); s._enabled=True; s._action="warn"; s._config_mtime=None
+        s._seen={}; s._detected=0; s._blocked=0
+    def configure(s,cfg=None,mtime=None):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        enabled = bool(cfg.get("detect_doh", True))
+        action = str(cfg.get("doh_action", "block" if cfg.get("doh_block", False) else "warn")).lower()
+        if action not in ("warn","block","ignore"): action = "warn"
+        with s._lock:
+            s._enabled=enabled; s._action=action; s._config_mtime=mtime
+    def reload_config_if_changed(s,force=False):
+        try: mtime=os.path.getmtime(CONFIG_PATH)
+        except FileNotFoundError:
+            if force or s._config_mtime is not None: s.configure({}, None)
+            return
+        except: return
+        with s._lock:
+            if not force and s._config_mtime == mtime: return
+        try:
+            with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
+            s.configure(cfg if isinstance(cfg,dict) else {}, mtime)
+        except: pass
+    def check(s,conns,db=None):
+        s.reload_config_if_changed()
+        with s._lock: enabled,action=s._enabled,s._action
+        if not enabled or action=="ignore": return []
+        now=time.time(); events=[]
+        for c in conns:
+            if not detect_doh_endpoint(c.host, c.ra, c.rp): continue
+            key=f"{c.ra}|{c.rp}|{c.proc}"
+            with s._lock:
+                if key in s._seen and now-s._seen[key]<300: continue
+                s._seen[key]=now; s._detected+=1
+            blocked=False; msg="warned"
+            if action=="block" and c.ra and not PRIV_RE.match(c.ra):
+                ok,out=fw.block_ip(c.ra,"Outbound"); blocked=ok; msg="blocked" if ok else out
+                if ok:
+                    with s._lock: s._blocked+=1
+            target = c.host if c.host not in ("","-","...") else c.ra
+            ev=DoHEvent(endpoint=c.ra,host=c.host,app=c.proc,action=action,blocked=blocked,message=msg)
+            events.append(ev)
+            if db:
+                try: db.log_event(target,"doh_block" if blocked else "doh_warn",s.owner,f"{c.proc} -> {c.ra}:{c.rp}; {msg}")
+                except: pass
+        return events
+    def snapshot(s):
+        with s._lock: return {"enabled":s._enabled,"action":s._action,"detected":s._detected,"blocked":s._blocked}
+
 def export_usage_reports(report_dir=None):
     report_dir = report_dir or REPORT_DIR
     os.makedirs(report_dir, exist_ok=True)
@@ -1477,6 +1546,9 @@ class ConnWorker(QThread):
                     root=get_root_domain(h)
                     if h in blocked_domains or root in blocked_domains: rs="HOSTS:BLOCK"
                 cat=categorize_traffic(h if h and h not in ("...","-") else "",ra,rp)
+                if detect_doh_endpoint(h,ra,rp):
+                    rs = "DOH:WARN" if rs=="-" else f"{rs};DOH:WARN"
+                    cat = "DNS-over-HTTPS"
                 if ra and ra!="*" and d!="Listen":
                     threats.record(ra,rp,blocked=(rs!="-"))
                     if dns_c.get(ra) is None: s.need_dns.emit(ra)
@@ -1724,6 +1796,7 @@ class HeadlessMonitor(QObject):
         self.hm = HostsFileManager()
         self.conn_db = ConnDB()
         self._quota = BandwidthQuotaEnforcer("PyWallService")
+        self._doh = DoHDetector("PyWallService")
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -1792,6 +1865,8 @@ class HeadlessMonitor(QObject):
         if live: self.conn_db.insert_batch(live)
         for ev in self._quota.check(live, db=self.db):
             _service_log(f"Quota exceeded for {ev.app}: {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}; blocked={ev.blocked}; {ev.message}")
+        for ev in self._doh.check(live, db=self.db):
+            _service_log(f"DoH {ev.action}: {ev.app} -> {ev.endpoint}; blocked={ev.blocked}; {ev.message}")
         self._enforce_threats()
 
     def snapshot(self):
@@ -1816,6 +1891,7 @@ class HeadlessMonitor(QObject):
             "config_path": CONFIG_PATH,
             "last_config_reload": self._last_config_reload,
             "bandwidth_quotas": self._quota.snapshot(),
+            "doh": self._doh.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
             "previous_clean_shutdown": self._restored_state.get("clean_shutdown") if self._restored_state else None,
@@ -1857,6 +1933,7 @@ class HeadlessMonitor(QObject):
                 self._config_mtime = None
                 self._last_config_reload = "missing"
                 self._quota.load_config({})
+                self._doh.configure({})
                 self._tls_w.configure({})
             return
         except Exception as e:
@@ -1886,10 +1963,11 @@ class HeadlessMonitor(QObject):
         if self._timer.isActive() and self.poll_seconds != old_poll:
             self._timer.setInterval(int(self.poll_seconds * 1000))
         self._quota.load_config(cfg, mtime)
+        self._doh.configure(cfg, mtime)
         self._tls_w.configure(cfg, mtime)
         self._config_mtime = mtime
         self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -1902,7 +1980,8 @@ class HeadlessMonitor(QObject):
             self._last_summary = now
             stats = self.conn_db.get_stats()
             qstats = self._quota.snapshot()
-            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
+            dstats = self._doh.snapshot()
+            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
             self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
@@ -3011,10 +3090,11 @@ class ToolsTab(QWidget):
         prev=s.get("previous_clean_shutdown")
         prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
         q=s.get("bandwidth_quotas",{}) if isinstance(s.get("bandwidth_quotas",{}),dict) else {}
+        doh=s.get("doh",{}) if isinstance(s.get("doh",{}),dict) else {}
         tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -3099,7 +3179,7 @@ class MainWindow(QMainWindow):
         self._notif_cooldown={}  # Rate-limit: domain -> last_notify_time
 
         # Core objects
-        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI")
+        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI")
 
         # Background workers
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
@@ -3277,6 +3357,8 @@ class MainWindow(QMainWindow):
         if live: self.conn_db.insert_batch(live)
         for ev in self._quota.check(live, db=self.db):
             self._on_quota_event(ev)
+        for ev in self._doh.check(live, db=self.db):
+            self._on_doh_event(ev)
 
     def _on_evt_batch(self,evts):
         # Merge event worker data into connections view
@@ -3291,6 +3373,16 @@ class MainWindow(QMainWindow):
         self._notif_cooldown[key]=now
         title="Bandwidth quota blocked" if ev.blocked else "Bandwidth quota exceeded"
         self._tray.showMessage(APP_NAME, f"{title}: {ev.app} {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}", QSystemTrayIcon.Warning, 4000)
+
+    def _on_doh_event(self,ev):
+        self._update_status(f"DoH blocked {ev.endpoint}" if ev.blocked else f"DoH warning {ev.endpoint}")
+        if not (hasattr(self,'_tray') and self._tray): return
+        key=f"doh:{ev.endpoint}:{ev.app}"
+        now=time.time()
+        if key in self._notif_cooldown and now-self._notif_cooldown[key]<300: return
+        self._notif_cooldown[key]=now
+        title="DoH endpoint blocked" if ev.blocked else "DoH endpoint detected"
+        self._tray.showMessage(APP_NAME, f"{title}: {ev.app} -> {ev.endpoint}", QSystemTrayIcon.Warning, 4000)
 
     def _on_fw_block(self,ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra,'fw_blocked',ci.proc,f'FW blocked: {ci.ra}:{ci.rp}')

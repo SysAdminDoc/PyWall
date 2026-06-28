@@ -30,7 +30,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.10"])
+        self.assertEqual(versions, ["4.1.11"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -71,6 +71,11 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("tls_sni_log_path", TEXT)
         self.assertIn("tls_sni_read_existing", TEXT)
         self.assertIn("tls_sni", TEXT)
+        self.assertIn("DoHDetector", TEXT)
+        self.assertIn("detect_doh_endpoint", TEXT)
+        self.assertIn("doh_action", TEXT)
+        self.assertIn("DOH:WARN", TEXT)
+        self.assertIn("dns.google", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())
