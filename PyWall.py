@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.7 - Windows Firewall & Network Command Center
+PyWall v4.1.8 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
 import multiprocessing
 multiprocessing.freeze_support()
 
-import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io
+import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io, html
 import tempfile, webbrowser, socket, datetime, ipaddress, logging
 import argparse, signal, hmac, secrets, fnmatch
 from pathlib import Path
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.7"
+APP_VERSION = "4.1.8"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -144,6 +144,7 @@ if not os.path.exists(DB_PATH) and os.path.exists(LEGACY_DB_PATH):
 CONN_DB_PATH = os.path.join(CONFIG_DIR, "connections.db")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
+REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
 os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True)
 SERVICE_NAME = "PyWallService"
 SERVICE_DISPLAY_NAME = "PyWall Background Service"
@@ -714,6 +715,23 @@ class ConnDB:
                 active_sessions=self._conn.execute("SELECT COUNT(*) FROM connection_sessions WHERE active=1").fetchone()[0]
                 return {"total":total,"blocked":blocked,"unique_ips":unique_ips,"bytes_sent":sent,"bytes_recv":recv,"sessions":sessions,"active_sessions":active_sessions}
             except: return {"total":0,"blocked":0,"unique_ips":0,"bytes_sent":0,"bytes_recv":0,"sessions":0,"active_sessions":0}
+    def usage_report(self,days=1,limit=1000):
+        with self._lock:
+            try:
+                cutoff=(datetime.datetime.now()-datetime.timedelta(days=max(1,int(days or 1)))).isoformat(timespec="seconds")
+                sql=("SELECT COALESCE(NULLIF(proc,''),'Unknown') app,COUNT(*) sessions,COALESCE(SUM(active),0) active_sessions,"
+                     "COALESCE(SUM(samples),0) samples,COALESCE(SUM(bytes_sent),0) bytes_sent,COALESCE(SUM(bytes_recv),0) bytes_recv,"
+                     "MIN(first_seen) first_seen,MAX(last_seen) last_seen FROM connection_sessions WHERE last_seen>=? "
+                     "GROUP BY app ORDER BY (COALESCE(SUM(bytes_sent),0)+COALESCE(SUM(bytes_recv),0)) DESC,app LIMIT ?")
+                rows=self._conn.execute(sql,(cutoff,max(1,int(limit or 1000)))).fetchall()
+                out=[]
+                for app,sessions,active,samples,sent,recv,first,last in rows:
+                    sent=int(sent or 0); recv=int(recv or 0)
+                    out.append({"app":app or "Unknown","sessions":int(sessions or 0),"active_sessions":int(active or 0),
+                        "samples":int(samples or 0),"bytes_sent":sent,"bytes_recv":recv,"bytes_total":sent+recv,
+                        "first_seen":first or "","last_seen":last or ""})
+                return out
+            except: return []
     def prune(self,days=30):
         with self._lock:
             try:
@@ -1132,6 +1150,43 @@ class BandwidthQuotaEnforcer:
 
     def _norm(s, value):
         return str(value or "").strip().lower().replace("/", "\\")
+
+def export_usage_reports(report_dir=None):
+    report_dir = report_dir or REPORT_DIR
+    os.makedirs(report_dir, exist_ok=True)
+    cdb = ConnDB(); today = datetime.datetime.now().strftime("%Y-%m-%d")
+    exports = []
+    columns = ["period","app","sessions","active_sessions","samples","bytes_sent","bytes_recv","bytes_total","sent","recv","total","first_seen","last_seen"]
+    for period, days in (("daily",1),("weekly",7)):
+        rows = cdb.usage_report(days=days)
+        csv_path = os.path.join(report_dir, f"pywall-usage-{period}-{today}.csv")
+        html_path = os.path.join(report_dir, f"pywall-usage-{period}-{today}.html")
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=columns); w.writeheader()
+            for row in rows:
+                w.writerow({
+                    "period": period, "app": row["app"], "sessions": row["sessions"], "active_sessions": row["active_sessions"],
+                    "samples": row["samples"], "bytes_sent": row["bytes_sent"], "bytes_recv": row["bytes_recv"], "bytes_total": row["bytes_total"],
+                    "sent": _fmt_bytes(row["bytes_sent"]), "recv": _fmt_bytes(row["bytes_recv"]), "total": _fmt_bytes(row["bytes_total"]),
+                    "first_seen": row["first_seen"], "last_seen": row["last_seen"],
+                })
+        body = []
+        for row in rows:
+            body.append("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in [
+                row["app"], row["sessions"], row["active_sessions"], row["samples"], _fmt_bytes(row["bytes_sent"]),
+                _fmt_bytes(row["bytes_recv"]), _fmt_bytes(row["bytes_total"]), row["first_seen"], row["last_seen"]]) + "</tr>")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write("<!doctype html><html><head><meta charset='utf-8'><title>PyWall Usage Report</title>"
+                    "<style>body{font-family:Segoe UI,Arial,sans-serif;background:#11111b;color:#cdd6f4;margin:24px}"
+                    "table{border-collapse:collapse;width:100%;background:#181825}th,td{border:1px solid #313244;padding:8px;text-align:left}"
+                    "th{background:#1e1e2e;color:#89b4fa}td:nth-child(n+2){font-family:Consolas,monospace}</style></head><body>")
+            f.write(f"<h1>PyWall {period.title()} Usage Report</h1><p>Generated {html.escape(datetime.datetime.now().isoformat(timespec='seconds'))}. "
+                    f"Rows include sessions last seen in the previous {days} day(s).</p>")
+            f.write("<table><thead><tr><th>App</th><th>Sessions</th><th>Active</th><th>Samples</th><th>Sent</th><th>Received</th><th>Total</th><th>First Seen</th><th>Last Seen</th></tr></thead><tbody>")
+            f.write("".join(body) if body else "<tr><td colspan='9'>No connection sessions found for this period.</td></tr>")
+            f.write("</tbody></table></body></html>")
+        exports.append({"period": period, "csv": csv_path, "html": html_path, "rows": len(rows)})
+    return exports
 
 # ─── Threat Detector ─────────────────────────────────────────────────────────
 class ThreatDetector:
@@ -1806,13 +1861,19 @@ def _build_cli_parser():
     run = sub.add_parser("service-run", help="Run the headless monitor in the foreground")
     run.add_argument("--no-auto-block", action="store_true")
     run.add_argument("--poll-seconds", type=float, default=2.0)
+    report = sub.add_parser("report", help="Export daily and weekly app usage reports")
+    report.add_argument("--output", default=REPORT_DIR, help="Report output directory")
     return parser
 
 def _dispatch_cli(argv):
     if not argv: return None
-    if argv[0] not in ("service", "service-run", "-h", "--help"): return None
+    if argv[0] not in ("service", "service-run", "report", "-h", "--help"): return None
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
+    if args.command == "report":
+        for item in export_usage_reports(args.output):
+            print(f"{item['period']}: {item['rows']} apps -> {item['csv']} | {item['html']}")
+        return 0
     if args.command == "service-run" or (args.command == "service" and args.action == "run"):
         return _run_service_foreground(auto_block=not args.no_auto_block, poll_seconds=args.poll_seconds)
     if args.command == "service":
@@ -2798,6 +2859,7 @@ class ToolsTab(QWidget):
         g3=QGroupBox("Cache & Data"); g3l=QHBoxLayout(g3)
         g3l.addWidget(_make_toolbar_btn("Clear Favicon Cache","dim",self._clear_favicons))
         g3l.addWidget(_make_toolbar_btn("Prune History (30d)","dim",self._prune_history))
+        g3l.addWidget(_make_toolbar_btn("Export Usage Reports","primary",self._export_usage_reports))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
         # Import tools
         g4=QGroupBox("External Import"); g4l=QVBoxLayout(g4)
@@ -2866,6 +2928,13 @@ class ToolsTab(QWidget):
         self.slbl.setText(f"Cleared {ct} cached favicons")
     def _prune_history(self):
         cdb=ConnDB(); cdb.prune(30); self.slbl.setText("Pruned connection history older than 30 days")
+    def _export_usage_reports(self):
+        try:
+            exports=export_usage_reports()
+            names=", ".join(f"{x['period']} {x['rows']} apps" for x in exports)
+            self.slbl.setText(f"Exported usage reports to {REPORT_DIR}: {names}")
+        except Exception as e:
+            self.slbl.setText(f"Usage report export failed: {e}")
     def _open_config(self):
         if sys.platform=='win32': os.startfile(CONFIG_DIR)
         else: subprocess.Popen(['xdg-open',CONFIG_DIR])

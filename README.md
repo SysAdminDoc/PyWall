@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.7-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.7"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.8-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.8"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -90,7 +90,7 @@ Per-app Allow / Block / Ask policies. See which apps are making connections, the
 
 ### History & Timeline
 
-SQLite-backed connection log with full-text search and filters (process, country, time range). Per-process sent/received byte deltas are captured from `psutil` I/O counters and rolled into per-connection sessions with first/last seen, duration, samples, and cumulative totals. Auto-pruning by configurable retention period.
+SQLite-backed connection log with full-text search and filters (process, country, time range). Per-process sent/received byte deltas are captured from `psutil` I/O counters and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
 
 ### Bandwidth Quotas
 
@@ -145,6 +145,7 @@ python PyWall.py service start
 python PyWall.py service status
 python PyWall.py service stop
 python PyWall.py service remove
+python PyWall.py report
 ```
 
 Service logs and the IPC token are written to `%ProgramData%/PyWall/`. High-severity detector hits are blocked in both inbound and outbound directions with `PW_` firewall rules; existing `HG_` rules from older builds remain visible as PyWall-managed rules.
@@ -213,6 +214,7 @@ service.log     Background service status and auto-block log (%ProgramData%/PyWa
 service.token   Local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state
 quota_state.json  Persisted app quota counters and enforced-cap records
+reports/       Daily and weekly CSV/HTML app usage reports
 plugins/        User and example plugin scripts
 ```
 
@@ -230,6 +232,7 @@ plugins/        User and example plugin scripts
 | `TrafficCategorizer` | Hostname/process classification into categories |
 | `RuleScheduler` | Cron-like rule enable/disable scheduling |
 | `BandwidthQuotaEnforcer` | Config-driven app byte caps with persisted counters, tray/service notifications, and firewall enforcement |
+| `export_usage_reports` | Daily and weekly app usage report writer for CSV and HTML |
 | `NetworkProfileManager` | Auto-switching between Domain/Private/Public |
 | `PluginManager` | Dynamic plugin loading and event dispatch |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
@@ -244,7 +247,7 @@ plugins/        User and example plugin scripts
 Some areas that could use work:
 
 - **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Daily/weekly reports** -- export app and connection usage as CSV and HTML
+- **MITRE mapping** -- map detector hits to ATT&CK tactics and techniques
 - **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic

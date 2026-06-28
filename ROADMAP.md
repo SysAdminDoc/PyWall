@@ -4,9 +4,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Planned Features
 
-### Accounting
-- Daily/weekly usage report (CSV + HTML)
-
 ### Detection
 - MITRE ATT&CK mapping on detector hits
 - SSL-MITM via Lumen / mitmproxy hook for TLS SNI logging (opt-in)
