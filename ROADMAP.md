@@ -143,3 +143,75 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 - **Rule engine with priority + direction + profile keys** (simplewall) — matches Windows firewall's 3-profile model properly.
 - **Interactive prompt with timeout default** (opensnitch) — blocks by default if user doesn't answer in N seconds.
 - **Plugin system for enrichment** (already in project) — pair with the new threat-feed integrations cleanly.
+
+## Research-Driven Additions
+
+- [ ] P1 - Add versioned config validation and corrupt-config recovery
+  Why: `config.json` currently feeds service, quota, DoH, IDS, TLS, and UI behavior without a schema, version, or safe recovery path.
+  Evidence: `PyWall.py` config reload paths; OpenSnitch issue signal for rules schema validation; Portmaster profile/config UX.
+  Touches: `PyWall.py` config load/save helpers, `HeadlessMonitor._reload_config_if_changed`, settings/tooling UI, tests.
+  Acceptance: Config has a `schema_version`, unknown/invalid fields are reported without crashing, corrupt files are backed up and replaced with defaults, and GUI/service both surface the recovery event.
+  Complexity: M
+
+- [ ] P1 - Add feed provenance, cache, and checksum controls for imported blocklists
+  Why: URL imports and future update checks need trust and rollback metadata before marketplace-style feeds expand.
+  Evidence: `ImportWorker` URL fetch path in `PyWall.py`; Portmaster remote block/allow list issue signal; simplewall/Portmaster blocklist update models.
+  Touches: `ImportWorker`, `HostsDB`, blocklist import UI, config paths, tests.
+  Acceptance: Each feed records source URL, fetched timestamp, item count, hash, last-good cache path, and failure reason; failed updates keep the last-good feed and show a status/log entry.
+  Complexity: M
+
+- [ ] P1 - Add plugin manifest permissions and execution guardrails
+  Why: README advertises drop-in Python plugins, but unbounded local plugin execution would become the riskiest extension path.
+  Evidence: README plugin claims; Portmaster extension issue signal; OpenSnitch SIEM/blocklist integration patterns.
+  Touches: plugin loader/component once implemented, config, plugin directory layout, diagnostics UI, tests.
+  Acceptance: Plugins require a manifest declaring event hooks and network/file permissions, disabled plugins cannot execute, failures are isolated and logged, and unsigned/unknown plugins show an explicit trust state.
+  Complexity: M
+
+- [ ] P1 - Detect and surface external firewall rule tampering
+  Why: PyWall caches rule names and manages `PW_`/legacy rules, but Windows Firewall can be changed by other tools, installers, or policy.
+  Evidence: `FirewallEngine._known_names` and rule refresh paths in `PyWall.py`; TinyWall tamper protection; Windows Firewall Control secure-rules model.
+  Touches: `FirewallEngine`, firewall tab, service snapshots, diagnostics/log DB, tests.
+  Acceptance: External create/delete/disable changes to managed rules are detected on refresh/service tick, logged with before/after state, and surfaced as a warning with restore/reconcile actions.
+  Complexity: M
+
+- [ ] P1 - Add first-run learning review without noisy per-connection prompts
+  Why: Competitors prove learning mode is valuable, but PyWall's no-confirmation philosophy needs a batch review model instead of modal prompts.
+  Evidence: TinyWall learning mode; OpenSnitch interactive prompts; GlassWire ask-to-connect; existing roadmap notes for multi-select toasts.
+  Touches: `ConnectionsTab`, toast/review queue UI, `FirewallEngine`, config defaults, tests.
+  Acceptance: A first-run mode collects unknown outbound apps for a timed window, groups them by signer/path/parent where available, and lets the user allow/block selected groups with clear default behavior.
+  Complexity: L
+
+- [ ] P1 - Add optional Sysmon/WFP event correlation for connection evidence
+  Why: psutil polling can miss short-lived connections and lacks event IDs; Windows event 5157 and Sysmon Event ID 3 provide auditable evidence.
+  Evidence: `EvtWorker` 5157 polling in `PyWall.py`; Microsoft event 5157 docs; Sysmon network connection docs; Sniffnet display-filter issue signal.
+  Touches: `EvtWorker`, `ConnDB`, history/security tabs, report/export code, tests with mocked events.
+  Acceptance: When enabled, history rows can include event source, event ID, rule/filter metadata where available, and a filter for psutil-only versus event-backed observations.
+  Complexity: L
+
+- [ ] P2 - Add notification fatigue controls and digesting
+  Why: Security tools lose trust when alerts are either too noisy or too silent; peer products expose discreet alerts, unseen-host notifications, and batch decisions.
+  Evidence: GlassWire discreet alerts; Sniffnet unseen-host notification issue; OpenSnitch/Portmaster prompt batching issue signal.
+  Touches: toast code paths in `MainWindow`, config, tray/status UI, service log summaries, tests.
+  Acceptance: Users can set severity thresholds, snooze repeated app/IP alerts, receive a periodic digest, and still force high-severity threat notifications.
+  Complexity: M
+
+- [ ] P2 - Add signed-app trust and rule grouping
+  Why: Parent process, signer, and group-aware rules reduce brittle per-path decisions and match peer app-firewall expectations.
+  Evidence: Little Snitch/LuLu signed-app trust patterns; Fort Firewall app groups and parent-process issue signal; Windows WinVerifyTrust API.
+  Touches: connection enrichment, rule dialog, history schema, firewall/app grouping UI, tests.
+  Acceptance: Connection and rule views can group by signer/app family, show unsigned/changed signer state, and create allow/block rules from a group without losing per-path detail.
+  Complexity: L
+
+- [ ] P2 - Add forensic export bundles for incidents
+  Why: Current CSV/HTML usage reports are useful for accounting, but incident handoff needs rules, config, logs, events, and filtered history together.
+  Evidence: `export_usage_reports` in `PyWall.py`; Sniffnet PCAP/export model; GlassWire history/timeline model.
+  Touches: export/report code, `ConnDB`, `HostsDB`, service/crash logs, tools UI, tests.
+  Acceptance: A date-filtered incident bundle exports JSON/CSV history, matching firewall rules, config snapshot with secrets redacted, service/crash logs, and source metadata into one timestamped archive.
+  Complexity: M
+
+- [ ] P3 - Add Wireshark-style filter grammar for history and live views
+  Why: Large connection/history tables need repeatable filters beyond simple text search once identity, events, and groups are added.
+  Evidence: Sniffnet display-filter issue; existing `ConnDB.search` simple LIKE query in `PyWall.py`; Wireshark display-filter UX.
+  Touches: `ConnectionsTab`, `HistoryTab`, `ConnDB.search`, filter parser, docs/tests.
+  Acceptance: Users can filter by fields such as `proc`, `ra`, `rp`, `country`, `stat`, `event_id`, and `bytes_total`, with invalid filters showing inline errors instead of empty silent results.
+  Complexity: L
