@@ -9,7 +9,9 @@ import unittest
 
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "PyWall.py"
+README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
 TEXT = SRC.read_text(encoding="utf-8")
+README_TEXT = README.read_text(encoding="utf-8")
 TREE = ast.parse(TEXT)
 
 
@@ -163,6 +165,22 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("Reset aborted", reset_block)
         self.assertIn("rollback saved", reset_block)
         self.assertIn("def _fw_restore", TEXT)
+
+    def test_readme_does_not_advertise_missing_components(self):
+        stale_claims = (
+            "PluginManager",
+            "RuleScheduler",
+            "NetworkProfileManager",
+            "AnomalyDetector",
+            "ReputationScorer",
+            "Network Map",
+            "Block All Unknown",
+            "VirusTotal hash lookups",
+            "Digital signature verification",
+            "Full config export/import with diff preview",
+        )
+        for claim in stale_claims:
+            self.assertNotIn(claim, README_TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())

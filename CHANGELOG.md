@@ -8,6 +8,7 @@ All notable changes to PyWall will be documented in this file.
 - Added: Tools tab can restore/import a saved firewall configuration.
 - Changed: Firewall rule PowerShell commands now use validated structured builders with escaped literals for names, paths, descriptions, ports, and addresses.
 - Changed: Service IPC token files and named pipes now apply restrictive ACLs for LocalSystem, Administrators, and the current user where pywin32 security APIs are available.
+- Changed: README feature/component inventory now matches the implemented runtime surface instead of advertising planned plugin, scheduler, network-profile, anomaly, and reputation components.
 
 ## [v4.1.14] - 2026-06-28
 

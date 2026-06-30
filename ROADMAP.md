@@ -67,13 +67,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Reconcile advertised components with implemented code
-  Why: README claims plugin, scheduling, network profile automation, anomaly, and reputation manager classes that are not present in `PyWall.py`.
-  Evidence: `README.md:97`, `README.md:222-227`; `rtk rg "PluginManager|RuleScheduler|NetworkProfileManager|AnomalyDetector|ReputationScorer" PyWall.py`.
-  Touches: `PyWall.py`, `README.md`, `tests/`.
-  Acceptance: Each advertised component has a minimal implemented path and test, or the README is narrowed to match actual behavior in the same commit.
-  Complexity: M
-
 - [ ] P1 - Pin dependencies and remove elevated runtime installs
   Why: Unpinned dependencies plus `_bootstrap()` pip installs from an elevated GUI/service process create supply-chain and reproducibility risk.
   Evidence: `requirements.txt`; `PyWall.py:85-117`; PyPI pages for psutil, PyQt5, requests, pywin32.

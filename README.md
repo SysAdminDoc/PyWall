@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A real-time Windows Firewall manager and network monitor.</strong><br/>
-  Single-file Python app. WFC-style rule editor. Toast notifications. Threat detection. Plugin system.
+  Single-file Python app. WFC-style rule editor. Toast notifications. Threat detection. Service mode.
 </p>
 
 <p align="center">
@@ -81,18 +81,11 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 - Periodic outbound beacon detection for low-reputation or unattributed endpoints
 - IDS-lite YARA-style rule file for connection metadata matches
 - Custom IP/domain blocklist enforcement
-- VirusTotal hash lookups (bring your own API key)
-- Digital signature verification
-- GeoIP novelty alerts (first connection to a new country)
-- Unusual-hour connection detection
-
-### Network Map
-
-Animated visualization with traffic flow particles. Nodes represent active connections sized by activity. Color-coded by traffic category.
+- VirusTotal and related research links from domain context menus
 
 ### Application Control
 
-Per-app Allow / Block / Ask policies. See which apps are making connections, their paths, and command lines. Block All Unknown mode for lockdown environments.
+Live connection rows show process names, paths, PIDs, remote endpoints, traffic category, byte deltas, and context actions to block the selected IP, program, or domain.
 
 ### History & Timeline
 
@@ -101,21 +94,6 @@ SQLite-backed connection log with full-text search and filters (process, country
 ### Bandwidth Quotas
 
 Optional app quotas in `config.json` enforce daily, weekly, or lifetime byte caps by process name or executable path. When an app crosses its cap, PyWall records the event, shows a tray toast in GUI mode, creates an outbound program block when the executable path is known, and falls back to blocking active remote IPs.
-
-### Scheduling
-
-Time-based rule scheduling -- enable or disable rules on a cron-like schedule. Network profile auto-switching. DNS-level blocking. Bandwidth quota monitoring.
-
-### Plugin System
-
-Drop `.py` files into `%APPDATA%/PyWall/plugins/`. Plugins receive events: `start`, `stop`, `connection`, `block`. Four example plugins included:
-
-| Plugin | Description |
-|--------|-------------|
-| Webhook Notifier | Send alerts to Slack, Discord, or Teams |
-| CSV Logger | Daily CSV logs of connections and blocks |
-| IP Reputation | Check IPs against AbuseIPDB |
-| Connection Stats | Track per-session statistics |
 
 ### Themes
 
@@ -199,8 +177,6 @@ rule suspicious_powershell {
 }
 ```
 
-Full config export/import with diff preview is available in Settings.
-
 ---
 
 ## Requirements
@@ -217,7 +193,7 @@ Full config export/import with diff preview is available in Settings.
 |---------|---------|
 | `PyQt5` | GUI |
 | `psutil` | Process and connection enumeration |
-| `requests` | GeoIP, WHOIS, VirusTotal, plugin HTTP |
+| `requests` | Reserved HTTP integration dependency |
 | `pywin32` | Windows Service install/start/stop/status control |
 
 Runtime dependencies auto-install on first run if missing when PyWall is not running from a frozen executable.
@@ -242,7 +218,6 @@ service_state.json  Last service heartbeat, clean-shutdown marker, and restored 
 quota_state.json  Persisted app quota counters and enforced-cap records
 fw_backups/    Timestamped `.wfw` rollback exports before firewall reset
 reports/       Daily and weekly CSV/HTML app usage reports
-plugins/        User and example plugin scripts
 ```
 
 ### Internal Components
@@ -258,14 +233,9 @@ plugins/        User and example plugin scripts
 | `TLSLogWorker` | Opt-in mitmproxy/Lumen-style TLS SNI log tailer that feeds observed domains into the DNS feed |
 | `DoHDetector` | Known endpoint detector with warn/block policy for DNS-over-HTTPS and DNS-over-TLS connections |
 | `IDSRuleEngine` | YARA-style metadata rule loader/evaluator for live connection rows |
-| `AnomalyDetector` | GeoIP novelty, unusual hours, baseline deviation |
-| `ReputationScorer` | Multi-signal scoring (VT, signatures, blocklists, GeoIP) |
 | `TrafficCategorizer` | Hostname/process classification into categories |
-| `RuleScheduler` | Cron-like rule enable/disable scheduling |
 | `BandwidthQuotaEnforcer` | Config-driven app byte caps with persisted counters, tray/service notifications, and firewall enforcement |
 | `export_usage_reports` | Daily and weekly app usage report writer for CSV and HTML |
-| `NetworkProfileManager` | Auto-switching between Domain/Private/Public |
-| `PluginManager` | Dynamic plugin loading and event dispatch |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
@@ -278,9 +248,8 @@ plugins/        User and example plugin scripts
 
 Some areas that could use work:
 
-- **QTableView migration** -- QTableWidget to QAbstractTableModel for large rule sets
-- **Rule scheduling UI** -- parity with the existing `RuleScheduler`
-- **More plugins** -- GeoIP fencing, bandwidth alerting, scheduled reports
+- **Rule scheduling** -- engine and UI for scheduled enable/disable windows
+- **Plugin system** -- manifest, permissions, marketplace pointer, and notifier/report plugins
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic
 
