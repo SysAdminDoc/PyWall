@@ -90,13 +90,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Add versioned config validation and corrupt-config recovery
-  Why: `config.json` currently feeds service, quota, DoH, IDS, TLS, and UI behavior without a schema, version, or safe recovery path.
-  Evidence: `PyWall.py` config reload paths; OpenSnitch issue signal for rules schema validation; Portmaster profile/config UX.
-  Touches: `PyWall.py` config load/save helpers, `HeadlessMonitor._reload_config_if_changed`, settings/tooling UI, tests.
-  Acceptance: Config has a `schema_version`, unknown/invalid fields are reported without crashing, corrupt files are backed up and replaced with defaults, and GUI/service both surface the recovery event.
-  Complexity: M
-
 - [ ] P1 - Add feed provenance, cache, and checksum controls for imported blocklists
   Why: URL imports and future update checks need trust and rollback metadata before marketplace-style feeds expand.
   Evidence: `ImportWorker` URL fetch path in `PyWall.py`; Portmaster remote block/allow list issue signal; simplewall/Portmaster blocklist update models.

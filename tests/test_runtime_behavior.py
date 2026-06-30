@@ -44,6 +44,15 @@ BASE_NAMES = {
     "_build_remove_firewall_rule_cmd",
     "_build_set_firewall_rule_enabled_cmd",
     "_build_rule_exists_cmd",
+    "CONFIG_SCHEMA_VERSION",
+    "GEOIP_HTTPS_ENDPOINT",
+    "CONFIG_DEFAULTS",
+    "ConfigLoadResult",
+    "_coerce_config_value",
+    "_validate_runtime_config",
+    "_write_json_atomic",
+    "_config_backup_path",
+    "load_runtime_config",
 }
 
 
@@ -96,7 +105,7 @@ def load_runtime(*names):
         "QObject": object,
         "QTimer": object,
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.19-test",
+        "APP_VERSION": "4.1.20",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),
@@ -108,6 +117,7 @@ def load_runtime(*names):
         "IDS_RULES_PATH": os.path.join(tempfile.gettempdir(), "ids_rules.yaral"),
         "IPC_PIPE_NAME": r"\\.\pipe\PyWallService",
         "IPC_TOKEN_PATH": os.path.join(tempfile.gettempdir(), "service.token"),
+        "GEOIP_HTTPS_ENDPOINT": "https://ipwho.is/{ip}",
         "NOWIN": 0,
         "PRIV_RE": re.compile(r"^(0\.0\.0\.0|127\.|::1$|::$|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|fe80:|fd)"),
         "SERVICE_NAME": "PyWallService",
@@ -366,6 +376,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             }
             pathlib.Path(cfg_path).write_text(json.dumps(cfg), encoding="utf-8")
             ns["CONFIG_PATH"] = cfg_path
+            ns["load_runtime_config"].__defaults__ = (cfg_path, True)
             monitor = ns["HeadlessMonitor"].__new__(ns["HeadlessMonitor"])
             monitor.auto_block = True
             monitor.poll_seconds = 2.0
@@ -388,6 +399,36 @@ class RuntimeBehaviorTests(unittest.TestCase):
             for worker in (monitor._doh, monitor._ids, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
+
+    def test_runtime_config_recovers_corrupt_files_and_reports_invalid_fields(self):
+        ns = load_runtime("load_runtime_config")
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = os.path.join(td, "config.json")
+            pathlib.Path(cfg_path).write_text("{not-json", encoding="utf-8")
+            result = ns["load_runtime_config"](cfg_path)
+
+            self.assertTrue(result.recovered)
+            self.assertTrue(os.path.exists(result.backup_path))
+            recovered = json.loads(pathlib.Path(cfg_path).read_text(encoding="utf-8"))
+            self.assertEqual(recovered["schema_version"], ns["CONFIG_SCHEMA_VERSION"])
+            self.assertEqual(recovered["geoip_provider"], "ipwhois")
+
+            pathlib.Path(cfg_path).write_text(json.dumps({
+                "schema_version": "bad",
+                "doh_action": "explode",
+                "geoip_https_endpoint": "http://plain.example/{ip}",
+                "service_poll_seconds": 0,
+                "unknown_future_key": 42,
+            }), encoding="utf-8")
+            result = ns["load_runtime_config"](cfg_path)
+
+            self.assertFalse(result.recovered)
+            self.assertGreaterEqual(len(result.warnings), 3)
+            self.assertEqual(result.data["schema_version"], ns["CONFIG_SCHEMA_VERSION"])
+            self.assertEqual(result.data["doh_action"], "warn")
+            self.assertEqual(result.data["geoip_https_endpoint"], "https://ipwho.is/{ip}")
+            self.assertEqual(result.data["service_poll_seconds"], 1.0)
+            self.assertEqual(result.data["unknown_future_key"], 42)
 
 
 if __name__ == "__main__":

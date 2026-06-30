@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.20] - 2026-06-30
+
+- Added: Versioned `config.json` validation with `schema_version`, typed defaults, warnings for unknown/invalid fields, and corrupt-file backup/recovery.
+- Changed: GUI and service status now surface config recovery/warning state instead of silently falling back.
+- Changed: Runtime reload paths now share the same validated config loader.
+
 ## [v4.1.19] - 2026-06-30
 
 - Added: Behavior-level unit tests for firewall PowerShell command execution, service IPC, SQLite migrations, threat thresholds, hosts cleanup, and service config reload.

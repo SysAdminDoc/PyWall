@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.19-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.19"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.20-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.20"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -139,10 +139,11 @@ Service logs and the IPC token are written to `%ProgramData%/PyWall/`. High-seve
 
 ## Configuration
 
-Settings live in `%APPDATA%/PyWall/config.json`. Key options:
+Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`, validates known fields on load, preserves unknown future fields with warnings, and backs up corrupt JSON to `config.json.corrupt.<timestamp>.bak` before replacing it with defaults.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `schema_version` | `1` | Runtime config schema version |
 | `theme` | `Charcoal` | UI theme |
 | `tray` | `true` | Minimize to tray on close |
 | `toast` | `true` | Desktop notifications |

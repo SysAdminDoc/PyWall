@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.19 - Windows Firewall & Network Command Center
+PyWall v4.1.20 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.19"
+APP_VERSION = "4.1.20"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -168,6 +168,133 @@ IPC_TOKEN_PATH = os.path.join(SERVICE_STATE_DIR, "service.token")
 SERVICE_STATE_PATH = os.path.join(SERVICE_STATE_DIR, "service_state.json")
 QUOTA_STATE_PATH = os.path.join(CONFIG_DIR, "quota_state.json")
 GEOIP_HTTPS_ENDPOINT = "https://ipwho.is/{ip}"
+CONFIG_SCHEMA_VERSION = 1
+CONFIG_DEFAULTS = {
+    "schema_version": CONFIG_SCHEMA_VERSION,
+    "theme": "Charcoal",
+    "tray": True,
+    "toast": True,
+    "toast_sec": 10,
+    "start_monitoring": False,
+    "history_days": 30,
+    "threat_auto_block": False,
+    "service_auto_block": True,
+    "service_poll_seconds": 2.0,
+    "bandwidth_quotas": {},
+    "tls_sni_enabled": False,
+    "tls_sni_log_path": "",
+    "tls_sni_read_existing": False,
+    "detect_doh": True,
+    "doh_action": "warn",
+    "ids_rules_enabled": True,
+    "ids_rules_path": IDS_RULES_PATH,
+    "geoip_provider": "ipwhois",
+    "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
+    "geoip_mmdb_path": "",
+    "auto_block_inbound": True,
+    "detect_portscan": True,
+    "detect_bruteforce": True,
+    "vt_api_key": "",
+}
+
+@dataclass
+class ConfigLoadResult:
+    data:dict
+    mtime:float|None=None
+    recovered:bool=False
+    backup_path:str=""
+    warnings:list=field(default_factory=list)
+
+def _coerce_config_value(key, value):
+    default = CONFIG_DEFAULTS[key]
+    if key == "schema_version":
+        try: value = int(value)
+        except: raise ValueError("must be an integer")
+        if value < 1: raise ValueError("must be >= 1")
+        return min(value, CONFIG_SCHEMA_VERSION)
+    if isinstance(default, bool):
+        if isinstance(value, bool): return value
+        if isinstance(value, str) and value.lower() in ("true","1","yes","on"): return True
+        if isinstance(value, str) and value.lower() in ("false","0","no","off"): return False
+        raise ValueError("must be true or false")
+    if isinstance(default, int) and not isinstance(default, bool):
+        try: value = int(value)
+        except: raise ValueError("must be an integer")
+        return max(0, value)
+    if isinstance(default, float):
+        try: value = float(value)
+        except: raise ValueError("must be a number")
+        return max(1.0, value)
+    if isinstance(default, dict):
+        if isinstance(value, dict): return value
+        raise ValueError("must be an object")
+    text = str(value if value is not None else "")
+    if key == "doh_action" and text.lower() not in ("warn","block","ignore"):
+        raise ValueError("must be warn, block, or ignore")
+    if key == "geoip_provider" and text.lower() not in ("ipwhois","maxmind","disabled"):
+        raise ValueError("must be ipwhois, maxmind, or disabled")
+    if key == "geoip_https_endpoint" and text and not text.lower().startswith("https://"):
+        raise ValueError("must start with https://")
+    return text.lower() if key in ("doh_action","geoip_provider") else text
+
+def _validate_runtime_config(raw):
+    warnings=[]; out=dict(CONFIG_DEFAULTS)
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be an object")
+    for key,value in raw.items():
+        if key not in CONFIG_DEFAULTS:
+            warnings.append(f"unknown config field ignored by runtime: {key}")
+            out[key]=value
+            continue
+        try:
+            out[key]=_coerce_config_value(key,value)
+        except ValueError as e:
+            warnings.append(f"invalid config field {key}: {e}; using default")
+            out[key]=CONFIG_DEFAULTS[key]
+    out["schema_version"]=CONFIG_SCHEMA_VERSION
+    return out,warnings
+
+def _write_json_atomic(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+def _config_backup_path(path, reason="corrupt"):
+    stamp=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{path}.{reason}.{stamp}.bak"
+
+def load_runtime_config(path=CONFIG_PATH, recover=True):
+    if not os.path.exists(path):
+        data=dict(CONFIG_DEFAULTS)
+        if recover:
+            try: _write_json_atomic(path,data)
+            except: pass
+        try: mtime=os.path.getmtime(path)
+        except: mtime=None
+        return ConfigLoadResult(data=data,mtime=mtime,warnings=["config missing; defaults created" if recover else "config missing"])
+    try:
+        with open(path,"r",encoding="utf-8") as f: raw=json.load(f)
+        data,warnings=_validate_runtime_config(raw)
+        if data != raw and recover:
+            try: _write_json_atomic(path,data)
+            except Exception as e: warnings.append(f"config rewrite failed: {e}")
+        try: mtime=os.path.getmtime(path)
+        except: mtime=None
+        return ConfigLoadResult(data=data,mtime=mtime,warnings=warnings)
+    except Exception as e:
+        warnings=[f"config recovery: {e}"]
+        backup=""
+        if recover:
+            try:
+                backup=_config_backup_path(path)
+                shutil.copy2(path,backup)
+                _write_json_atomic(path,dict(CONFIG_DEFAULTS))
+            except Exception as be:
+                warnings.append(f"config backup/write failed: {be}")
+        try: mtime=os.path.getmtime(path)
+        except: mtime=None
+        return ConfigLoadResult(data=dict(CONFIG_DEFAULTS),mtime=mtime,recovered=bool(backup),backup_path=backup,warnings=warnings)
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -1291,19 +1418,10 @@ class BandwidthQuotaEnforcer:
             s._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds") if quotas else "none"
 
     def reload_config_if_changed(s, force=False):
-        try: mtime = os.path.getmtime(CONFIG_PATH)
-        except FileNotFoundError:
-            if force or s._config_mtime is not None: s.load_config({}, None)
-            return
-        except Exception as e:
-            log.warning(f"Quota config stat failed: {e}"); return
-        if not force and s._config_mtime == mtime: return
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f: cfg = json.load(f)
-            if not isinstance(cfg, dict): cfg = {}
-            s.load_config(cfg, mtime)
-        except Exception as e:
-            log.warning(f"Quota config reload failed: {e}")
+        result=load_runtime_config()
+        if not force and s._config_mtime == result.mtime: return
+        s.load_config(result.data,result.mtime)
+        if result.warnings: log.warning("; ".join(result.warnings))
 
     def check(s, conns, db=None):
         s.reload_config_if_changed()
@@ -1445,17 +1563,10 @@ class DoHDetector:
         with s._lock:
             s._enabled=enabled; s._action=action; s._config_mtime=mtime
     def reload_config_if_changed(s,force=False):
-        try: mtime=os.path.getmtime(CONFIG_PATH)
-        except FileNotFoundError:
-            if force or s._config_mtime is not None: s.configure({}, None)
-            return
-        except: return
+        result=load_runtime_config()
         with s._lock:
-            if not force and s._config_mtime == mtime: return
-        try:
-            with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
-            s.configure(cfg if isinstance(cfg,dict) else {}, mtime)
-        except: pass
+            if not force and s._config_mtime == result.mtime: return
+        s.configure(result.data, result.mtime)
     def check(s,conns,db=None):
         s.reload_config_if_changed()
         with s._lock: enabled,action=s._enabled,s._action
@@ -1492,19 +1603,11 @@ class IDSRuleEngine:
             if path != s._path: s._rules=[]; s._rules_mtime=None
             s._enabled=enabled; s._path=path; s._config_mtime=mtime
     def reload(s):
-        try: cmtime=os.path.getmtime(CONFIG_PATH)
-        except FileNotFoundError:
-            if s._config_mtime is not None: s.configure({}, None)
-            cmtime=None
-        except: cmtime=None
-        if cmtime is not None:
-            with s._lock:
-                same_config = s._config_mtime == cmtime
-            if not same_config:
-                try:
-                    with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
-                    s.configure(cfg if isinstance(cfg,dict) else {}, cmtime)
-                except: pass
+        result=load_runtime_config()
+        with s._lock:
+            same_config = s._config_mtime == result.mtime
+        if not same_config:
+            s.configure(result.data, result.mtime)
         with s._lock:
             enabled,path,last=s._enabled,s._path,s._rules_mtime
         if not enabled or not path or not os.path.exists(path): return
@@ -1771,18 +1874,12 @@ class GeoIPWorker(QThread):
                 s._batch.clear()
             s._stop.wait(2)
     def _reload_config_if_changed(s):
-        try: mtime=os.path.getmtime(CONFIG_PATH)
-        except FileNotFoundError:
-            if s._config_mtime is not None: s.configure({}, None)
-            return
-        except: return
+        result=load_runtime_config()
         with s._lock:
-            if s._config_mtime == mtime: return
-        try:
-            with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
-            s.configure(cfg if isinstance(cfg,dict) else {}, mtime)
-        except Exception as e:
-            s._emit_status(f"GeoIP config failed: {e}")
+            if s._config_mtime == result.mtime: return
+        s.configure(result.data, result.mtime)
+        if result.warnings:
+            s._emit_status("; ".join(result.warnings[:2]))
     def configure(s,cfg=None,mtime=None):
         cfg=cfg if isinstance(cfg,dict) else {}
         provider=str(cfg.get("geoip_provider","ipwhois") or "ipwhois").strip().lower()
@@ -1913,17 +2010,11 @@ class TLSLogWorker(QThread):
                 s._emit_status(f"TLS SNI hook error: {e}")
             s._stop.wait(2.0)
     def _reload_config_if_changed(s):
-        try: mtime=os.path.getmtime(CONFIG_PATH)
-        except FileNotFoundError:
-            if s._config_mtime is not None: s.configure({}, None)
-            return
-        except: return
+        result=load_runtime_config()
         with s._lock:
-            if s._config_mtime == mtime: return
-        try:
-            with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
-            s.configure(cfg if isinstance(cfg,dict) else {}, mtime)
-        except Exception as e: s._emit_status(f"TLS SNI config failed: {e}")
+            if s._config_mtime == result.mtime: return
+        s.configure(result.data, result.mtime)
+        if result.warnings: s._emit_status("; ".join(result.warnings[:2]))
     def _poll(s):
         with s._lock:
             enabled,path,offset=s._enabled,s._path,s._offset
@@ -2403,6 +2494,9 @@ class HeadlessMonitor(QObject):
         self._started = time.time()
         self._config_mtime = None
         self._last_config_reload = ""
+        self._last_config_warnings = []
+        self._last_config_recovered = False
+        self._last_config_backup_path = ""
 
     def start(self):
         _service_log(f"Headless monitor starting; auto_block={self.auto_block}")
@@ -2483,6 +2577,10 @@ class HeadlessMonitor(QObject):
             "pipe": IPC_PIPE_NAME,
             "config_path": CONFIG_PATH,
             "last_config_reload": self._last_config_reload,
+            "config_schema_version": CONFIG_SCHEMA_VERSION,
+            "config_warnings": list(self._last_config_warnings),
+            "config_recovered": self._last_config_recovered,
+            "config_backup_path": self._last_config_backup_path,
             "bandwidth_quotas": self._quota.snapshot(),
             "doh": self._doh.snapshot(),
             "ids": self._ids.snapshot(),
@@ -2523,33 +2621,17 @@ class HeadlessMonitor(QObject):
             _service_log(f"Service state save failed: {e}", "WARNING")
 
     def _reload_config_if_changed(self, force=False):
-        try:
-            mtime = os.path.getmtime(CONFIG_PATH)
-        except FileNotFoundError:
-            if force:
-                self._config_mtime = None
-                self._last_config_reload = "missing"
-                self._quota.load_config({})
-                self._doh.configure({})
-                self._ids.configure({})
-                self._geo_w.configure({})
-                self._tls_w.configure({})
+        result = load_runtime_config()
+        if not force and self._config_mtime == result.mtime:
             return
-        except Exception as e:
-            _service_log(f"Config stat failed: {e}", "WARNING")
-            return
-        if not force and self._config_mtime == mtime:
-            return
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if not isinstance(cfg, dict):
-                raise ValueError("config root must be an object")
-        except Exception as e:
-            _service_log(f"Config reload failed: {e}", "WARNING")
-            self._config_mtime = mtime
-            self._last_config_reload = f"failed: {datetime.datetime.now().isoformat(timespec='seconds')}"
-            return
+        cfg = result.data
+        self._last_config_warnings = list(result.warnings)
+        self._last_config_recovered = bool(result.recovered)
+        self._last_config_backup_path = result.backup_path
+        if result.recovered:
+            _service_log(f"Config recovered from corrupt file; backup={result.backup_path}", "WARNING")
+        for warning in result.warnings:
+            _service_log(f"Config warning: {warning}", "WARNING")
         old_auto = self.auto_block
         old_poll = self.poll_seconds
         if "service_auto_block" in cfg:
@@ -2561,13 +2643,14 @@ class HeadlessMonitor(QObject):
             except: pass
         if self._timer.isActive() and self.poll_seconds != old_poll:
             self._timer.setInterval(int(self.poll_seconds * 1000))
-        self._quota.load_config(cfg, mtime)
-        self._doh.configure(cfg, mtime)
-        self._ids.configure(cfg, mtime)
-        self._geo_w.configure(cfg, mtime)
-        self._tls_w.configure(cfg, mtime)
-        self._config_mtime = mtime
-        self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
+        self._quota.load_config(cfg, result.mtime)
+        self._doh.configure(cfg, result.mtime)
+        self._ids.configure(cfg, result.mtime)
+        self._geo_w.configure(cfg, result.mtime)
+        self._tls_w.configure(cfg, result.mtime)
+        self._config_mtime = result.mtime
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        self._last_config_reload = f"recovered: {stamp}" if result.recovered else f"warnings: {stamp}" if result.warnings else stamp
         _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
@@ -3727,6 +3810,7 @@ class ToolsTab(QWidget):
         mins=int(s.get("uptime_sec",0))//60
         prev=s.get("previous_clean_shutdown")
         prev_txt="prev clean" if prev is True else "prev unclean" if prev is False else "prev new"
+        cfg_state="cfg recovered" if s.get("config_recovered") else f"cfg warnings {len(s.get('config_warnings',[]) or [])}" if s.get("config_warnings") else "cfg ok"
         q=s.get("bandwidth_quotas",{}) if isinstance(s.get("bandwidth_quotas",{}),dict) else {}
         doh=s.get("doh",{}) if isinstance(s.get("doh",{}),dict) else {}
         ids=s.get("ids",{}) if isinstance(s.get("ids",{}),dict) else {}
@@ -3737,7 +3821,7 @@ class ToolsTab(QWidget):
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
              f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | "
              f"geoip {geo.get('provider','ipwhois')} {geo.get('lookups',0)}/{geo.get('unknown',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | "
-             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} {cfg_state} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -3834,6 +3918,7 @@ class MainWindow(QMainWindow):
         self._monitoring=False; self._conn_monitoring=False
         self._launch_time=time.time()  # For notification warmup
         self._notif_cooldown={}  # Rate-limit: domain -> last_notify_time
+        self._config_result=load_runtime_config()
 
         # Core objects
         self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI")
@@ -3852,6 +3937,10 @@ class MainWindow(QMainWindow):
         self._tls_w.status_changed.connect(lambda msg:self._sbar_msg.setText(msg))
         self._tls_w.feed_updated.connect(self._feed.refresh)
         self._tls_w.start()
+        if self._config_result.recovered:
+            self._sbar_msg.setText(f"Config recovered; backup saved to {self._config_result.backup_path}")
+        elif self._config_result.warnings:
+            self._sbar_msg.setText(f"Config warning: {self._config_result.warnings[0]}")
 
         # Auto-start DNS monitor
         QTimer.singleShot(300,self._start_dns_monitor)

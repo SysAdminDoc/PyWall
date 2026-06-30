@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.19"])
+        self.assertEqual(versions, ["4.1.20"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -204,6 +204,19 @@ class ServiceModeStaticTests(unittest.TestCase):
         msg = ns["_missing_dependency_message"](["PyQt5", "psutil"])
         self.assertIn("Missing required runtime dependencies: PyQt5, psutil", msg)
         self.assertIn("-m pip install -r requirements.txt", msg)
+
+    def test_runtime_config_validation_and_recovery_are_wired(self):
+        for token in (
+            "CONFIG_SCHEMA_VERSION = 1",
+            "CONFIG_DEFAULTS",
+            "class ConfigLoadResult",
+            "def load_runtime_config",
+            "config_warnings",
+            "config_recovered",
+            "config_backup_path",
+            "Config recovered",
+        ):
+            self.assertIn(token, TEXT)
 
     def test_connection_identity_enrichment_is_wired(self):
         for token in (
