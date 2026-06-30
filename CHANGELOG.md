@@ -2,6 +2,11 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.16] - 2026-06-30
+
+- Changed: Runtime dependencies are pinned in `requirements.txt` and startup now exits with a clear setup command instead of installing packages from an elevated process.
+- Removed: Unused `requests` dependency.
+
 ## [v4.1.15] - 2026-06-30
 
 - Added: Firewall reset now writes a timestamped `.wfw` rollback export before running the destructive reset.

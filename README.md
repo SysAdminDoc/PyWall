@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.15-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.15"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.16-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.16"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -32,10 +32,11 @@ It's a single `.py` file. No installer. No build step. Drop it anywhere and run 
 # Clone and run (admin recommended)
 git clone https://github.com/SysAdminDoc/PyWall.git
 cd PyWall
+python -m pip install -r requirements.txt
 python PyWall.py
 ```
 
-Dependencies (`PyQt5`, `psutil`, `requests`, and `pywin32` on Windows) auto-install on first launch. PyWall also auto-elevates to admin and configures Windows firewall audit logging automatically.
+Dependencies are pinned in `requirements.txt` and must be installed before launch. PyWall auto-elevates to admin and configures Windows firewall audit logging automatically.
 
 ---
 
@@ -193,10 +194,9 @@ rule suspicious_powershell {
 |---------|---------|
 | `PyQt5` | GUI |
 | `psutil` | Process and connection enumeration |
-| `requests` | Reserved HTTP integration dependency |
 | `pywin32` | Windows Service install/start/stop/status control |
 
-Runtime dependencies auto-install on first run if missing when PyWall is not running from a frozen executable.
+If dependencies are missing, startup exits with the exact `pip install -r requirements.txt` command to run.
 
 ---
 

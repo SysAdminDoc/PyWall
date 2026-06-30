@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.15 - Windows Firewall & Network Command Center
+PyWall v4.1.16 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -49,6 +49,26 @@ NOWIN = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
 def _is_frozen():
     return getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS")
 
+def _missing_dependency_message(missing):
+    packages = ", ".join(missing)
+    return (
+        f"Missing required runtime dependencies: {packages}\n"
+        "Install them before launching PyWall:\n"
+        f"  {sys.executable} -m pip install -r requirements.txt"
+    )
+
+def _check_dependencies():
+    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil')]
+    if sys.platform == 'win32':
+        deps.append(('pywin32', 'win32serviceutil'))
+    missing = []
+    for pkg, mod in deps:
+        try: __import__(mod)
+        except ImportError: missing.append(pkg)
+    if missing:
+        print(_missing_dependency_message(missing), file=sys.stderr)
+        sys.exit(2)
+
 def _kill_remnants():
     """Kill leftover PyWall python/powershell processes from prior runs."""
     if sys.platform != 'win32': return
@@ -84,6 +104,9 @@ def _kill_remnants():
 
 def _bootstrap():
     """Elevate to admin + install missing deps. Must run BEFORE heavy imports."""
+    if sys.version_info < (3, 8):
+        print("Python 3.8+ required"); sys.exit(1)
+    _check_dependencies()
     if sys.platform == 'win32':
         import ctypes
         if not ctypes.windll.shell32.IsUserAnAdmin():
@@ -98,20 +121,6 @@ def _bootstrap():
             os._exit(0)
     # We're admin now — kill remnants from prior crashed runs
     _kill_remnants()
-    if sys.version_info < (3, 8):
-        print("Python 3.8+ required"); sys.exit(1)
-    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil')]
-    if sys.platform == 'win32':
-        deps.append(('pywin32', 'win32serviceutil'))
-    for pkg, mod in deps:
-        try: __import__(mod)
-        except ImportError:
-            if _is_frozen(): continue
-            for f in [[], ['--user'], ['--break-system-packages']]:
-                try:
-                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'] + f,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NOWIN); break
-                except: continue
 _bootstrap()
 
 import psutil
@@ -125,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.15"
+APP_VERSION = "4.1.16"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -2442,7 +2451,7 @@ def _dispatch_cli(argv):
             print("Windows service control is only available on Windows.", file=sys.stderr)
             return 2
         if PyWallWindowsService is None or win32serviceutil is None:
-            print("pywin32 is required for Windows service control. Run pip install pywin32.", file=sys.stderr)
+            print("pywin32 is required for Windows service control. Run python -m pip install -r requirements.txt.", file=sys.stderr)
             return 2
         if args.action == "status":
             print(_service_status_text())

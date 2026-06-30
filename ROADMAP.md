@@ -67,13 +67,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Pin dependencies and remove elevated runtime installs
-  Why: Unpinned dependencies plus `_bootstrap()` pip installs from an elevated GUI/service process create supply-chain and reproducibility risk.
-  Evidence: `requirements.txt`; `PyWall.py:85-117`; PyPI pages for psutil, PyQt5, requests, pywin32.
-  Touches: `requirements.txt`, `PyWall.py`, `README.md`, packaging docs/tests.
-  Acceptance: Dependencies are version-pinned, startup fails with a clear local setup message when packages are missing, frozen builds never attempt pip, and tests cover missing-dependency branches.
-  Complexity: S
-
 - [ ] P1 - Add Windows app identity enrichment for svchost, UWP, signer, and parent process
   Why: Competitors expose service/package/parent identity, while PyWall rows mostly show process/path/PID and can mislead for shared hosts.
   Evidence: Fort Firewall service-name and parent-process rules; simplewall Windows services/UWP support; `PyWall.py:1043-1096`.

@@ -22,6 +22,7 @@ def load_helpers(*names):
         "ipaddress": ipaddress,
         "os": os,
         "re": re,
+        "sys": __import__("sys"),
         "CONFIG_DIR": tempfile.gettempdir(),
         "_nt_to_dos": lambda path: path,
         "_ps": lambda cmd, timeout=20: (True, cmd),
@@ -52,7 +53,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.15"])
+        self.assertEqual(versions, ["4.1.16"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -181,6 +182,25 @@ class ServiceModeStaticTests(unittest.TestCase):
         )
         for claim in stale_claims:
             self.assertNotIn(claim, README_TEXT)
+
+    def test_runtime_dependencies_are_pinned_and_not_auto_installed(self):
+        requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("psutil==7.2.2", requirements)
+        self.assertIn("PyQt5==5.15.11", requirements)
+        self.assertIn('pywin32==312; sys_platform == "win32"', requirements)
+        self.assertNotIn("requests", requirements)
+        self.assertNotIn("pip', 'install", TEXT)
+        self.assertNotIn('"pip", "install"', TEXT)
+        self.assertIn("pip install -r requirements.txt", TEXT)
+        self.assertIn("_check_dependencies()", TEXT)
+        bootstrap = TEXT[TEXT.index("def _bootstrap"):TEXT.index("\n_bootstrap()", TEXT.index("def _bootstrap"))]
+        self.assertLess(bootstrap.index("_check_dependencies()"), bootstrap.index("IsUserAnAdmin"))
+
+    def test_missing_dependency_message_points_to_local_requirements(self):
+        ns = load_helpers("_missing_dependency_message")
+        msg = ns["_missing_dependency_message"](["PyQt5", "psutil"])
+        self.assertIn("Missing required runtime dependencies: PyQt5, psutil", msg)
+        self.assertIn("-m pip install -r requirements.txt", msg)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())
