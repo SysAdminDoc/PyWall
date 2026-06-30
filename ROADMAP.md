@@ -67,13 +67,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Expand test coverage around firewall, service, DB, and detectors
-  Why: Current tests are static symbol checks and do not exercise the behaviors most likely to break user trust.
-  Evidence: `tests/test_service_mode_static.py`; `PyWall.py` firewall/service/database classes.
-  Touches: `tests/`, `PyWall.py` seams for dependency injection.
-  Acceptance: Unit tests mock PowerShell, pywin32 pipe APIs, SQLite migrations, threat detector thresholds, hosts cleanup, and service config reload; test suite runs with `python -m unittest discover -s tests`.
-  Complexity: M
-
 - [ ] P2 - Add accessibility and i18n foundations for dense security tables
   Why: Current UI is color-heavy and lacks translation/accessibility plumbing while competitors ship localization.
   Evidence: No `setAccessibleName` or Qt translation flow in `PyWall.py`; simplewall/Fort/Sniffnet/OpenSnitch localization.

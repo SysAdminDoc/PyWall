@@ -2,6 +2,11 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.19] - 2026-06-30
+
+- Added: Behavior-level unit tests for firewall PowerShell command execution, service IPC, SQLite migrations, threat thresholds, hosts cleanup, and service config reload.
+- Changed: The test harness now exercises selected non-GUI runtime classes through AST-loaded seams without triggering GUI bootstrap or elevation.
+
 ## [v4.1.18] - 2026-06-30
 
 - Added: GeoIP enrichment now supports HTTPS lookup by default and optional local MaxMind-compatible `.mmdb` databases via `maxminddb`.
