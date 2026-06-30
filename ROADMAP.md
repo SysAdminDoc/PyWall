@@ -90,13 +90,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Add plugin manifest permissions and execution guardrails
-  Why: README advertises drop-in Python plugins, but unbounded local plugin execution would become the riskiest extension path.
-  Evidence: README plugin claims; Portmaster extension issue signal; OpenSnitch SIEM/blocklist integration patterns.
-  Touches: plugin loader/component once implemented, config, plugin directory layout, diagnostics UI, tests.
-  Acceptance: Plugins require a manifest declaring event hooks and network/file permissions, disabled plugins cannot execute, failures are isolated and logged, and unsigned/unknown plugins show an explicit trust state.
-  Complexity: M
-
 - [ ] P1 - Detect and surface external firewall rule tampering
   Why: PyWall caches rule names and manages `PW_`/legacy rules, but Windows Firewall can be changed by other tools, installers, or policy.
   Evidence: `FirewallEngine._known_names` and rule refresh paths in `PyWall.py`; TinyWall tamper protection; Windows Firewall Control secure-rules model.

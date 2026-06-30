@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.22] - 2026-06-30
+
+- Added: Passive plugin manifest registry for `%APPDATA%/PyWall/plugins` with declared hooks, network/file permissions, trust-state reporting, and default-deny execution gates.
+- Added: Tools and service status now summarize plugin manifest counts, invalid manifests, executable plugins, and signed/unsigned/unknown trust state.
+- Changed: Runtime config now validates plugin enable/disable lists and records manifest validation failures in `plugin_events.log`.
+
 ## [v4.1.21] - 2026-06-30
 
 - Added: Blocklist imports now record feed provenance, source URL, fetch timestamp, item count, SHA-256 checksum, last-good cache path, status, and failure reason.

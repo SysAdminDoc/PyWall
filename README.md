@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.21-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.21"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.22-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.22"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -88,6 +88,10 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 
 Built-in blocklist imports record source URL, fetch timestamp, parsed item count, SHA-256 checksum, last-good cache path, and failure reason. If a feed update fails, PyWall keeps the last-good cached feed available and reports the fallback in the Blocklists status line.
 
+### Plugin Guardrails
+
+Plugin manifests can be staged under `%APPDATA%/PyWall/plugins`, but plugin code is not executed by default. The Tools tab scans `pywall-plugin.json` or `plugin.json` manifests, validates declared hooks and network/file permissions, classifies signed/unsigned/unknown trust state, writes invalid manifest details to `plugin_events.log`, and only marks a plugin executable when `plugins_enabled`, the manifest `enabled` flag, and `plugin_enabled_ids` all opt in.
+
 ### Application Control
 
 Live connection rows show process names, paths, PIDs, service/package/parent/signer identity, remote endpoints, traffic category, byte deltas, and context actions to block the selected IP, program, or domain.
@@ -168,6 +172,9 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `geoip_provider` | `ipwhois` | GeoIP source: `ipwhois`, `maxmind`, or `disabled`; plaintext providers are not used |
 | `geoip_https_endpoint` | `https://ipwho.is/{ip}` | HTTPS GeoIP endpoint template used by the default provider |
 | `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
+| `plugins_enabled` | `false` | Global plugin execution gate; manifests are scanned but not executable unless this is true |
+| `plugin_enabled_ids` | `[]` | Explicit allowlist of plugin IDs that may execute declared hooks |
+| `plugin_disabled_ids` | `[]` | Explicit denylist that overrides manifest and allowlist settings |
 | `auto_block_inbound` | `true` | Block unsolicited inbound connections |
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
@@ -222,6 +229,8 @@ pywall.db       Domain/feed/log SQLite database
 connections.db  Connection history SQLite database
 config.json     Settings, app profiles, blocklists
 feed_cache/    Last-good raw blocklist downloads with feed provenance in `pywall.db`
+plugins/       Passive plugin manifests; plugin code is default-denied until explicitly enabled
+plugin_events.log  Manifest validation and plugin guardrail diagnostics
 service.log     Background service status and auto-block log (%ProgramData%/PyWall on Windows)
 service.token   ACL-restricted local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state
@@ -246,6 +255,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `TrafficCategorizer` | Hostname/process classification into categories |
 | `BandwidthQuotaEnforcer` | Config-driven app byte caps with persisted counters, tray/service notifications, and firewall enforcement |
 | `export_usage_reports` | Daily and weekly app usage report writer for CSV and HTML |
+| `PluginRegistry` | Passive manifest scanner with hook/permission validation, trust-state reporting, and default-deny execution gates |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
@@ -259,7 +269,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 Some areas that could use work:
 
 - **Rule scheduling** -- engine and UI for scheduled enable/disable windows
-- **Plugin system** -- manifest, permissions, marketplace pointer, and notifier/report plugins
+- **Plugin system** -- execution hooks and plugin implementations on top of the existing manifest guardrails
 - **Localization** -- i18n support
 - **Unit tests** -- test coverage for FWManager and detection logic
 

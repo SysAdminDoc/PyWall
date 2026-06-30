@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.21 - Windows Firewall & Network Command Center
+PyWall v4.1.22 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.21"
+APP_VERSION = "4.1.22"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -156,7 +156,22 @@ FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
 REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
 IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
 FEED_CACHE_DIR = os.path.join(CONFIG_DIR, "feed_cache")
-os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True); os.makedirs(FEED_CACHE_DIR, exist_ok=True)
+PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
+PLUGIN_LOG_PATH = os.path.join(CONFIG_DIR, "plugin_events.log")
+PLUGIN_MANIFEST_NAMES = ("pywall-plugin.json", "plugin.json")
+PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,79}$")
+PLUGIN_ALLOWED_HOOKS = {
+    "connection_observed",
+    "dns_domain_seen",
+    "threat_detected",
+    "notification",
+    "report_generated",
+    "feed_import",
+    "geoip_lookup",
+    "service_snapshot",
+}
+PLUGIN_ALLOWED_PERMISSION_KEYS = {"network", "files", "firewall", "notifications", "reports", "config"}
+os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True); os.makedirs(FEED_CACHE_DIR, exist_ok=True); os.makedirs(PLUGINS_DIR, exist_ok=True)
 SERVICE_NAME = "PyWallService"
 SERVICE_DISPLAY_NAME = "PyWall Background Service"
 SERVICE_DESCRIPTION = "Headless PyWall connection monitor and threat auto-blocker."
@@ -192,6 +207,9 @@ CONFIG_DEFAULTS = {
     "geoip_provider": "ipwhois",
     "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
     "geoip_mmdb_path": "",
+    "plugins_enabled": False,
+    "plugin_enabled_ids": [],
+    "plugin_disabled_ids": [],
     "auto_block_inbound": True,
     "detect_portscan": True,
     "detect_bruteforce": True,
@@ -229,6 +247,10 @@ def _coerce_config_value(key, value):
     if isinstance(default, dict):
         if isinstance(value, dict): return value
         raise ValueError("must be an object")
+    if isinstance(default, list):
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        raise ValueError("must be a list")
     text = str(value if value is not None else "")
     if key == "doh_action" and text.lower() not in ("warn","block","ignore"):
         raise ValueError("must be warn, block, or ignore")
@@ -296,6 +318,203 @@ def load_runtime_config(path=CONFIG_PATH, recover=True):
         try: mtime=os.path.getmtime(path)
         except: mtime=None
         return ConfigLoadResult(data=dict(CONFIG_DEFAULTS),mtime=mtime,recovered=bool(backup),backup_path=backup,warnings=warnings)
+
+@dataclass
+class PluginManifest:
+    plugin_id:str
+    name:str
+    version:str
+    manifest_path:str
+    enabled:bool=False
+    hooks:list=field(default_factory=list)
+    permissions:dict=field(default_factory=dict)
+    trust_state:str="unknown"
+    publisher:str=""
+    signature:str=""
+    executable:bool=False
+    disabled_reason:str=""
+    errors:list=field(default_factory=list)
+
+    def as_dict(self):
+        return {
+            "id": self.plugin_id,
+            "name": self.name,
+            "version": self.version,
+            "manifest_path": self.manifest_path,
+            "enabled": self.enabled,
+            "hooks": list(self.hooks),
+            "permissions": dict(self.permissions),
+            "trust_state": self.trust_state,
+            "publisher": self.publisher,
+            "executable": self.executable,
+            "disabled_reason": self.disabled_reason,
+            "errors": list(self.errors),
+        }
+
+@dataclass
+class PluginScanResult:
+    plugins:list=field(default_factory=list)
+    errors:list=field(default_factory=list)
+
+    def summary(self):
+        total=len(self.plugins)
+        invalid=sum(1 for p in self.plugins if p.errors)
+        return {
+            "total": total,
+            "valid": total - invalid,
+            "invalid": invalid,
+            "enabled": sum(1 for p in self.plugins if p.enabled),
+            "executable": sum(1 for p in self.plugins if p.executable),
+            "signed": sum(1 for p in self.plugins if p.trust_state == "signed"),
+            "unsigned": sum(1 for p in self.plugins if p.trust_state == "unsigned"),
+            "unknown": sum(1 for p in self.plugins if p.trust_state == "unknown"),
+            "errors": list(self.errors),
+        }
+
+def _safe_plugin_id(value):
+    text=str(value or "").strip().lower()
+    return text if PLUGIN_ID_RE.match(text) else ""
+
+def _plugin_log(msg, level="INFO"):
+    line=f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
+    try:
+        with open(PLUGIN_LOG_PATH,"a",encoding="utf-8") as f: f.write(line + "\n")
+    except: pass
+    logger=getattr(log, level.lower(), None) or getattr(log, "info", None)
+    if logger: logger(msg)
+
+class PluginRegistry:
+    def __init__(self, plugin_dir=PLUGINS_DIR, config=None):
+        self.plugin_dir=plugin_dir
+        self.config=config
+
+    def _config(self):
+        if self.config is not None:
+            return self.config
+        return load_runtime_config().data
+
+    def scan(self, log_errors=True):
+        try: os.makedirs(self.plugin_dir, exist_ok=True)
+        except Exception as e:
+            msg=f"Plugin directory unavailable: {e}"
+            if log_errors: _plugin_log(msg,"WARNING")
+            return PluginScanResult(errors=[msg])
+        cfg=self._config()
+        plugins=[]; errors=[]
+        for manifest_path in self._manifest_paths():
+            manifest=self._load_manifest(manifest_path,cfg)
+            plugins.append(manifest)
+            if manifest.errors:
+                msg=f"Plugin {manifest.plugin_id or manifest.manifest_path} invalid: {'; '.join(manifest.errors)}"
+                errors.append(msg)
+                if log_errors: _plugin_log(msg,"WARNING")
+        return PluginScanResult(plugins=plugins, errors=errors)
+
+    def can_execute(self, plugin_id, hook):
+        wanted=_safe_plugin_id(plugin_id)
+        if not wanted: return False
+        for plugin in self.scan(log_errors=False).plugins:
+            if plugin.plugin_id == wanted:
+                return bool(plugin.executable and hook in plugin.hooks)
+        return False
+
+    def _manifest_paths(self):
+        root=Path(self.plugin_dir)
+        if not root.exists(): return []
+        paths=[]
+        try:
+            for name in PLUGIN_MANIFEST_NAMES:
+                path=root / name
+                if path.is_file(): paths.append(path)
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if not child.is_dir(): continue
+                for name in PLUGIN_MANIFEST_NAMES:
+                    path=child / name
+                    if path.is_file():
+                        paths.append(path)
+                        break
+        except Exception as e:
+            _plugin_log(f"Plugin scan failed: {e}","WARNING")
+        return paths
+
+    def _load_manifest(self, path, cfg):
+        errors=[]
+        try:
+            with open(path,"r",encoding="utf-8") as f: raw=json.load(f)
+            if not isinstance(raw,dict):
+                raise ValueError("manifest root must be an object")
+        except Exception as e:
+            return PluginManifest("", path.parent.name, "0.0.0", str(path), errors=[f"manifest read failed: {e}"], disabled_reason="invalid manifest")
+        plugin_id=_safe_plugin_id(raw.get("id") or path.parent.name)
+        if not plugin_id: errors.append("id must match [A-Za-z0-9_.-] and be 2-80 chars")
+        name=str(raw.get("name") or plugin_id or path.parent.name).strip() or "Unnamed Plugin"
+        version=str(raw.get("version") or "0.0.0").strip() or "0.0.0"
+        enabled=bool(raw.get("enabled", False))
+        hooks=self._parse_hooks(raw.get("hooks"), errors)
+        permissions=self._parse_permissions(raw.get("permissions"), errors)
+        trust=raw.get("trust") if isinstance(raw.get("trust"),dict) else {}
+        publisher=str(raw.get("publisher") or trust.get("publisher") or "").strip()
+        signature=str(raw.get("signature") or trust.get("signature") or "").strip()
+        trust_state="signed" if signature else "unsigned" if publisher else "unknown"
+        enabled_ids={_safe_plugin_id(x) for x in cfg.get("plugin_enabled_ids",[]) or []}
+        disabled_ids={_safe_plugin_id(x) for x in cfg.get("plugin_disabled_ids",[]) or []}
+        global_enabled=bool(cfg.get("plugins_enabled",False))
+        if errors:
+            executable=False; disabled_reason="invalid manifest"
+        elif not global_enabled:
+            executable=False; disabled_reason="plugins disabled in config"
+        elif plugin_id in disabled_ids:
+            executable=False; disabled_reason="disabled in config"
+        elif not enabled:
+            executable=False; disabled_reason="manifest disabled"
+        elif plugin_id not in enabled_ids:
+            executable=False; disabled_reason="not allowlisted in config"
+        else:
+            executable=True; disabled_reason=""
+        return PluginManifest(plugin_id,name,version,str(path),enabled,hooks,permissions,trust_state,publisher,signature,executable,disabled_reason,errors)
+
+    def _parse_hooks(self, value, errors):
+        if not isinstance(value,list) or not value:
+            errors.append("hooks must declare at least one event hook")
+            return []
+        hooks=[]
+        for raw_hook in value:
+            hook=str(raw_hook or "").strip()
+            if hook not in PLUGIN_ALLOWED_HOOKS:
+                errors.append(f"unsupported hook: {hook or '<empty>'}")
+            elif hook not in hooks:
+                hooks.append(hook)
+        return hooks
+
+    def _parse_permissions(self, value, errors):
+        if not isinstance(value,dict):
+            errors.append("permissions must declare network and files entries")
+            return {}
+        permissions={}
+        if "network" not in value:
+            errors.append("permissions.network must be declared")
+        if "files" not in value:
+            errors.append("permissions.files must be declared")
+        for raw_key, raw_value in value.items():
+            key=str(raw_key or "").strip()
+            if key not in PLUGIN_ALLOWED_PERMISSION_KEYS:
+                errors.append(f"unsupported permission: {key or '<empty>'}")
+                continue
+            if key in ("network","files"):
+                if raw_value in (None, False):
+                    permissions[key]=[]
+                elif isinstance(raw_value,list):
+                    permissions[key]=[str(v).strip() for v in raw_value if str(v).strip()]
+                else:
+                    errors.append(f"permissions.{key} must be a list")
+            else:
+                if isinstance(raw_value,bool):
+                    permissions[key]=raw_value
+                else:
+                    errors.append(f"permissions.{key} must be true or false")
+        permissions.setdefault("network",[])
+        permissions.setdefault("files",[])
+        return permissions
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -2538,6 +2757,7 @@ class HeadlessMonitor(QObject):
         self._geo_w = GeoIPWorker()
         self._sign_w = SignerWorker()
         self._tls_w = TLSLogWorker(self.db)
+        self._plugins = PluginRegistry()
         self._dns_mon = DNSMonitorThread(self.hm, self.db)
         self._conn_w = ConnWorker(self.db)
         self._evt_w = EvtWorker()
@@ -2561,6 +2781,8 @@ class HeadlessMonitor(QObject):
         if self._restored_state:
             _service_log(f"Restored prior service state: saved_at={self._restored_state.get('saved_at','?')}, clean_shutdown={self._restored_state.get('clean_shutdown')}")
         self._reload_config_if_changed(force=True)
+        plugins = self._plugins.scan()
+        _service_log(f"Plugin guardrails scanned: {plugins.summary()}")
         self._save_service_state(clean_shutdown=False)
         self._dns_w.start(); self._who_w.start(); self._geo_w.start(); self._sign_w.start(); self._tls_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
@@ -2644,6 +2866,7 @@ class HeadlessMonitor(QObject):
             "ids": self._ids.snapshot(),
             "geoip": self._geo_w.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
+            "plugins": self._plugins.scan(log_errors=False).summary(),
             "identity_fields": ["service", "parent_process", "uwp_package", "signer_trust"],
             "signer": self._sign_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
@@ -3851,6 +4074,14 @@ class ToolsTab(QWidget):
         g3l.addWidget(_make_toolbar_btn("Prune History (30d)","dim",self._prune_history))
         g3l.addWidget(_make_toolbar_btn("Export Usage Reports","primary",self._export_usage_reports))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
+        # Plugin trust boundary tools
+        gplug=QGroupBox("Plugin Guardrails"); gplugl=QHBoxLayout(gplug)
+        self.plugin_lbl=QLabel("Plugins not scanned")
+        self.plugin_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;")
+        gplugl.addWidget(self.plugin_lbl,1)
+        gplugl.addWidget(_make_toolbar_btn("Scan Plugins","primary",self._scan_plugins))
+        gplugl.addWidget(_make_toolbar_btn("Open Plugin Folder","dim",self._open_plugins))
+        lo.addWidget(gplug)
         # Import tools
         g4=QGroupBox("External Import"); g4l=QVBoxLayout(g4)
         g4l.addWidget(QLabel("Paste domains to block (one per line):"))
@@ -3877,11 +4108,13 @@ class ToolsTab(QWidget):
         geo=s.get("geoip",{}) if isinstance(s.get("geoip",{}),dict) else {}
         tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
         signer=s.get("signer",{}) if isinstance(s.get("signer",{}),dict) else {}
+        plugins=s.get("plugins",{}) if isinstance(s.get("plugins",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
              f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | "
              f"geoip {geo.get('provider','ipwhois')} {geo.get('lookups',0)}/{geo.get('unknown',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | "
-             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} {cfg_state} | {prev_txt}")
+             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | plugins {plugins.get('executable',0)}/{plugins.get('total',0)} invalid {plugins.get('invalid',0)} | "
+             f"bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} {cfg_state} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -3950,6 +4183,21 @@ class ToolsTab(QWidget):
     def _open_config(self):
         if sys.platform=='win32': os.startfile(CONFIG_DIR)
         else: subprocess.Popen(['xdg-open',CONFIG_DIR])
+    def _scan_plugins(self):
+        result=PluginRegistry().scan()
+        summary=result.summary()
+        self.plugin_lbl.setText(
+            f"{summary['total']} found | {summary['executable']} executable | {summary['invalid']} invalid | "
+            f"signed {summary['signed']} | unsigned {summary['unsigned']} | unknown {summary['unknown']}"
+        )
+        if result.errors:
+            self.slbl.setText(result.errors[0][:180])
+        else:
+            self.slbl.setText("Plugin manifests scanned; no plugin code executed")
+    def _open_plugins(self):
+        os.makedirs(PLUGINS_DIR,exist_ok=True)
+        if sys.platform=='win32': os.startfile(PLUGINS_DIR)
+        else: subprocess.Popen(['xdg-open',PLUGINS_DIR])
     def _import_paste(self):
         lines=[l.strip().lower() for l in self.paste.toPlainText().splitlines() if l.strip() and not l.strip().startswith('#')]
         domains=[d for d in lines if looks_like_domain(d)]

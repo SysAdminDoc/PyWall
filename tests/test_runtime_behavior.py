@@ -47,12 +47,19 @@ BASE_NAMES = {
     "_build_rule_exists_cmd",
     "CONFIG_SCHEMA_VERSION",
     "GEOIP_HTTPS_ENDPOINT",
+    "PLUGIN_ALLOWED_HOOKS",
+    "PLUGIN_ALLOWED_PERMISSION_KEYS",
+    "PLUGIN_ID_RE",
+    "PLUGIN_LOG_PATH",
+    "PLUGIN_MANIFEST_NAMES",
     "DOMAIN_RE",
     "IPV4_RE",
     "WILDCARD_RE",
     "MULTI_TLDS",
     "CONFIG_DEFAULTS",
     "ConfigLoadResult",
+    "PluginManifest",
+    "PluginScanResult",
     "looks_like_domain",
     "get_root_domain",
     "normalize_line",
@@ -62,6 +69,8 @@ BASE_NAMES = {
     "_validate_runtime_config",
     "_write_json_atomic",
     "_config_backup_path",
+    "_plugin_log",
+    "_safe_plugin_id",
     "load_runtime_config",
 }
 
@@ -141,13 +150,15 @@ def load_runtime(*names):
         "QThread": FakeQThread,
         "pyqtSignal": lambda *args, **kwargs: FakeSignal(),
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.21",
+        "APP_VERSION": "4.1.22",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),
         "CONN_DB_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-connections.db"),
         "DB_PATH": os.path.join(tempfile.gettempdir(), "pywall-test.db"),
         "FEED_CACHE_DIR": os.path.join(tempfile.gettempdir(), "pywall-feed-cache"),
+        "PLUGINS_DIR": os.path.join(tempfile.gettempdir(), "pywall-plugins"),
+        "PLUGIN_LOG_PATH": os.path.join(tempfile.gettempdir(), "plugin_events.log"),
         "FW_PFX": "PW_",
         "LEGACY_FW_PFX": ("HG_",),
         "FW_RULE_PREFIXES": ("PW_", "HG_"),
@@ -467,6 +478,61 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(result.data["geoip_https_endpoint"], "https://ipwho.is/{ip}")
             self.assertEqual(result.data["service_poll_seconds"], 1.0)
             self.assertEqual(result.data["unknown_future_key"], 42)
+
+    def test_plugin_registry_validates_manifests_and_blocks_execution_by_default(self):
+        ns = load_runtime("PluginRegistry")
+        with tempfile.TemporaryDirectory() as td:
+            plugin_dir = os.path.join(td, "plugins")
+            log_path = os.path.join(td, "plugin_events.log")
+            ns["PLUGIN_LOG_PATH"] = log_path
+            good_dir = pathlib.Path(plugin_dir) / "notifier"
+            bad_dir = pathlib.Path(plugin_dir) / "bad"
+            good_dir.mkdir(parents=True)
+            bad_dir.mkdir(parents=True)
+            good_manifest = {
+                "id": "Notifier.One",
+                "name": "Unit Notifier",
+                "version": "1.0.0",
+                "enabled": True,
+                "hooks": ["notification"],
+                "permissions": {"network": ["https://ntfy.sh"], "files": [], "notifications": True},
+                "trust": {"publisher": "Unit Publisher"},
+            }
+            bad_manifest = {
+                "id": "bad",
+                "name": "Bad Plugin",
+                "version": "1.0.0",
+                "enabled": True,
+                "hooks": ["shell_escape"],
+                "permissions": {"network": "all"},
+            }
+            (good_dir / "pywall-plugin.json").write_text(json.dumps(good_manifest), encoding="utf-8")
+            (bad_dir / "plugin.json").write_text(json.dumps(bad_manifest), encoding="utf-8")
+
+            cfg = dict(ns["CONFIG_DEFAULTS"])
+            cfg["plugins_enabled"] = False
+            cfg["plugin_enabled_ids"] = ["notifier.one"]
+            registry = ns["PluginRegistry"](plugin_dir, cfg)
+            result = registry.scan()
+
+            summary = result.summary()
+            self.assertEqual(summary["total"], 2)
+            self.assertEqual(summary["invalid"], 1)
+            good = next(p for p in result.plugins if p.plugin_id == "notifier.one")
+            self.assertFalse(good.executable)
+            self.assertEqual(good.disabled_reason, "plugins disabled in config")
+            self.assertEqual(good.trust_state, "unsigned")
+            self.assertFalse(registry.can_execute("notifier.one", "notification"))
+            self.assertIn("unsupported hook", pathlib.Path(log_path).read_text(encoding="utf-8"))
+
+            cfg["plugins_enabled"] = True
+            registry = ns["PluginRegistry"](plugin_dir, cfg)
+            self.assertTrue(registry.can_execute("Notifier.One", "notification"))
+            self.assertFalse(registry.can_execute("Notifier.One", "feed_import"))
+
+            cfg["plugin_disabled_ids"] = ["notifier.one"]
+            registry = ns["PluginRegistry"](plugin_dir, cfg)
+            self.assertFalse(registry.can_execute("Notifier.One", "notification"))
 
     def test_import_worker_records_feed_provenance_and_uses_last_good_cache(self):
         ns = load_runtime("HostsDB", "ImportWorker")

@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.21"])
+        self.assertEqual(versions, ["4.1.22"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -114,6 +114,13 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("QTableView", TEXT)
         self.assertIn("set_rules", TEXT)
         self.assertIn("QAbstractTableModel", TEXT)
+        self.assertIn("PluginRegistry", TEXT)
+        self.assertIn("PLUGIN_MANIFEST_NAMES", TEXT)
+        self.assertIn("plugins_enabled", TEXT)
+        self.assertIn("plugin_enabled_ids", TEXT)
+        self.assertIn("plugin_disabled_ids", TEXT)
+        self.assertIn("can_execute", TEXT)
+        self.assertIn("plugin_events.log", TEXT)
 
     def test_firewall_command_literals_escape_powershell_metacharacters(self):
         ns = load_helpers(
@@ -228,6 +235,24 @@ class ServiceModeStaticTests(unittest.TestCase):
             "_parse_import_text",
             "hashlib.sha256(raw_bytes).hexdigest()",
             "using cached feed",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_plugin_manifest_guardrails_are_wired(self):
+        for token in (
+            "class PluginRegistry",
+            "class PluginManifest",
+            "class PluginScanResult",
+            "PLUGIN_ALLOWED_HOOKS",
+            "PLUGIN_ALLOWED_PERMISSION_KEYS",
+            "permissions.network must be declared",
+            "plugins disabled in config",
+            "not allowlisted in config",
+            "disabled in config",
+            "trust_state",
+            "\"plugins\": self._plugins.scan",
+            "Scan Plugins",
+            "Plugin manifests scanned; no plugin code executed",
         ):
             self.assertIn(token, TEXT)
 
