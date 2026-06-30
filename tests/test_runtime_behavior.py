@@ -28,6 +28,8 @@ TREE = ast.parse(SRC.read_text(encoding="utf-8"))
 
 BASE_NAMES = {
     "CI",
+    "LearningReviewGroup",
+    "LearningReviewCollector",
     "FWRule",
     "FirewallTamperEvent",
     "ThreatEvent",
@@ -155,7 +157,7 @@ def load_runtime(*names):
         "QThread": FakeQThread,
         "pyqtSignal": lambda *args, **kwargs: FakeSignal(),
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.23",
+        "APP_VERSION": "4.1.24",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),
@@ -276,6 +278,45 @@ class RuntimeBehaviorTests(unittest.TestCase):
             engine._mark_local_change("PW_TestRule")
             engine._detect_tamper([original])
             self.assertEqual(engine.tamper_summary()["pending"], 0)
+
+    def test_learning_review_collector_groups_unknown_outbound_apps(self):
+        ns = load_runtime("LearningReviewCollector")
+        collector = ns["LearningReviewCollector"](enabled=True, window_seconds=60, started=100.0)
+        ci1 = ns["CI"](
+            dir="Out",
+            ra="198.51.100.50",
+            rp="443",
+            host="api.example.test",
+            proc="app.exe",
+            path=r"C:\Apps\App\app.exe",
+            signer="Valid: Example Publisher",
+            parent="explorer.exe (100)",
+            stat="-",
+        )
+        ci2 = ns["CI"](
+            dir="Out",
+            ra="198.51.100.51",
+            rp="443",
+            host="cdn.example.test",
+            proc="app.exe",
+            path=r"C:\Apps\App\app.exe",
+            signer="Valid: Example Publisher",
+            parent="explorer.exe (100)",
+            stat="-",
+        )
+        blocked = ns["CI"](dir="Out", ra="203.0.113.2", proc="bad.exe", stat="FW:BLOCKED")
+        local = ns["CI"](dir="Out", ra="192.168.1.10", proc="lan.exe", stat="-")
+
+        self.assertEqual(collector.observe([ci1, ci2, blocked, local], now=110.0), 1)
+        groups = collector.groups()
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["count"], 2)
+        self.assertEqual(groups[0]["signer"], "Valid: Example Publisher")
+        self.assertEqual(groups[0]["ips"], ["198.51.100.50", "198.51.100.51"])
+        self.assertFalse(collector.active(now=200.0))
+        self.assertEqual(collector.observe([ns["CI"](dir="Out", ra="198.51.100.52", proc="late.exe")], now=200.0), 0)
+        removed = collector.remove(groups[0]["key"])
+        self.assertEqual(removed.proc, "app.exe")
 
     def test_conn_db_migrates_identity_columns_and_searches_sessions(self):
         ns = load_runtime("ConnDB")

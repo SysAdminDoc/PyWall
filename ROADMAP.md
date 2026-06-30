@@ -90,13 +90,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Add first-run learning review without noisy per-connection prompts
-  Why: Competitors prove learning mode is valuable, but PyWall's no-confirmation philosophy needs a batch review model instead of modal prompts.
-  Evidence: TinyWall learning mode; OpenSnitch interactive prompts; GlassWire ask-to-connect; existing roadmap notes for multi-select toasts.
-  Touches: `ConnectionsTab`, toast/review queue UI, `FirewallEngine`, config defaults, tests.
-  Acceptance: A first-run mode collects unknown outbound apps for a timed window, groups them by signer/path/parent where available, and lets the user allow/block selected groups with clear default behavior.
-  Complexity: L
-
 - [ ] P1 - Add optional Sysmon/WFP event correlation for connection evidence
   Why: psutil polling can miss short-lived connections and lacks event IDs; Windows event 5157 and Sysmon Event ID 3 provide auditable evidence.
   Evidence: `EvtWorker` 5157 polling in `PyWall.py`; Microsoft event 5157 docs; Sysmon network connection docs; Sniffnet display-filter issue signal.

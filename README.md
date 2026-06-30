@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.23-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.23"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.24-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.24"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -97,6 +97,10 @@ Plugin manifests can be staged under `%APPDATA%/PyWall/plugins`, but plugin code
 
 Live connection rows show process names, paths, PIDs, service/package/parent/signer identity, remote endpoints, traffic category, byte deltas, and context actions to block the selected IP, program, or domain.
 
+### Learning Review
+
+On startup, PyWall can collect unknown outbound apps for a timed review window without prompting on every connection. The Connections tab groups candidates by signer, executable path, parent process, and process name, then lets you allow or block selected groups in one batch; the default behavior is collect-only until you choose an action.
+
 ### History & Timeline
 
 SQLite-backed connection log with full-text search and filters (process, service, parent, package, signer, country, time range). Per-process sent/received byte deltas and app identity fields are captured from `psutil`/Windows metadata and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
@@ -158,6 +162,8 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `toast` | `true` | Desktop notifications |
 | `toast_sec` | `10` | Auto-dismiss delay (seconds, 0 = manual) |
 | `start_monitoring` | `false` | Auto-start monitor on launch |
+| `learning_mode_enabled` | `true` | Collect unknown outbound apps for a non-modal review window on startup |
+| `learning_mode_window_minutes` | `10.0` | Timed learning review collection window |
 | `history_days` | `30` | Connection history retention |
 | `threat_auto_block` | `false` | Auto-block detected threats |
 | `service_auto_block` | `true` | Override service-mode high-severity auto-blocking without restart |
@@ -255,6 +261,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `DoHDetector` | Known endpoint detector with warn/block policy for DNS-over-HTTPS and DNS-over-TLS connections |
 | `IDSRuleEngine` | YARA-style metadata rule loader/evaluator for live connection rows |
 | `TrafficCategorizer` | Hostname/process classification into categories |
+| `LearningReviewCollector` | Timed, non-modal collector that groups unknown outbound apps by signer/path/parent for batch allow/block decisions |
 | `BandwidthQuotaEnforcer` | Config-driven app byte caps with persisted counters, tray/service notifications, and firewall enforcement |
 | `export_usage_reports` | Daily and weekly app usage report writer for CSV and HTML |
 | `PluginRegistry` | Passive manifest scanner with hook/permission validation, trust-state reporting, and default-deny execution gates |

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.23 - Windows Firewall & Network Command Center
+PyWall v4.1.24 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.23"
+APP_VERSION = "4.1.24"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -193,6 +193,8 @@ CONFIG_DEFAULTS = {
     "toast": True,
     "toast_sec": 10,
     "start_monitoring": False,
+    "learning_mode_enabled": True,
+    "learning_mode_window_minutes": 10.0,
     "history_days": 30,
     "threat_auto_block": False,
     "service_auto_block": True,
@@ -748,6 +750,102 @@ class CI:
     state:str=""; path:str=""; org:str="-"; cmd:str=""
     stat:str="-"; country:str="-"; cc:str=""
     category:str=""; bytes_sent:int=0; bytes_recv:int=0
+
+@dataclass
+class LearningReviewGroup:
+    key:str=""; proc:str=""; path:str=""; signer:str="-"; parent:str="-"
+    package:str="-"; svc:str="-"; first_seen:str=""; last_seen:str=""
+    count:int=0; endpoints:list=field(default_factory=list); hosts:list=field(default_factory=list); ips:list=field(default_factory=list)
+
+    def record(self, ci):
+        now=datetime.datetime.now().isoformat(timespec="seconds")
+        if not self.first_seen: self.first_seen=now
+        self.last_seen=now; self.count+=1
+        endpoint=f"{ci.ra}:{ci.rp}" if ci.rp else str(ci.ra or "")
+        if endpoint and endpoint not in self.endpoints: self.endpoints.append(endpoint)
+        if ci.ra and ci.ra not in self.ips: self.ips.append(ci.ra)
+        if ci.host and ci.host not in ("-","...") and ci.host not in self.hosts: self.hosts.append(ci.host)
+
+    def as_dict(self):
+        return {
+            "key": self.key,
+            "proc": self.proc,
+            "path": self.path,
+            "signer": self.signer,
+            "parent": self.parent,
+            "package": self.package,
+            "svc": self.svc,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "count": self.count,
+            "endpoints": list(self.endpoints),
+            "hosts": list(self.hosts),
+            "ips": list(self.ips),
+        }
+
+class LearningReviewCollector:
+    def __init__(self, enabled=True, window_seconds=600, started=None):
+        self.enabled=bool(enabled)
+        self.window_seconds=max(float(window_seconds or 0),0.0)
+        self.started=float(started if started is not None else time.time())
+        self.closed=False
+        self._groups={}
+
+    def active(self, now=None):
+        if not self.enabled or self.closed: return False
+        if self.window_seconds <= 0: return True
+        now=float(now if now is not None else time.time())
+        return now - self.started <= self.window_seconds
+
+    def seconds_remaining(self, now=None):
+        if self.window_seconds <= 0: return 0
+        now=float(now if now is not None else time.time())
+        return max(0, int(self.window_seconds - (now - self.started)))
+
+    def stop(self):
+        self.closed=True
+
+    def clear(self):
+        self._groups.clear()
+
+    def observe(self, conns, now=None):
+        if not self.active(now): return 0
+        added=0
+        for ci in conns or []:
+            if not self._should_collect(ci): continue
+            key=self._group_key(ci)
+            group=self._groups.get(key)
+            if group is None:
+                group=LearningReviewGroup(key=key, proc=ci.proc or "?", path=ci.path or "", signer=ci.signer or "-",
+                    parent=ci.parent or "-", package=ci.package or "-", svc=ci.svc or "-")
+                self._groups[key]=group; added+=1
+            group.record(ci)
+        return added
+
+    def groups(self):
+        return sorted((g.as_dict() for g in self._groups.values()), key=lambda g:(-g["count"], g["proc"].lower(), g["path"].lower()))
+
+    def remove(self, key):
+        return self._groups.pop(key, None)
+
+    def _should_collect(self, ci):
+        if getattr(ci,"dir","") != "Out": return False
+        if getattr(ci,"stat","-") not in ("","-"): return False
+        ip=str(getattr(ci,"ra","") or "")
+        if not ip or ip in ("*","0.0.0.0","127.0.0.1","::1"): return False
+        if PRIV_RE.match(ip): return False
+        proc=str(getattr(ci,"proc","") or "").strip()
+        if not proc or proc in ("?","System Idle Process"): return False
+        return True
+
+    def _group_key(self, ci):
+        parts=[
+            str(getattr(ci,"signer","") or "-").lower(),
+            str(getattr(ci,"path","") or "").lower(),
+            str(getattr(ci,"parent","") or "-").lower(),
+            str(getattr(ci,"proc","") or "?").lower(),
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 @dataclass
 class FWRule:
@@ -1639,6 +1737,10 @@ class FirewallEngine:
         safe=Path(prog_path).stem[:30]; nm=f"{FW_PFX}Block_{safe}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
         return self.create_rule(nm,direction,"Block",program=prog_path,desc="Program blocked by PyWall")
+    def allow_program(self,prog_path,direction="Outbound"):
+        safe=Path(prog_path).stem[:30]; nm=f"{FW_PFX}Allow_{safe}_{direction[:3]}"
+        if self.rule_exists(nm): return True,"Rule already exists"
+        return self.create_rule(nm,direction,"Allow",program=prog_path,desc="Program allowed by PyWall learning review")
     def block_port(self,port,proto="TCP",direction="Outbound"):
         nm=f"{FW_PFX}Block_Port{port}_{proto}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
@@ -3653,7 +3755,10 @@ class DomainTab(QWidget):
 class ConnectionsTab(QWidget):
     def __init__(self,db,hm,conn_db):
         super().__init__(); self.db=db; self.hm=hm; self.cdb=conn_db; self._data=[]; self._filtered=[]
-        self._filter_txt=""; self._filter_dir="All"; self._filter_pro="All"; self._filter_cat="All"; self._build()
+        self._filter_txt=""; self._filter_dir="All"; self._filter_pro="All"; self._filter_cat="All"
+        cfg=load_runtime_config().data
+        self.learning=LearningReviewCollector(cfg.get("learning_mode_enabled",True), float(cfg.get("learning_mode_window_minutes",10.0))*60.0)
+        self._build()
     def _build(self):
         lo=QVBoxLayout(self); lo.setContentsMargins(12,12,12,12); lo.setSpacing(8)
         tb=QHBoxLayout(); tb.setSpacing(6)
@@ -3686,6 +3791,23 @@ class ConnectionsTab(QWidget):
         self.btn_hosts_block=QPushButton("Hosts Block"); self.btn_hosts_block.setProperty("class","warning"); self.btn_hosts_block.clicked.connect(self._hosts_block_sel); ab.addWidget(self.btn_hosts_block)
         self.btn_kill=QPushButton("Kill Process"); self.btn_kill.setProperty("class","dim"); self.btn_kill.clicked.connect(self._kill_sel); ab.addWidget(self.btn_kill)
         rl.addLayout(ab)
+        # Timed first-run learning review
+        rl.addWidget(QLabel("Learning Review"))
+        self.learn_lbl=QLabel("Collecting unknown outbound apps")
+        self.learn_lbl.setWordWrap(True); self.learn_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;")
+        rl.addWidget(self.learn_lbl)
+        self.learn_tbl=QTableWidget(0,4); self.learn_tbl.setHorizontalHeaderLabels(["App","Signer / Parent","Seen","Endpoints"])
+        self.learn_tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
+        for i,w in [(1,130),(2,45),(3,115)]: self.learn_tbl.setColumnWidth(i,w)
+        self.learn_tbl.verticalHeader().setVisible(False); self.learn_tbl.setAlternatingRowColors(True)
+        self.learn_tbl.setEditTriggers(QTableWidget.NoEditTriggers); self.learn_tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        self.learn_tbl.setMaximumHeight(185); rl.addWidget(self.learn_tbl)
+        lb=QHBoxLayout()
+        lb.addWidget(_make_toolbar_btn("Allow","success",lambda:self._learning_decide("allow")))
+        lb.addWidget(_make_toolbar_btn("Block","danger",lambda:self._learning_decide("block")))
+        lb.addWidget(_make_toolbar_btn("End","dim",self._learning_end))
+        lb.addWidget(_make_toolbar_btn("Clear","dim",self._learning_clear))
+        rl.addLayout(lb)
         # HG rules mini-panel
         rl.addWidget(QLabel("PyWall FW Rules"))
         self.rules_tbl=QTableWidget(0,4); self.rules_tbl.setHorizontalHeaderLabels(["Name","Action","Direction","Addr"])
@@ -3740,6 +3862,62 @@ class ConnectionsTab(QWidget):
     def _kill_sel(self):
         ci=self._get_sel_ci()
         if ci and ci.pid>0: fw.kill_connection(ci.pid)
+    def _learning_refresh(self):
+        groups=self.learning.groups()
+        self.learn_tbl.setSortingEnabled(False); self.learn_tbl.setRowCount(len(groups))
+        for i,g in enumerate(groups):
+            app=QTableWidgetItem(g["proc"] or "?"); app.setData(Qt.UserRole,g["key"])
+            if g.get("path"): app.setToolTip(g["path"])
+            self.learn_tbl.setItem(i,0,app)
+            identity=g.get("signer") if g.get("signer") not in ("","-","...") else g.get("parent","-")
+            self.learn_tbl.setItem(i,1,QTableWidgetItem(identity or "-"))
+            ct=QTableWidgetItem(str(g.get("count",0))); ct.setTextAlignment(Qt.AlignCenter); self.learn_tbl.setItem(i,2,ct)
+            eps=", ".join((g.get("endpoints") or [])[:3])
+            self.learn_tbl.setItem(i,3,QTableWidgetItem(eps))
+        self.learn_tbl.setSortingEnabled(True)
+        if self.learning.active():
+            rem=self.learning.seconds_remaining()
+            self.learn_lbl.setText(f"Collecting unknown outbound apps for batch review ({len(groups)} groups, {rem//60}m {rem%60}s left)")
+        else:
+            self.learn_lbl.setText(f"Learning review stopped ({len(groups)} groups pending)")
+    def _learning_selected_keys(self):
+        keys=[]
+        for row in sorted(set(i.row() for i in self.learn_tbl.selectedIndexes())):
+            item=self.learn_tbl.item(row,0)
+            key=item.data(Qt.UserRole) if item else ""
+            if key and key not in keys: keys.append(key)
+        return keys
+    def _learning_decide(self, action):
+        keys=self._learning_selected_keys()
+        if not keys:
+            self.learn_lbl.setText("Select one or more learning groups first")
+            return
+        decided=0; failures=[]
+        for key in keys:
+            group=self.learning.remove(key)
+            if not group: continue
+            data=group.as_dict(); path=data.get("path") or ""
+            if path and path!="-":
+                ok,out=(fw.allow_program(path) if action=="allow" else fw.block_program(path))
+            else:
+                ok=True; out=""
+                for ip in (data.get("ips") or [])[:5]:
+                    step_ok,step_out=(fw.allow_ip(ip,"Outbound") if action=="allow" else fw.block_ip(ip,"Outbound"))
+                    ok=ok and step_ok
+                    if not step_ok: out=step_out
+            if ok:
+                decided+=1
+                event_action="learning_allow" if action=="allow" else "learning_block"
+                self.db.log_event(data.get("proc","learning"),event_action,"LearningReview",
+                    f"{data.get('count',0)} samples; signer={data.get('signer','-')}; parent={data.get('parent','-')}; path={path or 'endpoint fallback'}")
+            else:
+                failures.append(f"{data.get('proc','?')}: {out}")
+        self._refresh_rules(); self._learning_refresh()
+        self.learn_lbl.setText(f"{action.capitalize()}ed {decided} learning group(s)" + (f"; {failures[0]}" if failures else ""))
+    def _learning_end(self):
+        self.learning.stop(); self._learning_refresh()
+    def _learning_clear(self):
+        self.learning.clear(); self._learning_refresh()
     def _rules_ctx(self,pos):
         r=self.rules_tbl.currentRow()
         if r<0: return
@@ -3758,7 +3936,7 @@ class ConnectionsTab(QWidget):
             addr=r.remote_addr if r.remote_addr not in ("Any","*") else r.program or "Any"
             self.rules_tbl.setItem(i,3,QTableWidgetItem(addr[:40]))
     def update_data(self,conns):
-        self._data=conns; self._update_table()
+        self._data=conns; self.learning.observe(conns); self._learning_refresh(); self._update_table()
     def _update_table(self):
         f=self._filter_txt.lower(); fd=self._filter_dir; fp=self._filter_pro; fc=self._filter_cat
         filtered=[]
@@ -3780,7 +3958,7 @@ class ConnectionsTab(QWidget):
                 if ci.stat!="-": it.setForeground(color)
                 self.table.setItem(i,j,it)
         self.table.setSortingEnabled(True)
-        self.count_lbl.setText(f"{len(filtered)}/{len(self._data)} connections")
+        self.count_lbl.setText(f"{len(filtered)}/{len(self._data)} connections | review {len(self.learning.groups())}")
 
 
 class FirewallRuleTableModel(QAbstractTableModel):

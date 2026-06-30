@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.23"])
+        self.assertEqual(versions, ["4.1.24"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -125,6 +125,10 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("firewall_tamper.log", TEXT)
         self.assertIn("restore_last_tamper", TEXT)
         self.assertIn("accept_current_rules", TEXT)
+        self.assertIn("LearningReviewCollector", TEXT)
+        self.assertIn("learning_mode_enabled", TEXT)
+        self.assertIn("learning_mode_window_minutes", TEXT)
+        self.assertIn("allow_program", TEXT)
 
     def test_firewall_command_literals_escape_powershell_metacharacters(self):
         ns = load_helpers(
@@ -275,6 +279,21 @@ class ServiceModeStaticTests(unittest.TestCase):
             "Accept Drift",
             "WARNING: {tamper.get('pending')}",
             "fw.get_all_rules(force_refresh=True)",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_learning_review_is_wired(self):
+        for token in (
+            "class LearningReviewCollector",
+            "class LearningReviewGroup",
+            "Learning Review",
+            "Collecting unknown outbound apps for batch review",
+            "_learning_decide",
+            "learning_allow",
+            "learning_block",
+            "fw.allow_program",
+            "fw.block_program",
+            "review {len(self.learning.groups())}",
         ):
             self.assertIn(token, TEXT)
 

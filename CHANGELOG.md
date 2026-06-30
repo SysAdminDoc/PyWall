@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.24] - 2026-06-30
+
+- Added: Timed learning review for unknown outbound apps that groups candidates by signer, executable path, parent process, and process name without per-connection prompts.
+- Added: Connections tab batch review controls to allow or block selected learning groups through program rules or endpoint fallback rules.
+- Changed: Runtime config now exposes `learning_mode_enabled` and `learning_mode_window_minutes`.
+
 ## [v4.1.23] - 2026-06-30
 
 - Added: Managed firewall rule tamper detection for external create/delete/enable/disable/field changes to `PW_` and legacy `HG_` rules.
