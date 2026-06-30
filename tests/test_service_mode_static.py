@@ -1,12 +1,32 @@
 #!/usr/bin/env python3
 import ast
+import ipaddress
+import os
 import pathlib
+import re
+import tempfile
 import unittest
 
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "PyWall.py"
 TEXT = SRC.read_text(encoding="utf-8")
 TREE = ast.parse(TEXT)
+
+
+def load_helpers(*names):
+    nodes = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    ns = {
+        "datetime": __import__("datetime"),
+        "ipaddress": ipaddress,
+        "os": os,
+        "re": re,
+        "CONFIG_DIR": tempfile.gettempdir(),
+        "_nt_to_dos": lambda path: path,
+        "_ps": lambda cmd, timeout=20: (True, cmd),
+    }
+    ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<helpers>", "exec"), ns)
+    return ns
 
 
 class ServiceModeStaticTests(unittest.TestCase):
@@ -30,7 +50,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.14"])
+        self.assertEqual(versions, ["4.1.15"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -89,6 +109,60 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("QTableView", TEXT)
         self.assertIn("set_rules", TEXT)
         self.assertIn("QAbstractTableModel", TEXT)
+
+    def test_firewall_command_literals_escape_powershell_metacharacters(self):
+        ns = load_helpers(
+            "_ps_literal", "_fw_enum", "_fw_profile", "_fw_protocol", "_fw_ports",
+            "_fw_address", "_fw_program", "_build_new_firewall_rule_cmd",
+            "_build_remove_firewall_rule_cmd", "_build_set_firewall_rule_enabled_cmd",
+            "_build_rule_exists_cmd",
+        )
+        cmd = ns["_build_new_firewall_rule_cmd"](
+            "PW_Bob's;Rule",
+            program=r"C:\Program Files\Bob's App\app.exe",
+            remote_addr="203.0.113.7",
+            remote_port="443,8443-8444",
+            protocol="TCP",
+            desc="owner's semicolon; stays literal",
+        )
+        self.assertIn("-DisplayName 'PW_Bob''s;Rule'", cmd)
+        self.assertIn("-Program 'C:\\Program Files\\Bob''s App\\app.exe'", cmd)
+        self.assertIn("-RemotePort '443,8443-8444'", cmd)
+        self.assertIn("-Description 'owner''s semicolon; stays literal'", cmd)
+        self.assertIn("Remove-NetFirewallRule -DisplayName 'PW_Bob''s;Rule'", ns["_build_remove_firewall_rule_cmd"]("PW_Bob's;Rule"))
+        self.assertIn("Set-NetFirewallRule -DisplayName 'PW_Bob''s;Rule' -Enabled False", ns["_build_set_firewall_rule_enabled_cmd"]("PW_Bob's;Rule", False))
+        self.assertIn("Get-NetFirewallRule -DisplayName 'PW_Bob''s;Rule'", ns["_build_rule_exists_cmd"]("PW_Bob's;Rule"))
+
+    def test_firewall_command_builders_reject_unstructured_values(self):
+        ns = load_helpers(
+            "_ps_literal", "_fw_enum", "_fw_profile", "_fw_protocol", "_fw_ports",
+            "_fw_address", "_fw_program", "_build_new_firewall_rule_cmd",
+        )
+        with self.assertRaises(ValueError):
+            ns["_build_new_firewall_rule_cmd"]("PW_Test", remote_port="80; Remove-Item C:\\")
+        with self.assertRaises(ValueError):
+            ns["_build_new_firewall_rule_cmd"]("PW_Test", remote_addr="203.0.113.7;Stop")
+        with self.assertRaises(ValueError):
+            ns["_build_new_firewall_rule_cmd"]("PW_Test", protocol="TCP;Stop")
+        with self.assertRaises(ValueError):
+            ns["_build_new_firewall_rule_cmd"]("PW_Test\nbad")
+
+    def test_service_ipc_security_hooks_are_wired(self):
+        self.assertIn("def _build_ipc_security_descriptor", TEXT)
+        self.assertIn("def _build_ipc_security_attributes", TEXT)
+        self.assertIn("def _secure_ipc_token_file", TEXT)
+        self.assertIn("_secure_ipc_token_file(IPC_TOKEN_PATH)", TEXT)
+        self.assertIn("_build_ipc_security_attributes())", TEXT)
+        self.assertIn("DACL_SECURITY_INFORMATION", TEXT)
+
+    def test_firewall_reset_exports_rollback_before_reset(self):
+        reset_idx = TEXT.index("def _fw_reset")
+        reset_block = TEXT[reset_idx:TEXT.index("def _fw_export", reset_idx)]
+        self.assertIn("_timestamped_fw_export_path()", reset_block)
+        self.assertLess(reset_block.index("_export_firewall_config(backup)"), reset_block.index('netsh advfirewall reset'))
+        self.assertIn("Reset aborted", reset_block)
+        self.assertIn("rollback saved", reset_block)
+        self.assertIn("def _fw_restore", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())

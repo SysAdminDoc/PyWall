@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.14 - Windows Firewall & Network Command Center
+PyWall v4.1.15 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -125,7 +125,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.14"
+APP_VERSION = "4.1.15"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -168,8 +168,10 @@ def _service_log(msg, level="INFO"):
 
 try:
     import win32serviceutil, win32service, servicemanager, win32pipe, win32file, pywintypes
+    import win32security, ntsecuritycon
 except ImportError:
     win32serviceutil = win32service = servicemanager = win32pipe = win32file = pywintypes = None
+    win32security = ntsecuritycon = None
 
 if win32serviceutil is not None:
     class PyWallWindowsService(win32serviceutil.ServiceFramework):
@@ -525,6 +527,149 @@ def _ps(cmd, t=20):
         return (r.returncode==0, r.stdout.strip())
     except Exception as e: return (False, str(e))
 
+def _ps_literal(value, field="value", max_len=1024):
+    text = str(value if value is not None else "")
+    if not text:
+        raise ValueError(f"{field} is required")
+    if len(text) > max_len:
+        raise ValueError(f"{field} is too long")
+    if any(ch in text for ch in ("\x00", "\r", "\n")):
+        raise ValueError(f"{field} contains control characters")
+    return "'" + text.replace("'", "''") + "'"
+
+def _fw_enum(value, allowed, field, default=None):
+    text = str(value if value is not None else default or "").strip()
+    if not text and default is not None: text = default
+    match = {v.lower(): v for v in allowed}.get(text.lower())
+    if not match:
+        raise ValueError(f"Invalid {field}: {value}")
+    return match
+
+def _fw_profile(value):
+    text = str(value or "Any").strip()
+    if text in ("", "*", "Any"): return "Any"
+    allowed = {"Domain", "Private", "Public"}
+    parts = []
+    for part in text.split(","):
+        item = _fw_enum(part.strip(), allowed, "profile")
+        if item not in parts: parts.append(item)
+    return ",".join(parts) if parts else "Any"
+
+def _fw_protocol(value):
+    text = str(value or "Any").strip()
+    if text in ("", "*", "Any"): return ""
+    allowed = {"TCP", "UDP", "ICMPv4", "ICMPv6"}
+    if text.upper() in ("TCP", "UDP"): return text.upper()
+    if text.lower() in ("icmpv4", "icmpv6"): return "ICMPv" + text[-1]
+    if text.isdigit() and 0 <= int(text) <= 255: return text
+    raise ValueError(f"Invalid protocol: {value}")
+
+def _fw_ports(value, field):
+    text = str(value or "").strip()
+    if text in ("", "*", "Any"): return ""
+    safe_words = {"RPC", "RPC-EPMap", "IPHTTPS", "Teredo"}
+    out = []
+    for raw in text.split(","):
+        part = raw.strip()
+        if not part: raise ValueError(f"Invalid {field}: empty segment")
+        if part in safe_words:
+            out.append(part); continue
+        if "-" in part:
+            start, end = [p.strip() for p in part.split("-", 1)]
+            if not (start.isdigit() and end.isdigit()):
+                raise ValueError(f"Invalid {field}: {part}")
+            lo, hi = int(start), int(end)
+            if not (1 <= lo <= hi <= 65535):
+                raise ValueError(f"Invalid {field}: {part}")
+            out.append(f"{lo}-{hi}"); continue
+        if not part.isdigit() or not (1 <= int(part) <= 65535):
+            raise ValueError(f"Invalid {field}: {part}")
+        out.append(str(int(part)))
+    return ",".join(out)
+
+def _fw_address(value, field):
+    text = str(value or "").strip()
+    if text in ("", "*", "Any"): return ""
+    keywords = {"LocalSubnet", "DefaultGateway", "DHCP", "DNS", "WINS", "Internet", "Intranet", "IntranetRemoteAccess", "PlayToDevice"}
+    out = []
+    for raw in text.split(","):
+        part = raw.strip()
+        if not part: raise ValueError(f"Invalid {field}: empty segment")
+        if part in keywords:
+            out.append(part); continue
+        if "-" in part and "/" not in part:
+            start, end = [p.strip() for p in part.split("-", 1)]
+            try:
+                ipaddress.ip_address(start); ipaddress.ip_address(end)
+            except ValueError:
+                raise ValueError(f"Invalid {field}: {part}")
+            out.append(f"{start}-{end}"); continue
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise ValueError(f"Invalid {field}: {part}")
+        out.append(part)
+    return ",".join(out)
+
+def _fw_program(value):
+    text = _nt_to_dos(str(value or "").strip())
+    if not text or text in ("-", "N/A"): return ""
+    if any(ch in text for ch in ("\x00", "\r", "\n", '"')):
+        raise ValueError("program path contains invalid characters")
+    return text
+
+def _build_new_firewall_rule_cmd(name,direction="Outbound",action="Block",remote_addr="",remote_port="",local_addr="",local_port="",protocol="",program="",profile="Any",desc="",enabled=True):
+    direction = _fw_enum(direction, {"Inbound", "Outbound"}, "direction", "Outbound")
+    action = _fw_enum(action, {"Allow", "Block"}, "action", "Block")
+    profile = _fw_profile(profile)
+    proto = _fw_protocol(protocol)
+    parts = ["New-NetFirewallRule", "-DisplayName", _ps_literal(name, "rule name", 256), "-Direction", direction, "-Action", action,
+        "-Enabled", "True" if enabled else "False", "-Profile", profile]
+    remote_addr = _fw_address(remote_addr, "remote address")
+    local_addr = _fw_address(local_addr, "local address")
+    remote_port = _fw_ports(remote_port, "remote port")
+    local_port = _fw_ports(local_port, "local port")
+    program = _fw_program(program)
+    if remote_addr: parts.extend(["-RemoteAddress", _ps_literal(remote_addr, "remote address")])
+    if local_addr: parts.extend(["-LocalAddress", _ps_literal(local_addr, "local address")])
+    if remote_port: parts.extend(["-RemotePort", _ps_literal(remote_port, "remote port")])
+    if local_port: parts.extend(["-LocalPort", _ps_literal(local_port, "local port")])
+    if proto: parts.extend(["-Protocol", proto])
+    if program: parts.extend(["-Program", _ps_literal(program, "program path")])
+    if desc: parts.extend(["-Description", _ps_literal(str(desc)[:200], "description", 200)])
+    parts.extend(["-ErrorAction", "Stop"])
+    return " ".join(parts)
+
+def _build_rule_exists_cmd(name):
+    return f"(Get-NetFirewallRule -DisplayName {_ps_literal(name, 'rule name', 256)} -ErrorAction SilentlyContinue) -ne $null"
+
+def _build_remove_firewall_rule_cmd(name):
+    return f"Remove-NetFirewallRule -DisplayName {_ps_literal(name, 'rule name', 256)} -ErrorAction SilentlyContinue"
+
+def _build_set_firewall_rule_enabled_cmd(name, enabled=True):
+    return f"Set-NetFirewallRule -DisplayName {_ps_literal(name, 'rule name', 256)} -Enabled {'True' if enabled else 'False'} -ErrorAction Stop"
+
+def _export_firewall_config(path):
+    if not path: return False, "No export path provided"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        return _ps(f"netsh advfirewall export {_ps_literal(path, 'firewall export path')}", 30)
+    except Exception as e:
+        return False, str(e)
+
+def _import_firewall_config(path):
+    if not path: return False, "No import path provided"
+    try:
+        return _ps(f"netsh advfirewall import {_ps_literal(path, 'firewall import path')}", 30)
+    except Exception as e:
+        return False, str(e)
+
+def _timestamped_fw_export_path(prefix="fw_before_reset"):
+    d = os.path.join(CONFIG_DIR, "fw_backups")
+    os.makedirs(d, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(d, f"{prefix}_{stamp}.wfw")
+
 def _is_managed_rule_name(name):
     return any(str(name or "").startswith(pfx) for pfx in FW_RULE_PREFIXES)
 
@@ -781,27 +926,26 @@ class FirewallEngine:
     def rule_exists(self,name):
         with self._cache_lock:
             if self._known_names_loaded: return name in self._known_names
-        ok,out=_ps(f'(Get-NetFirewallRule -DisplayName "{name}" -EA SilentlyContinue) -ne $null',8)
+        try: cmd = _build_rule_exists_cmd(name)
+        except ValueError: return False
+        ok,out=_ps(cmd,8)
         return ok and out.strip().lower()=="true"
     def create_rule(self,name,direction="Outbound",action="Block",remote_addr="",remote_port="",local_addr="",local_port="",protocol="",program="",profile="Any",desc="",enabled=True):
-        parts=[f'New-NetFirewallRule -DisplayName "{name}" -Direction {direction} -Action {action}']
-        parts.append(f'-Enabled {"True" if enabled else "False"}')
-        parts.append(f'-Profile "{profile}"' if profile and profile!="Any" else '-Profile Any')
-        if remote_addr and remote_addr not in ("*","Any"): parts.append(f'-RemoteAddress "{remote_addr}"')
-        if remote_port and remote_port not in ("*","Any"): parts.append(f'-RemotePort "{remote_port}"')
-        if local_port and local_port not in ("*","Any"): parts.append(f'-LocalPort "{local_port}"')
-        if protocol and protocol not in ("","Any"): parts.append(f'-Protocol {protocol}')
-        if program and program not in ("-","N/A",""): parts.append(f'-Program "{_nt_to_dos(program)}"')
-        if desc: parts.append(f'-Description "{desc[:200]}"')
-        ok,out=_ps(" ".join(parts),20)
+        try: cmd = _build_new_firewall_rule_cmd(name,direction,action,remote_addr,remote_port,local_addr,local_port,protocol,program,profile,desc,enabled)
+        except ValueError as e: return False, str(e)
+        ok,out=_ps(cmd,20)
         if ok: self._invalidate(); self._known_names.add(name)
         return ok,out
     def delete_rule(self,name):
-        ok,out=_ps(f'Remove-NetFirewallRule -DisplayName "{name}" -EA SilentlyContinue',15)
+        try: cmd = _build_remove_firewall_rule_cmd(name)
+        except ValueError as e: return False, str(e)
+        ok,out=_ps(cmd,15)
         if ok: self._invalidate(); self._known_names.discard(name)
         return ok,out
     def enable_rule(self,name,enabled=True):
-        ok,_=_ps(f'Set-NetFirewallRule -DisplayName "{name}" -Enabled {"True" if enabled else "False"}',10)
+        try: cmd = _build_set_firewall_rule_enabled_cmd(name,enabled)
+        except ValueError: return False
+        ok,_=_ps(cmd,10)
         if ok: self._invalidate()
         return ok
     def get_all_rules(self,force_refresh=False):
@@ -1809,9 +1953,61 @@ class RuleScanWorker(QThread):
         except Exception as e:
             log.warning(f"RuleScanWorker error: {e}"); s.ready.emit([])
 
+def _ipc_allowed_sids():
+    if sys.platform != "win32" or win32security is None: return []
+    sids = []
+    for attr in ("WinLocalSystemSid", "WinBuiltinAdministratorsSid"):
+        try: sids.append(win32security.CreateWellKnownSid(getattr(win32security, attr), None))
+        except Exception as e: _service_log(f"IPC SID lookup failed for {attr}: {e}", "WARNING")
+    try:
+        user = os.getlogin() if hasattr(os, "getlogin") else os.environ.get("USERNAME", "")
+        if user:
+            sid, _, _ = win32security.LookupAccountName(None, user)
+            if sid not in sids: sids.append(sid)
+    except Exception as e:
+        _service_log(f"IPC current-user SID lookup failed: {e}", "WARNING")
+    return sids
+
+def _build_ipc_security_descriptor():
+    if sys.platform != "win32" or win32security is None or ntsecuritycon is None: return None
+    sids = _ipc_allowed_sids()
+    if not sids: return None
+    mask = (ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_WRITE |
+        ntsecuritycon.FILE_GENERIC_EXECUTE | ntsecuritycon.DELETE | ntsecuritycon.READ_CONTROL | ntsecuritycon.WRITE_DAC)
+    sd = win32security.SECURITY_DESCRIPTOR()
+    dacl = win32security.ACL()
+    for sid in sids:
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, mask, sid)
+    sd.SetSecurityDescriptorDacl(True, dacl, False)
+    return sd
+
+def _build_ipc_security_attributes():
+    if win32security is None: return None
+    sd = _build_ipc_security_descriptor()
+    if sd is None: return None
+    try:
+        sa = win32security.SECURITY_ATTRIBUTES()
+        sa.SECURITY_DESCRIPTOR = sd
+        return sa
+    except Exception as e:
+        _service_log(f"IPC security attributes unavailable: {e}", "WARNING")
+        return None
+
+def _secure_ipc_token_file(path=IPC_TOKEN_PATH):
+    if sys.platform != "win32" or win32security is None: return False
+    sd = _build_ipc_security_descriptor()
+    if sd is None: return False
+    try:
+        win32security.SetFileSecurity(path, win32security.DACL_SECURITY_INFORMATION, sd)
+        return True
+    except Exception as e:
+        _service_log(f"IPC token ACL update failed: {e}", "WARNING")
+        return False
+
 def _get_ipc_token(create=False):
     try:
         if os.path.exists(IPC_TOKEN_PATH):
+            _secure_ipc_token_file(IPC_TOKEN_PATH)
             with open(IPC_TOKEN_PATH, "r", encoding="utf-8") as f:
                 token = f.read().strip()
                 if token: return token
@@ -1820,6 +2016,7 @@ def _get_ipc_token(create=False):
         token = secrets.token_urlsafe(32)
         with open(IPC_TOKEN_PATH, "w", encoding="utf-8") as f:
             f.write(token)
+        _secure_ipc_token_file(IPC_TOKEN_PATH)
         return token
     except Exception as e:
         _service_log(f"IPC token unavailable: {e}", "ERROR")
@@ -1902,7 +2099,7 @@ class ServiceIPCServer:
                     IPC_PIPE_NAME,
                     win32pipe.PIPE_ACCESS_DUPLEX,
                     win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-                    5, 65536, 65536, 1000, None)
+                    5, 65536, 65536, 1000, _build_ipc_security_attributes())
                 try:
                     win32pipe.ConnectNamedPipe(pipe, None)
                 except pywintypes.error as e:
@@ -3253,6 +3450,7 @@ class ToolsTab(QWidget):
         g2l.addWidget(_make_toolbar_btn("Enable All Profiles","success",self._fw_enable_all))
         g2l.addWidget(_make_toolbar_btn("Reset FW to Default","danger",self._fw_reset))
         g2l.addWidget(_make_toolbar_btn("Export FW Config","dim",self._fw_export))
+        g2l.addWidget(_make_toolbar_btn("Restore FW Config","dim",self._fw_restore))
         g2l.addWidget(_make_toolbar_btn("Enable Audit Logging","dim",self._fw_audit)); g2l.addStretch(); lo.addWidget(g2)
         # Cache tools
         g3=QGroupBox("Cache & Data"); g3l=QHBoxLayout(g3)
@@ -3310,12 +3508,26 @@ class ToolsTab(QWidget):
         for p in ["Domain","Private","Public"]: _ps(f'Set-NetFirewallProfile -Name {p} -Enabled True',10)
         self.slbl.setText("All firewall profiles enabled")
     def _fw_reset(self):
-        _ps("netsh advfirewall reset",15); self.slbl.setText("Firewall reset to defaults")
+        backup = _timestamped_fw_export_path()
+        ok,out = _export_firewall_config(backup)
+        if not ok:
+            self.slbl.setText(f"Reset aborted; firewall export failed: {out[:160] if out else 'unknown error'}")
+            return
+        ok,out = _ps("netsh advfirewall reset",15)
+        if ok:
+            self.slbl.setText(f"Firewall reset to defaults; rollback saved: {backup}")
+        else:
+            self.slbl.setText(f"Reset failed after rollback export: {backup} ({out[:120] if out else 'unknown error'})")
     def _fw_export(self):
         p,_=QFileDialog.getSaveFileName(self,"Export FW Config","fw_export.wfw","WFW (*.wfw)")
         if p:
-            ok,_=_ps(f'netsh advfirewall export "{p}"',30)
+            ok,_=_export_firewall_config(p)
             self.slbl.setText(f"Exported to {p}" if ok else "Export failed")
+    def _fw_restore(self):
+        p,_=QFileDialog.getOpenFileName(self,"Restore FW Config",os.path.join(CONFIG_DIR,"fw_backups"),"WFW (*.wfw)")
+        if p:
+            ok,out=_import_firewall_config(p)
+            self.slbl.setText(f"Restored firewall config from {p}" if ok else f"Restore failed: {out[:160] if out else 'unknown error'}")
     def _fw_audit(self):
         _ps("auditpol /set /subcategory:\"Filtering Platform Connection\" /failure:enable /success:enable",10)
         for p in ("domain","private","public"):

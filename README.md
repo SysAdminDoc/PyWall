@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.14-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.14"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.15-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.15"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white" alt="Windows"/>
   <img src="https://img.shields.io/badge/License-MIT-22C55E" alt="License"/>
-  <img src="https://img.shields.io/badge/Lines-~2.6k-F59E0B" alt="Lines"/>
+  <img src="https://img.shields.io/badge/Lines-~3.9k-F59E0B" alt="Lines"/>
 </p>
 
 ---
@@ -56,6 +56,7 @@ Full management of **all** Windows Firewall rules (not just ones PyWall created)
 - Browse-to-Allow / Browse-to-Block shortcuts
 - Open file location for any rule's program
 - Rule editor with **auto-detected dropdowns** populated from live connections
+- Destructive firewall reset first writes a timestamped `.wfw` rollback export and exposes restore/import from the Tools tab
 
 ### Toast Notifications
 
@@ -226,7 +227,7 @@ Runtime dependencies auto-install on first run if missing when PyWall is not run
 ## Architecture
 
 ```
-PyWall.py  (~2,600 lines, single file)
+PyWall.py  (~3,900 lines, single file)
 ```
 
 **Runtime files** (auto-created in `%APPDATA%/PyWall/`):
@@ -236,9 +237,10 @@ pywall.db       Domain/feed/log SQLite database
 connections.db  Connection history SQLite database
 config.json     Settings, app profiles, blocklists
 service.log     Background service status and auto-block log (%ProgramData%/PyWall on Windows)
-service.token   Local named-pipe IPC token (%ProgramData%/PyWall on Windows)
+service.token   ACL-restricted local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state
 quota_state.json  Persisted app quota counters and enforced-cap records
+fw_backups/    Timestamped `.wfw` rollback exports before firewall reset
 reports/       Daily and weekly CSV/HTML app usage reports
 plugins/        User and example plugin scripts
 ```

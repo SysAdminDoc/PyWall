@@ -67,27 +67,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P0 - Harden PowerShell firewall command construction
-  Why: Rule names, paths, descriptions, ports, and addresses are interpolated into PowerShell strings before running elevated firewall commands.
-  Evidence: `PyWall.py:704-724`; Microsoft `New-NetFirewallRule`.
-  Touches: `PyWall.py` (`_ps`, `FirewallEngine`), `tests/`.
-  Acceptance: Firewall rule creation/deletion/enabling uses escaped/structured arguments, rejects invalid values, and has regression tests for quotes, semicolons, pipes, and paths with spaces.
-  Complexity: M
-
-- [ ] P0 - Lock down service IPC pipe and token storage
-  Why: The service pipe currently relies on a bearer token and default named-pipe security attributes.
-  Evidence: `PyWall.py:1185-1305`; Microsoft named pipe security docs.
-  Touches: `PyWall.py` (`_get_ipc_token`, `ServiceIPCServer`, `_service_ipc_request`), service-mode tests.
-  Acceptance: Token file and pipe ACLs are restricted to LocalSystem/Administrators/the active user, unauthorized clients are denied before command handling, and tests cover token/ACL failure paths where platform APIs are mockable.
-  Complexity: M
-
-- [ ] P0 - Add automatic rollback before destructive firewall actions
-  Why: `Reset FW to Default` runs immediately and can remove user/system firewall policy without an automatic restore point.
-  Evidence: `PyWall.py:2596`; GlassWire/TinyWall lockdown and recovery patterns.
-  Touches: `PyWall.py` (`ToolsTab._fw_reset`, `_fw_export`), config/log paths, tests.
-  Acceptance: Reset first exports a timestamped `.wfw`, logs the path, exposes a restore action/status message, and aborts reset if export fails.
-  Complexity: S
-
 - [ ] P1 - Reconcile advertised components with implemented code
   Why: README claims plugin, scheduling, network profile automation, anomaly, and reputation manager classes that are not present in `PyWall.py`.
   Evidence: `README.md:97`, `README.md:222-227`; `rtk rg "PluginManager|RuleScheduler|NetworkProfileManager|AnomalyDetector|ReputationScorer" PyWall.py`.
