@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.18] - 2026-06-30
+
+- Added: GeoIP enrichment now supports HTTPS lookup by default and optional local MaxMind-compatible `.mmdb` databases via `maxminddb`.
+- Changed: Plaintext GeoIP batch lookups were removed; failures now cache unknown country data without blocking connection polling.
+- Changed: Service snapshots and Tools status now report the active GeoIP provider and lookup/unknown counts.
+
 ## [v4.1.17] - 2026-06-30
 
 - Added: Live and history connection rows now include svchost service names, parent process, UWP/package identity, and signer trust.

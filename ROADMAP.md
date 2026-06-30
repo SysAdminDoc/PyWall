@@ -67,13 +67,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Move GeoIP enrichment to HTTPS/local database providers
-  Why: Batch GeoIP currently sends remote IPs over plaintext HTTP, leaking connection metadata.
-  Evidence: `PyWall.py:991`; Sniffnet MaxMind/IPinfo model.
-  Touches: `GeoIPWorker`, config, cache/database paths, README, tests.
-  Acceptance: Default GeoIP uses HTTPS or a configured local MaxMind MMDB, plaintext providers are disabled by default, and failures degrade to cached/unknown country without GUI freezes.
-  Complexity: M
-
 - [ ] P1 - Expand test coverage around firewall, service, DB, and detectors
   Why: Current tests are static symbol checks and do not exercise the behaviors most likely to break user trust.
   Evidence: `tests/test_service_mode_static.py`; `PyWall.py` firewall/service/database classes.

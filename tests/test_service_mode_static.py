@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.17"])
+        self.assertEqual(versions, ["4.1.18"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -189,6 +189,7 @@ class ServiceModeStaticTests(unittest.TestCase):
         requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("psutil==7.2.2", requirements)
         self.assertIn("PyQt5==5.15.11", requirements)
+        self.assertIn("maxminddb==3.1.1", requirements)
         self.assertIn('pywin32==312; sys_platform == "win32"', requirements)
         self.assertNotIn("requests", requirements)
         self.assertNotIn("pip', 'install", TEXT)
@@ -253,6 +254,21 @@ class ServiceModeStaticTests(unittest.TestCase):
             ns["_signer_label_from_json"]('{"Status":"Valid","Subject":"CN=Microsoft Windows, O=Microsoft Corporation"}'),
             "Valid: Microsoft Windows",
         )
+
+    def test_geoip_uses_https_or_local_database(self):
+        for token in (
+            'GEOIP_HTTPS_ENDPOINT = "https://ipwho.is/{ip}"',
+            "geoip_provider",
+            "geoip_mmdb_path",
+            "geoip_https_endpoint",
+            "maxminddb.open_database",
+            "not endpoint.lower().startswith(\"https://\")",
+            "geoip {geo.get('provider','ipwhois')}",
+            '"geoip": self._geo_w.snapshot()',
+        ):
+            self.assertIn(token, TEXT)
+        self.assertNotIn("http://ip-api.com", TEXT)
+        self.assertNotIn("ip-api.com/batch", TEXT)
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())

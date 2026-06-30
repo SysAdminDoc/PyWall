@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.17 - Windows Firewall & Network Command Center
+PyWall v4.1.18 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -58,7 +58,7 @@ def _missing_dependency_message(missing):
     )
 
 def _check_dependencies():
-    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil')]
+    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil'), ('maxminddb', 'maxminddb')]
     if sys.platform == 'win32':
         deps.append(('pywin32', 'win32serviceutil'))
     missing = []
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.17"
+APP_VERSION = "4.1.18"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -167,6 +167,7 @@ IPC_PIPE_NAME = r"\\.\pipe\PyWallService"
 IPC_TOKEN_PATH = os.path.join(SERVICE_STATE_DIR, "service.token")
 SERVICE_STATE_PATH = os.path.join(SERVICE_STATE_DIR, "service_state.json")
 QUOTA_STATE_PATH = os.path.join(CONFIG_DIR, "quota_state.json")
+GEOIP_HTTPS_ENDPOINT = "https://ipwho.is/{ip}"
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -1745,12 +1746,16 @@ class WhoWorker(QThread):
     def stop(s): s._stop.set()
 
 class GeoIPWorker(QThread):
-    ready=pyqtSignal(str,str,str)
-    def __init__(s): super().__init__(); s._q=Queue(); s._stop=TEvent(); s._batch=[]
+    ready=pyqtSignal(str,str,str); status_changed=pyqtSignal(str)
+    def __init__(s):
+        super().__init__(); s._q=Queue(); s._stop=TEvent(); s._batch=[]; s._lock=Lock()
+        s._provider="ipwhois"; s._mmdb_path=""; s._https_endpoint=GEOIP_HTTPS_ENDPOINT; s._config_mtime=None
+        s._reader=None; s._reader_path=""; s._last_status=""; s._lookups=0; s._unknown=0
     def add(s,ip):
         if ip and ip not in geo_c and not PRIV_RE.match(ip): s._q.put(ip)
     def run(s):
         while not s._stop.is_set():
+            s._reload_config_if_changed()
             try:
                 while not s._q.empty() and len(s._batch)<100:
                     ip=s._q.get_nowait()
@@ -1758,20 +1763,106 @@ class GeoIPWorker(QThread):
             except: pass
             if s._batch:
                 batch=[ip for ip in s._batch[:100] if ip and not PRIV_RE.match(ip)]
-                if batch:
-                    try:
-                        import urllib.request as ur
-                        data=json.dumps([{"query":ip,"fields":"countryCode,country,query"} for ip in batch]).encode()
-                        req=ur.Request("http://ip-api.com/batch",data=data,headers={'Content-Type':'application/json'})
-                        with ur.urlopen(req,timeout=10) as resp:
-                            for item in json.loads(resp.read()):
-                                if item.get("countryCode"):
-                                    geo_c.put(item["query"],(item["countryCode"],item["country"]))
-                                    s.ready.emit(item["query"],item["countryCode"],item["country"])
-                    except: pass
+                for ip in batch:
+                    if ip in geo_c: continue
+                    cc,country=s._lookup(ip)
+                    geo_c.put(ip,(cc,country))
+                    if cc or country != "-": s.ready.emit(ip,cc,country)
                 s._batch.clear()
             s._stop.wait(2)
-    def stop(s): s._stop.set()
+    def _reload_config_if_changed(s):
+        try: mtime=os.path.getmtime(CONFIG_PATH)
+        except FileNotFoundError:
+            if s._config_mtime is not None: s.configure({}, None)
+            return
+        except: return
+        with s._lock:
+            if s._config_mtime == mtime: return
+        try:
+            with open(CONFIG_PATH,"r",encoding="utf-8") as f: cfg=json.load(f)
+            s.configure(cfg if isinstance(cfg,dict) else {}, mtime)
+        except Exception as e:
+            s._emit_status(f"GeoIP config failed: {e}")
+    def configure(s,cfg=None,mtime=None):
+        cfg=cfg if isinstance(cfg,dict) else {}
+        provider=str(cfg.get("geoip_provider","ipwhois") or "ipwhois").strip().lower()
+        if provider not in ("ipwhois","maxmind","disabled"): provider="ipwhois"
+        endpoint=str(cfg.get("geoip_https_endpoint",GEOIP_HTTPS_ENDPOINT) or GEOIP_HTTPS_ENDPOINT).strip()
+        if not endpoint.lower().startswith("https://"): endpoint=GEOIP_HTTPS_ENDPOINT
+        mmdb=str(cfg.get("geoip_mmdb_path","") or "").strip()
+        with s._lock:
+            if mmdb != s._mmdb_path: s._close_reader()
+            s._provider=provider; s._mmdb_path=mmdb; s._https_endpoint=endpoint; s._config_mtime=mtime
+    def _lookup(s,ip):
+        with s._lock:
+            provider=s._provider; endpoint=s._https_endpoint; mmdb=s._mmdb_path
+        if provider=="disabled":
+            s._unknown += 1
+            return "","-"
+        if provider=="maxmind":
+            hit=s._lookup_mmdb(ip,mmdb)
+            if hit: return hit
+            s._unknown += 1
+            return "","-"
+        hit=s._lookup_mmdb(ip,mmdb) if mmdb else None
+        if hit: return hit
+        hit=s._lookup_https(ip,endpoint)
+        if hit: return hit
+        s._unknown += 1
+        return "","-"
+    def _lookup_mmdb(s,ip,path):
+        if not path or not os.path.exists(path): return None
+        try:
+            import maxminddb
+            with s._lock:
+                if s._reader is None or s._reader_path != path:
+                    s._close_reader()
+                    s._reader=maxminddb.open_database(path)
+                    s._reader_path=path
+                reader=s._reader
+            rec=reader.get(ip) or {}
+            country=rec.get("country") or rec.get("registered_country") or {}
+            cc=str(country.get("iso_code") or "").upper()
+            names=country.get("names") if isinstance(country.get("names"),dict) else {}
+            name=str(names.get("en") or country.get("name") or cc or "-")
+            if cc or name!="-":
+                s._lookups += 1
+                return cc,name
+        except Exception as e:
+            s._emit_status(f"GeoIP MMDB unavailable: {e}")
+        return None
+    def _lookup_https(s,ip,endpoint):
+        if not endpoint.lower().startswith("https://"):
+            s._emit_status("GeoIP HTTPS endpoint rejected")
+            return None
+        try:
+            import urllib.request as ur
+            url=endpoint.format(ip=urllib.parse.quote(ip,safe=":."))
+            req=ur.Request(url,headers={'User-Agent':f'{APP_NAME}/{APP_VERSION}'})
+            with ur.urlopen(req,timeout=8) as resp:
+                data=json.loads(resp.read())
+            if not isinstance(data,dict) or data.get("success") is False: return None
+            cc=str(data.get("country_code") or data.get("countryCode") or data.get("country_code2") or "").upper()
+            country=str(data.get("country") or data.get("country_name") or cc or "-")
+            if cc or country!="-":
+                s._lookups += 1
+                return cc,country
+        except Exception as e:
+            s._emit_status(f"GeoIP HTTPS lookup failed: {e}")
+        return None
+    def _emit_status(s,msg):
+        if msg == s._last_status: return
+        s._last_status=msg; s.status_changed.emit(msg)
+    def _close_reader(s):
+        try:
+            if s._reader is not None: s._reader.close()
+        except: pass
+        s._reader=None; s._reader_path=""
+    def snapshot(s):
+        with s._lock:
+            return {"provider":s._provider,"mmdb_path":s._mmdb_path,"https_endpoint":s._https_endpoint,"lookups":s._lookups,"unknown":s._unknown}
+    def stop(s):
+        s._stop.set(); s._close_reader()
 
 class SignerWorker(QThread):
     ready=pyqtSignal(str,str)
@@ -2321,6 +2412,7 @@ class HeadlessMonitor(QObject):
         self._save_service_state(clean_shutdown=False)
         self._dns_w.start(); self._who_w.start(); self._geo_w.start(); self._sign_w.start(); self._tls_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
+        self._geo_w.status_changed.connect(self._on_status)
         self._tls_w.status_changed.connect(self._on_status)
         self._dns_mon.blocked_event.connect(self._on_dns_blocked)
         self._conn_w.ready.connect(self._on_connections)
@@ -2394,6 +2486,7 @@ class HeadlessMonitor(QObject):
             "bandwidth_quotas": self._quota.snapshot(),
             "doh": self._doh.snapshot(),
             "ids": self._ids.snapshot(),
+            "geoip": self._geo_w.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "identity_fields": ["service", "parent_process", "uwp_package", "signer_trust"],
             "signer": self._sign_w.snapshot(),
@@ -2439,6 +2532,7 @@ class HeadlessMonitor(QObject):
                 self._quota.load_config({})
                 self._doh.configure({})
                 self._ids.configure({})
+                self._geo_w.configure({})
                 self._tls_w.configure({})
             return
         except Exception as e:
@@ -2470,10 +2564,11 @@ class HeadlessMonitor(QObject):
         self._quota.load_config(cfg, mtime)
         self._doh.configure(cfg, mtime)
         self._ids.configure(cfg, mtime)
+        self._geo_w.configure(cfg, mtime)
         self._tls_w.configure(cfg, mtime)
         self._config_mtime = mtime
         self._last_config_reload = datetime.datetime.now().isoformat(timespec="seconds")
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -2488,7 +2583,8 @@ class HeadlessMonitor(QObject):
             qstats = self._quota.snapshot()
             dstats = self._doh.snapshot()
             istats = self._ids.snapshot()
-            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {istats.get('hits',0)} IDS hits, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
+            gstats = self._geo_w.snapshot()
+            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {istats.get('hits',0)} IDS hits, geoip {gstats.get('provider')} {gstats.get('lookups',0)}/{gstats.get('unknown',0)}, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
             self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
@@ -3634,12 +3730,14 @@ class ToolsTab(QWidget):
         q=s.get("bandwidth_quotas",{}) if isinstance(s.get("bandwidth_quotas",{}),dict) else {}
         doh=s.get("doh",{}) if isinstance(s.get("doh",{}),dict) else {}
         ids=s.get("ids",{}) if isinstance(s.get("ids",{}),dict) else {}
+        geo=s.get("geoip",{}) if isinstance(s.get("geoip",{}),dict) else {}
         tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
         signer=s.get("signer",{}) if isinstance(s.get("signer",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
              f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | "
-             f"sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | signers {signer.get('cached',0)}/{signer.get('queued',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"geoip {geo.get('provider','ipwhois')} {geo.get('lookups',0)}/{geo.get('unknown',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | "
+             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -3750,6 +3848,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_tray()
+        self._geo_w.status_changed.connect(lambda msg:self._sbar_msg.setText(msg))
         self._tls_w.status_changed.connect(lambda msg:self._sbar_msg.setText(msg))
         self._tls_w.feed_updated.connect(self._feed.refresh)
         self._tls_w.start()

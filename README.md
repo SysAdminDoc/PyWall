@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.17-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.17"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.18-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.18"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -44,7 +44,7 @@ Dependencies are pinned in `requirements.txt` and must be installed before launc
 
 ### Live Connection Monitor
 
-Real-time table of every TCP/UDP connection on the system with process name, PID, svchost service names, parent process, UWP/package identity where visible, signer trust, remote IP, hostname, port, protocol, country, traffic category, and reputation score. Connections are resolved in the background via DNS, WHOIS, GeoIP, and signer workers. Traffic is auto-categorized into groups like Streaming, Gaming, Social Media, Ads/Tracking, and more.
+Real-time table of every TCP/UDP connection on the system with process name, PID, svchost service names, parent process, UWP/package identity where visible, signer trust, remote IP, hostname, port, protocol, country, traffic category, and reputation score. Connections are resolved in the background via DNS, WHOIS, HTTPS/local GeoIP, and signer workers. Traffic is auto-categorized into groups like Streaming, Gaming, Social Media, Ads/Tracking, and more.
 
 ### WFC-Style Rules Panel
 
@@ -160,6 +160,9 @@ Settings live in `%APPDATA%/PyWall/config.json`. Key options:
 | `doh_action` | `warn` | DoH response: `warn`, `block`, or `ignore` |
 | `ids_rules_enabled` | `true` | Enable IDS-lite connection metadata rules |
 | `ids_rules_path` | `%APPDATA%/PyWall/ids_rules.yaral` | YARA-style rule file path |
+| `geoip_provider` | `ipwhois` | GeoIP source: `ipwhois`, `maxmind`, or `disabled`; plaintext providers are not used |
+| `geoip_https_endpoint` | `https://ipwho.is/{ip}` | HTTPS GeoIP endpoint template used by the default provider |
+| `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
 | `auto_block_inbound` | `true` | Block unsolicited inbound connections |
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
@@ -194,6 +197,7 @@ rule suspicious_powershell {
 |---------|---------|
 | `PyQt5` | GUI |
 | `psutil` | Process and connection enumeration |
+| `maxminddb` | Optional local MaxMind-compatible GeoIP database reader |
 | `pywin32` | Windows Service install/start/stop/status control |
 
 If dependencies are missing, startup exits with the exact `pip install -r requirements.txt` command to run.
@@ -267,6 +271,7 @@ PRs welcome. Open an issue first for larger changes.
 
 - [psutil](https://github.com/giampaolo/psutil) -- process and network utilities
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/) -- Qt5 Python bindings
-- [ip-api.com](http://ip-api.com) -- GeoIP lookups
+- [ipwho.is](https://ipwho.is/) -- HTTPS GeoIP lookups
+- [MaxMind DB](https://maxmind.github.io/MaxMind-DB/) -- optional local GeoIP database format
 - [VirusTotal](https://www.virustotal.com) -- file reputation API
 - Inspired by [Windows Firewall Control](https://www.binisoft.org/wfc) by Malwarebytes
