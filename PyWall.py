@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.16 - Windows Firewall & Network Command Center
+PyWall v4.1.17 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.16"
+APP_VERSION = "4.1.17"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -395,6 +395,7 @@ class CI:
     key:str=""; ts:str=""; src:str=""; dir:str=""; proto:str=""
     la:str=""; lp:str=""; ra:str=""; rp:str=""
     host:str="-"; proc:str="?"; pid:int=0; svc:str="-"
+    parent:str="-"; package:str="-"; signer:str="-"
     state:str=""; path:str=""; org:str="-"; cmd:str=""
     stat:str="-"; country:str="-"; cc:str=""
     category:str=""; bytes_sent:int=0; bytes_recv:int=0
@@ -439,9 +440,12 @@ class LRU:
         while len(s._d)>s._c: s._d.popitem(last=False)
     def __contains__(s,k):
         with s._l: return k in s._d
+    def __len__(s):
+        with s._l: return len(s._d)
     def clear(s):
         with s._l: s._d.clear()
-dns_c=LRU(5000); who_c=LRU(5000); geo_c=LRU(5000); prc_c=LRU(1000)
+dns_c=LRU(5000); who_c=LRU(5000); geo_c=LRU(5000); prc_c=LRU(1000); signer_c=LRU(2000)
+_svc_pid_cache={}; _svc_pid_cache_ts=0; _svc_pid_cache_lock=Lock()
 
 # ─── Domain Helpers ──────────────────────────────────────────────────────────
 def looks_like_domain(t):
@@ -545,6 +549,100 @@ def _ps_literal(value, field="value", max_len=1024):
     if any(ch in text for ch in ("\x00", "\r", "\n")):
         raise ValueError(f"{field} contains control characters")
     return "'" + text.replace("'", "''") + "'"
+
+def _service_names_by_pid(force=False):
+    global _svc_pid_cache, _svc_pid_cache_ts
+    if sys.platform != "win32" or not hasattr(psutil, "win_service_iter"):
+        return {}
+    now=time.time()
+    with _svc_pid_cache_lock:
+        if not force and _svc_pid_cache and now-_svc_pid_cache_ts<30:
+            return dict(_svc_pid_cache)
+    out=defaultdict(list)
+    try:
+        for svc in psutil.win_service_iter():
+            try:
+                info=svc.as_dict()
+                pid=int(info.get("pid") or 0)
+                if pid>0:
+                    name=info.get("name") or info.get("display_name") or ""
+                    if name: out[pid].append(str(name))
+            except: continue
+    except: out={}
+    resolved={pid:",".join(sorted(set(names))) for pid,names in out.items()}
+    with _svc_pid_cache_lock:
+        _svc_pid_cache=resolved; _svc_pid_cache_ts=now
+    return dict(resolved)
+
+def _service_names_for_pid(pid):
+    try: pid=int(pid or 0)
+    except: return "-"
+    if pid<=0: return "-"
+    return _service_names_by_pid().get(pid,"-")
+
+def _package_identity_from_path(path):
+    text=str(path or "").strip()
+    if not text or text=="-": return "-"
+    norm=text.replace("/","\\")
+    for marker in ("\\WindowsApps\\","\\AppData\\Local\\Packages\\"):
+        if marker.lower() in norm.lower():
+            tail=norm.lower().split(marker.lower(),1)[1]
+            segment=norm[len(norm)-len(tail):].split("\\",1)[0]
+            if not segment: return "-"
+            parts=segment.split("_")
+            if marker == "\\WindowsApps\\" and len(parts)>=5:
+                return f"{parts[0]}_{parts[-1]}"
+            return segment
+    return "-"
+
+def _parent_identity_from_process(proc):
+    try:
+        parent=proc.parent()
+        if parent: return f"{parent.name()} ({parent.pid})"
+    except: pass
+    return "-"
+
+def _cert_common_name(subject):
+    text=str(subject or "").strip()
+    if not text: return ""
+    for part in text.split(","):
+        item=part.strip()
+        if item.upper().startswith("CN="):
+            return item[3:].strip()[:80]
+    return text[:80]
+
+def _signer_label_from_json(raw):
+    try: data=json.loads(raw) if raw else {}
+    except: data={}
+    if isinstance(data,list): data=data[0] if data else {}
+    if not isinstance(data,dict): return "-"
+    status=str(data.get("Status") or "").strip()
+    subject=str(data.get("Subject") or "").strip()
+    if status.lower()=="valid":
+        cn=_cert_common_name(subject)
+        return f"Valid: {cn}" if cn else "Valid"
+    if status.lower()=="notsigned": return "Unsigned"
+    return status or "-"
+
+def _authenticode_signer_label(path):
+    text=str(path or "").strip()
+    if sys.platform!="win32" or not text or text=="-" or not os.path.exists(text):
+        return "-"
+    try:
+        lit=_ps_literal(text,"path",4096)
+    except ValueError:
+        return "-"
+    cmd=("$sig=Get-AuthenticodeSignature -LiteralPath "+lit+" -EA SilentlyContinue; "
+         "if ($null -eq $sig) { '' } else { "
+         "[PSCustomObject]@{Status=$sig.Status.ToString();Subject=$sig.SignerCertificate.Subject;Issuer=$sig.SignerCertificate.Issuer} | ConvertTo-Json -Compress }")
+    ok,out=_ps(cmd,20)
+    return _signer_label_from_json(out) if ok else "-"
+
+def _cached_signer_label(path):
+    text=str(path or "").strip()
+    if not text or text=="-": return "-"
+    cached=signer_c.get(text)
+    return cached if cached is not None else "..."
 
 def _fw_enum(value, allowed, field, default=None):
     text = str(value if value is not None else default or "").strip()
@@ -834,11 +932,14 @@ class ConnDB:
     def __init__(self):
         self._lock=Lock(); self._conn=sqlite3.connect(CONN_DB_PATH,check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL"); self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
+        self._conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
         cols={r[1] for r in self._conn.execute("PRAGMA table_info(connections)").fetchall()}
-        if "bytes_sent" not in cols: self._conn.execute("ALTER TABLE connections ADD COLUMN bytes_sent INTEGER DEFAULT 0")
-        if "bytes_recv" not in cols: self._conn.execute("ALTER TABLE connections ADD COLUMN bytes_recv INTEGER DEFAULT 0")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS connection_sessions (key TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,samples INTEGER DEFAULT 0,active INTEGER DEFAULT 1)")
+        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0"}.items():
+            if name not in cols: self._conn.execute(f"ALTER TABLE connections ADD COLUMN {name} {ddl}")
+        self._conn.execute("CREATE TABLE IF NOT EXISTS connection_sessions (key TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,samples INTEGER DEFAULT 0,active INTEGER DEFAULT 1)")
+        sess_cols={r[1] for r in self._conn.execute("PRAGMA table_info(connection_sessions)").fetchall()}
+        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","samples":"INTEGER DEFAULT 0","active":"INTEGER DEFAULT 1"}.items():
+            if name not in sess_cols: self._conn.execute(f"ALTER TABLE connection_sessions ADD COLUMN {name} {ddl}")
         for idx in ["CREATE INDEX IF NOT EXISTS idx_ts ON connections(ts)","CREATE INDEX IF NOT EXISTS idx_proc ON connections(proc)","CREATE INDEX IF NOT EXISTS idx_ra ON connections(ra)"]:
             self._conn.execute(idx)
         for idx in ["CREATE INDEX IF NOT EXISTS idx_sess_last ON connection_sessions(last_seen)","CREATE INDEX IF NOT EXISTS idx_sess_proc ON connection_sessions(proc)","CREATE INDEX IF NOT EXISTS idx_sess_ra ON connection_sessions(ra)","CREATE INDEX IF NOT EXISTS idx_sess_active ON connection_sessions(active)"]:
@@ -847,8 +948,8 @@ class ConnDB:
     def insert_batch(self,items):
         with self._lock:
             try:
-                self._conn.executemany("INSERT OR IGNORE INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,stat,country,cc,category,bytes_sent,bytes_recv) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [(c.ts,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv) for c in items])
+                self._conn.executemany("INSERT OR IGNORE INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,stat,country,cc,category,bytes_sent,bytes_recv) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(c.ts,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv) for c in items])
                 self._upsert_sessions(items)
                 self._conn.commit()
             except: pass
@@ -856,32 +957,32 @@ class ConnDB:
         now=datetime.datetime.now().isoformat(timespec="seconds")
         self._conn.execute("UPDATE connection_sessions SET active=0")
         for c in items:
-            self._conn.execute("INSERT OR IGNORE INTO connection_sessions (key,first_seen,last_seen,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,stat,country,cc,category,bytes_sent,bytes_recv,samples,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (c.key,now,now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.state,c.org,c.stat,c.country,c.cc,c.category,0,0,0,1))
-            self._conn.execute("UPDATE connection_sessions SET last_seen=?,src=?,dir=?,proto=?,la=?,lp=?,ra=?,rp=?,host=?,proc=?,pid=?,state=?,org=?,stat=?,country=?,cc=?,category=?,bytes_sent=bytes_sent+?,bytes_recv=bytes_recv+?,samples=samples+1,active=1 WHERE key=?",
-                (now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv,c.key))
+            self._conn.execute("INSERT OR IGNORE INTO connection_sessions (key,first_seen,last_seen,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,stat,country,cc,category,bytes_sent,bytes_recv,samples,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (c.key,now,now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,0,0,0,1))
+            self._conn.execute("UPDATE connection_sessions SET last_seen=?,src=?,dir=?,proto=?,la=?,lp=?,ra=?,rp=?,host=?,proc=?,pid=?,svc=?,parent=?,package=?,signer=?,state=?,org=?,stat=?,country=?,cc=?,category=?,bytes_sent=bytes_sent+?,bytes_recv=bytes_recv+?,samples=samples+1,active=1 WHERE key=?",
+                (now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv,c.key))
     def search(self,query="",limit=500,offset=0):
         with self._lock:
             try:
                 w,p=[],[]
-                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ?)"); p.extend([f"%{query}%"]*4)
+                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ?)"); p.extend([f"%{query}%"]*8)
                 where=" WHERE "+" AND ".join(w) if w else ""
-                sql=f"SELECT ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,country,stat,bytes_sent,bytes_recv FROM connections{where} ORDER BY id DESC LIMIT ? OFFSET ?"
+                sql=f"SELECT ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,country,stat,bytes_sent,bytes_recv FROM connections{where} ORDER BY id DESC LIMIT ? OFFSET ?"
                 p.extend([limit,offset]); return self._conn.execute(sql,p).fetchall()
             except: return []
     def search_sessions(self,query="",limit=500,offset=0):
         with self._lock:
             try:
                 w,p=[],[]
-                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ?)"); p.extend([f"%{query}%"]*4)
+                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ?)"); p.extend([f"%{query}%"]*8)
                 where=" WHERE "+" AND ".join(w) if w else ""
-                sql=f"SELECT first_seen,last_seen,active,proto,la,lp,ra,rp,host,proc,pid,samples,bytes_sent,bytes_recv,stat FROM connection_sessions{where} ORDER BY active DESC,last_seen DESC LIMIT ? OFFSET ?"
+                sql=f"SELECT first_seen,last_seen,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bytes_sent,bytes_recv,stat FROM connection_sessions{where} ORDER BY active DESC,last_seen DESC LIMIT ? OFFSET ?"
                 p.extend([limit,offset]); rows=self._conn.execute(sql,p).fetchall(); out=[]
-                for fs,ls,active,proto,la,lp,ra,rp,host,proc,pid,samples,bs,br,stat in rows:
+                for fs,ls,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bs,br,stat in rows:
                     dur=0
                     try: dur=int((datetime.datetime.fromisoformat(ls)-datetime.datetime.fromisoformat(fs)).total_seconds())
                     except: pass
-                    out.append((fs,ls,dur,active,proto,la,lp,ra,rp,host,proc,pid,samples,bs,br,stat))
+                    out.append((fs,ls,dur,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bs,br,stat))
                 return out
             except: return []
     def get_stats(self):
@@ -1672,6 +1773,32 @@ class GeoIPWorker(QThread):
             s._stop.wait(2)
     def stop(s): s._stop.set()
 
+class SignerWorker(QThread):
+    ready=pyqtSignal(str,str)
+    def __init__(s):
+        super().__init__(); s._q=Queue(); s._stop=TEvent(); s._lock=Lock(); s._queued=set()
+    def add(s,path):
+        text=str(path or "").strip()
+        if sys.platform!="win32" or not text or text=="-" or signer_c.get(text) is not None:
+            return
+        with s._lock:
+            if text in s._queued: return
+            s._queued.add(text)
+        s._q.put(text)
+    def run(s):
+        while not s._stop.is_set():
+            try: path=s._q.get(timeout=1)
+            except Empty: continue
+            with s._lock: s._queued.discard(path)
+            if signer_c.get(path) is not None: continue
+            label=_authenticode_signer_label(path)
+            signer_c.put(path,label)
+            s.ready.emit(path,label)
+    def snapshot(s):
+        with s._lock: queued=len(s._queued)
+        return {"queued":queued,"cached":len(signer_c)}
+    def stop(s): s._stop.set()
+
 class TLSLogWorker(QThread):
     status_changed=pyqtSignal(str); feed_updated=pyqtSignal()
     def __init__(s,db):
@@ -1817,7 +1944,7 @@ class DNSMonitorThread(QThread):
     def stop(self): self.running=False
 
 class ConnWorker(QThread):
-    ready=pyqtSignal(list); need_dns=pyqtSignal(str); need_who=pyqtSignal(str); need_geo=pyqtSignal(str)
+    ready=pyqtSignal(list); need_dns=pyqtSignal(str); need_who=pyqtSignal(str); need_geo=pyqtSignal(str); need_signer=pyqtSignal(str)
     def __init__(s,hosts_db): super().__init__(); s._stop=TEvent(); s._hosts_db=hosts_db; s._io_prev={}
     def run(s):
         while not s._stop.is_set():
@@ -1835,7 +1962,9 @@ class ConnWorker(QThread):
                 ra=c.raddr.ip if c.raddr else ""; rp=str(c.raddr.port) if c.raddr else ""
                 d="Listen" if not ra else "Out"; pid=c.pid or 0
                 if pid>0: seen_pids.add(pid)
-                pn,pp=s._proc(pid); st=c.status if hasattr(c,'status') and c.status else "?"
+                pn,pp,svc,parent,package=s._proc(pid); signer=_cached_signer_label(pp)
+                if signer=="..." and pp and pp!="-": s.need_signer.emit(pp)
+                st=c.status if hasattr(c,'status') and c.status else "?"
                 bs,br=s._proc_io(pid)
                 key=f"L|{proto}|{la}:{lp}|{ra}:{rp}|{pid}"
                 h=dns_c.get(ra,"..."); o=who_c.get(ra,"...")
@@ -1857,7 +1986,8 @@ class ConnWorker(QThread):
                     if who_c.get(ra) is None: s.need_who.emit(ra)
                     if geo_c.get(ra) is None: s.need_geo.emit(ra)
                 ci=CI(key=key,ts=now,src="Live",dir=d,proto=proto,la=la,lp=lp,ra=ra or "*",rp=rp or "*",
-                    host=h or "-",proc=pn,pid=pid,state=st,path=pp,org=o or "-",stat=rs,country=country,cc=cc,category=cat,bytes_sent=bs,bytes_recv=br)
+                    host=h or "-",proc=pn,pid=pid,svc=svc,parent=parent,package=package,signer=signer,
+                    state=st,path=pp,org=o or "-",stat=rs,country=country,cc=cc,category=cat,bytes_sent=bs,bytes_recv=br)
                 if ra and ra!="*" and d!="Listen": threats.record_beacon(ci)
                 out.append(ci)
             except: continue
@@ -1874,7 +2004,7 @@ class ConnWorker(QThread):
             return (max(0,cur[0]-prev[0]),max(0,cur[1]-prev[1]))
         except: return (0,0)
     def _proc(s,pid):
-        if pid<=0: return ("System","-")
+        if pid<=0: return ("System","-","-","-","-")
         c=prc_c.get(pid)
         if c: return c
         try:
@@ -1882,12 +2012,15 @@ class ConnWorker(QThread):
             pp="-"
             try: pp=_nt_to_dos(p.exe())
             except: pass
-            r=(nm,pp); prc_c.put(pid,r); return r
-        except: return ("?","-")
+            svc=_service_names_for_pid(pid)
+            parent=_parent_identity_from_process(p)
+            package=_package_identity_from_path(pp)
+            r=(nm,pp,svc,parent,package); prc_c.put(pid,r); return r
+        except: return ("?","-","-","-","-")
     def stop(s): s._stop.set()
 
 class EvtWorker(QThread):
-    ready=pyqtSignal(list); new_block=pyqtSignal(object)
+    ready=pyqtSignal(list); new_block=pyqtSignal(object); need_signer=pyqtSignal(str)
     def __init__(s): super().__init__(); s._stop=TEvent(); s._last_id=0
     def run(s):
         while not s._stop.is_set():
@@ -1913,6 +2046,11 @@ class EvtWorker(QThread):
             proto={6:"TCP",17:"UDP"}.get(e.get("Proto"),str(e.get("Proto","")))
             sa=str(e.get("SrcAddr","")); sp=str(e.get("SrcPort","")); da=str(e.get("DstAddr","")); dp=str(e.get("DstPort",""))
             pid=int(e.get("PID",0)); app=_nt_to_dos(str(e.get("AppPath",""))); proc=Path(app).name if app and app!="-" else "?"
+            svc=_service_names_for_pid(pid); parent="-"; package=_package_identity_from_path(app); signer=_cached_signer_label(app)
+            if pid>0:
+                try: parent=_parent_identity_from_process(psutil.Process(pid))
+                except: pass
+            if signer=="..." and app and app!="-": s.need_signer.emit(app)
             ts_raw=e.get("TimeCreated",""); ts=""
             if ts_raw:
                 try:
@@ -1924,7 +2062,8 @@ class EvtWorker(QThread):
             key=f"E|{proto}|{sa}:{sp}|{da}:{dp}|{rid}"
             cat=categorize_traffic(dns_c.get(da,"-"),da,dp)
             ci=CI(key=key,ts=ts,src="Event",dir="Out",proto=proto,la=sa,lp=sp,ra=da,rp=dp,host=dns_c.get(da,"-"),
-                proc=proc,pid=pid,state="Blocked",path=app,org=who_c.get(da,"-"),stat="FW:BLOCKED",country="-",cc="",category=cat)
+                proc=proc,pid=pid,svc=svc,parent=parent,package=package,signer=signer,
+                state="Blocked",path=app,org=who_c.get(da,"-"),stat="FW:BLOCKED",country="-",cc="",category=cat)
             evts.append(ci); s.new_block.emit(ci)
         if evts: s.ready.emit(evts)
     def stop(s): s._stop.set()
@@ -2157,6 +2296,7 @@ class HeadlessMonitor(QObject):
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
+        self._sign_w = SignerWorker()
         self._tls_w = TLSLogWorker(self.db)
         self._dns_mon = DNSMonitorThread(self.hm, self.db)
         self._conn_w = ConnWorker(self.db)
@@ -2179,7 +2319,7 @@ class HeadlessMonitor(QObject):
             _service_log(f"Restored prior service state: saved_at={self._restored_state.get('saved_at','?')}, clean_shutdown={self._restored_state.get('clean_shutdown')}")
         self._reload_config_if_changed(force=True)
         self._save_service_state(clean_shutdown=False)
-        self._dns_w.start(); self._who_w.start(); self._geo_w.start(); self._tls_w.start()
+        self._dns_w.start(); self._who_w.start(); self._geo_w.start(); self._sign_w.start(); self._tls_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
         self._tls_w.status_changed.connect(self._on_status)
         self._dns_mon.blocked_event.connect(self._on_dns_blocked)
@@ -2187,6 +2327,8 @@ class HeadlessMonitor(QObject):
         self._conn_w.need_dns.connect(self._dns_w.add)
         self._conn_w.need_who.connect(self._who_w.add)
         self._conn_w.need_geo.connect(self._geo_w.add)
+        self._conn_w.need_signer.connect(self._sign_w.add)
+        self._evt_w.need_signer.connect(self._sign_w.add)
         self._evt_w.new_block.connect(self._on_fw_blocked)
         self._dns_mon.start(); self._conn_w.start(); self._evt_w.start()
         self._ipc.start()
@@ -2197,10 +2339,10 @@ class HeadlessMonitor(QObject):
         _service_log("Headless monitor stopping")
         self._timer.stop()
         self._ipc.stop()
-        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._tls_w):
+        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._sign_w, self._tls_w):
             try: worker.stop()
             except: pass
-        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._tls_w):
+        for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._sign_w, self._tls_w):
             try: worker.wait(5000)
             except: pass
         try: self.conn_db.prune(30)
@@ -2253,6 +2395,8 @@ class HeadlessMonitor(QObject):
             "doh": self._doh.snapshot(),
             "ids": self._ids.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
+            "identity_fields": ["service", "parent_process", "uwp_package", "signer_trust"],
+            "signer": self._sign_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
             "previous_clean_shutdown": self._restored_state.get("clean_shutdown") if self._restored_state else None,
             "previous_saved_at": self._restored_state.get("saved_at") if self._restored_state else "",
@@ -2907,12 +3051,12 @@ class ConnectionsTab(QWidget):
         self.count_lbl=QLabel("0 connections"); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
         splitter=QSplitter(Qt.Horizontal)
-        self.table=QTableWidget(0,16)
-        cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Owner","Country","Category","Sent","Recv","Status"]
+        self.table=QTableWidget(0,20)
+        cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Service","Parent","Package","Signer","Owner","Country","Category","Sent","Recv","Status"]
         self.table.setHorizontalHeaderLabels(cols); self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False); self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setIconSize(QSize(16,16))
-        widths=[58,35,38,100,50,110,50,150,100,42,90,65,75,70,70,90]
+        widths=[58,35,38,100,50,110,50,150,100,42,95,110,130,120,90,65,75,70,70,90]
         for i,w in enumerate(widths): self.table.setColumnWidth(i,w)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self._ctx_menu)
         self.table.currentCellChanged.connect(self._on_select); splitter.addWidget(self.table)
@@ -2943,7 +3087,7 @@ class ConnectionsTab(QWidget):
         ci=self._get_sel_ci()
         if not ci: return
         port_name=PORTS.get(int(ci.rp),ci.rp) if ci.rp and ci.rp.isdigit() else ci.rp
-        self.detail.setPlainText(f"Process:  {ci.proc} (PID {ci.pid})\nPath:     {ci.path}\nRemote:   {ci.ra}:{ci.rp} ({port_name})\n"
+        self.detail.setPlainText(f"Process:  {ci.proc} (PID {ci.pid})\nService:  {ci.svc}\nParent:   {ci.parent}\nPackage:  {ci.package}\nSigner:   {ci.signer}\nPath:     {ci.path}\nRemote:   {ci.ra}:{ci.rp} ({port_name})\n"
             f"Hostname: {ci.host}\nOwner:    {ci.org}\nCountry:  {ci.country} ({ci.cc})\nCategory: {ci.category}\nProtocol: {ci.proto} | State: {ci.state}\nStatus:   {ci.stat}")
         self.detail.append(f"I/O delta: {_fmt_bytes(ci.bytes_sent)} sent / {_fmt_bytes(ci.bytes_recv)} received")
     def _ctx_menu(self,pos):
@@ -3006,14 +3150,15 @@ class ConnectionsTab(QWidget):
             if fd!="All" and ci.dir!=fd: continue
             if fp!="All" and ci.proto!=fp: continue
             if fc!="All" and ci.category!=fc: continue
-            if f and f not in ci.host.lower() and f not in ci.proc.lower() and f not in ci.ra.lower() and f not in (ci.org or "").lower() and f not in ci.country.lower(): continue
+            hay=" ".join([ci.host,ci.proc,ci.ra,ci.org or "",ci.country,ci.svc,ci.parent,ci.package,ci.signer]).lower()
+            if f and f not in hay: continue
             filtered.append(ci)
         self._filtered=filtered
         self.table.setSortingEnabled(False); self.table.setRowCount(len(filtered))
         for i,ci in enumerate(filtered):
             sc={"-":C['text'],"HOSTS:BLOCK":C['peach'],"FW:BLOCKED":C['red'],"POLICY:BLOCK":C['red']}
             color=QColor(sc.get(ci.stat,C['red'] if "BLOCK" in ci.stat else C['text']))
-            vals=[ci.ts,ci.dir,ci.proto,ci.la,ci.lp,ci.ra,ci.rp,ci.host,ci.proc,str(ci.pid),ci.org,f"{ci.country}",ci.category,_fmt_bytes(ci.bytes_sent),_fmt_bytes(ci.bytes_recv),ci.stat]
+            vals=[ci.ts,ci.dir,ci.proto,ci.la,ci.lp,ci.ra,ci.rp,ci.host,ci.proc,str(ci.pid),ci.svc,ci.parent,ci.package,ci.signer,ci.org,f"{ci.country}",ci.category,_fmt_bytes(ci.bytes_sent),_fmt_bytes(ci.bytes_recv),ci.stat]
             for j,v in enumerate(vals):
                 it=QTableWidgetItem(v)
                 if ci.stat!="-": it.setForeground(color)
@@ -3394,8 +3539,8 @@ class HistoryTab(QWidget):
         tb.addWidget(_make_toolbar_btn("Search","primary",self._do_search)); tb.addStretch()
         self.count_lbl=QLabel(""); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
-        self.table=QTableWidget(0,17)
-        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","State","Owner","Country","Status","Sent","Recv"])
+        self.table=QTableWidget(0,21)
+        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True); self.table.setAlternatingRowColors(True)
@@ -3416,20 +3561,20 @@ class HistoryTab(QWidget):
         if self.mode.currentText()=="Sessions":
             self._load_sessions(); return
         rows=self.cdb.search(self.search.text().strip(),500,self._offset)
-        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","State","Owner","Country","Status","Sent","Recv"])
+        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv"])
         self.table.setRowCount(len(rows))
         for i,r in enumerate(rows):
-            for j,v in enumerate(r[:17]):
-                if j in (15,16): v=_fmt_bytes(v)
+            for j,v in enumerate(r[:21]):
+                if j in (19,20): v=_fmt_bytes(v)
                 self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
         self.count_lbl.setText(f"{len(rows)} results"); self.total_lbl.setText(f"Total: {self.cdb.count()}")
     def _load_sessions(self):
         rows=self.cdb.search_sessions(self.search.text().strip(),500,self._offset)
-        self._set_cols(["First","Last","Duration","Active","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Samples","Sent","Recv","Status"])
+        self._set_cols(["First","Last","Duration","Active","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","Samples","Sent","Recv","Status"])
         self.table.setRowCount(len(rows))
         for i,r in enumerate(rows):
-            vals=list(r[:16]); vals[2]=_fmt_duration(vals[2]); vals[3]="ON" if vals[3] else "OFF"; vals[13]=_fmt_bytes(vals[13]); vals[14]=_fmt_bytes(vals[14])
+            vals=list(r[:20]); vals[2]=_fmt_duration(vals[2]); vals[3]="ON" if vals[3] else "OFF"; vals[17]=_fmt_bytes(vals[17]); vals[18]=_fmt_bytes(vals[18])
             for j,v in enumerate(vals): self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
         self.count_lbl.setText(f"{len(rows)} sessions"); self.total_lbl.setText(f"Sessions: {self.cdb.get_stats().get('sessions',0)}")
@@ -3490,9 +3635,11 @@ class ToolsTab(QWidget):
         doh=s.get("doh",{}) if isinstance(s.get("doh",{}),dict) else {}
         ids=s.get("ids",{}) if isinstance(s.get("ids",{}),dict) else {}
         tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
+        signer=s.get("signer",{}) if isinstance(s.get("signer",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
-             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
+             f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | "
+             f"sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | signers {signer.get('cached',0)}/{signer.get('queued',0)} | bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
     def _flush(self):
@@ -3597,6 +3744,7 @@ class MainWindow(QMainWindow):
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
         self._who_w=WhoWorker(); self._who_w.start()
         self._geo_w=GeoIPWorker(); self._geo_w.start()
+        self._sign_w=SignerWorker(); self._sign_w.start()
         self._tls_w=TLSLogWorker(self.db)
         self._conn_w=None; self._evt_w=None
 
@@ -3745,7 +3893,9 @@ class MainWindow(QMainWindow):
         self._conn_w.ready.connect(self._on_conns)
         self._conn_w.need_dns.connect(self._dns_w.add); self._conn_w.need_who.connect(self._who_w.add)
         self._conn_w.need_geo.connect(self._geo_w.add)
+        self._conn_w.need_signer.connect(self._sign_w.add)
         self._evt_w.ready.connect(self._on_evt_batch); self._evt_w.new_block.connect(self._on_fw_block)
+        self._evt_w.need_signer.connect(self._sign_w.add)
         self._conn_w.start(); self._evt_w.start()
         self._conn_monitoring=True; self._update_status("All Monitors Active")
         self._conn_btn.setText("CONNECTIONS: ON")
@@ -3848,7 +3998,7 @@ class MainWindow(QMainWindow):
         if self._monitoring and hasattr(self,'_dns_mon'): self._dns_mon.stop()
         if self._conn_w: self._conn_w.stop()
         if self._evt_w: self._evt_w.stop()
-        self._dns_w.stop(); self._who_w.stop(); self._geo_w.stop(); self._tls_w.stop()
+        self._dns_w.stop(); self._who_w.stop(); self._geo_w.stop(); self._sign_w.stop(); self._tls_w.stop()
         try: self.conn_db.prune(30)
         except: pass
         QApplication.quit()

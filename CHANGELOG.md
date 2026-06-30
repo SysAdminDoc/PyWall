@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.17] - 2026-06-30
+
+- Added: Live and history connection rows now include svchost service names, parent process, UWP/package identity, and signer trust.
+- Added: Authenticode signer lookups run on a background worker so connection polling does not block on signature checks.
+- Changed: Connection history/session storage now migrates and searches app identity fields.
+
 ## [v4.1.16] - 2026-06-30
 
 - Changed: Runtime dependencies are pinned in `requirements.txt` and startup now exits with a clear setup command instead of installing packages from an elevated process.

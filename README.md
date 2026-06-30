@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.16-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.16"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.17-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.17"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -44,7 +44,7 @@ Dependencies are pinned in `requirements.txt` and must be installed before launc
 
 ### Live Connection Monitor
 
-Real-time table of every TCP/UDP connection on the system with process name, remote IP, hostname, port, protocol, country, traffic category, and reputation score. Connections are resolved in the background via DNS, WHOIS, and GeoIP workers. Traffic is auto-categorized into groups like Streaming, Gaming, Social Media, Ads/Tracking, and more.
+Real-time table of every TCP/UDP connection on the system with process name, PID, svchost service names, parent process, UWP/package identity where visible, signer trust, remote IP, hostname, port, protocol, country, traffic category, and reputation score. Connections are resolved in the background via DNS, WHOIS, GeoIP, and signer workers. Traffic is auto-categorized into groups like Streaming, Gaming, Social Media, Ads/Tracking, and more.
 
 ### WFC-Style Rules Panel
 
@@ -86,11 +86,11 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 
 ### Application Control
 
-Live connection rows show process names, paths, PIDs, remote endpoints, traffic category, byte deltas, and context actions to block the selected IP, program, or domain.
+Live connection rows show process names, paths, PIDs, service/package/parent/signer identity, remote endpoints, traffic category, byte deltas, and context actions to block the selected IP, program, or domain.
 
 ### History & Timeline
 
-SQLite-backed connection log with full-text search and filters (process, country, time range). Per-process sent/received byte deltas are captured from `psutil` I/O counters and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
+SQLite-backed connection log with full-text search and filters (process, service, parent, package, signer, country, time range). Per-process sent/received byte deltas and app identity fields are captured from `psutil`/Windows metadata and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
 
 ### Bandwidth Quotas
 

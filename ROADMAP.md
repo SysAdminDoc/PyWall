@@ -67,13 +67,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Add Windows app identity enrichment for svchost, UWP, signer, and parent process
-  Why: Competitors expose service/package/parent identity, while PyWall rows mostly show process/path/PID and can mislead for shared hosts.
-  Evidence: Fort Firewall service-name and parent-process rules; simplewall Windows services/UWP support; `PyWall.py:1043-1096`.
-  Touches: `ConnWorker`, connection table/detail views, history schema, service snapshots, tests.
-  Acceptance: Live/history rows show service name for svchost, UWP package/app identity where available, parent process, and signer trust without blocking polling.
-  Complexity: L
-
 - [ ] P1 - Move GeoIP enrichment to HTTPS/local database providers
   Why: Batch GeoIP currently sends remote IPs over plaintext HTTP, leaking connection metadata.
   Evidence: `PyWall.py:991`; Sniffnet MaxMind/IPinfo model.

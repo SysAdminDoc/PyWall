@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ast
 import ipaddress
+import json
 import os
 import pathlib
 import re
@@ -20,6 +21,7 @@ def load_helpers(*names):
     ns = {
         "datetime": __import__("datetime"),
         "ipaddress": ipaddress,
+        "json": json,
         "os": os,
         "re": re,
         "sys": __import__("sys"),
@@ -53,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.16"])
+        self.assertEqual(versions, ["4.1.17"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -201,6 +203,56 @@ class ServiceModeStaticTests(unittest.TestCase):
         msg = ns["_missing_dependency_message"](["PyQt5", "psutil"])
         self.assertIn("Missing required runtime dependencies: PyQt5, psutil", msg)
         self.assertIn("-m pip install -r requirements.txt", msg)
+
+    def test_connection_identity_enrichment_is_wired(self):
+        for token in (
+            "svc:str",
+            "parent:str",
+            "package:str",
+            "signer:str",
+            "signer_c=LRU",
+            "class SignerWorker",
+            "Get-AuthenticodeSignature",
+            "need_signer=pyqtSignal(str)",
+            "_service_names_for_pid",
+            "_package_identity_from_path",
+            "_parent_identity_from_process",
+            "_cached_signer_label",
+            "identity_fields",
+            "signers {signer.get('cached',0)}/{signer.get('queued',0)}",
+        ):
+            self.assertIn(token, TEXT)
+        self.assertIn("self._conn_w.need_signer.connect(self._sign_w.add)", TEXT)
+        self.assertIn("self._evt_w.need_signer.connect(self._sign_w.add)", TEXT)
+
+    def test_connection_identity_fields_are_persisted_and_displayed(self):
+        for token in (
+            "svc TEXT DEFAULT '-'",
+            "parent TEXT DEFAULT '-'",
+            "package TEXT DEFAULT '-'",
+            "signer TEXT DEFAULT '-'",
+            "svc,parent,package,signer",
+            "OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ?",
+            '"Service","Parent","Package","Signer"',
+            "ci.svc,ci.parent,ci.package,ci.signer",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_identity_helper_outputs_are_stable(self):
+        ns = load_helpers("_package_identity_from_path", "_cert_common_name", "_signer_label_from_json")
+        self.assertEqual(
+            ns["_package_identity_from_path"](r"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator_11.2502.2.0_x64__8wekyb3d8bbwe\Calculator.exe"),
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+        )
+        self.assertEqual(
+            ns["_package_identity_from_path"](r"C:\Users\me\AppData\Local\Packages\Microsoft.WindowsCalculator_8wekyb3d8bbwe\LocalState"),
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+        )
+        self.assertEqual(ns["_cert_common_name"]("O=Example, CN=Example Publisher, C=US"), "Example Publisher")
+        self.assertEqual(
+            ns["_signer_label_from_json"]('{"Status":"Valid","Subject":"CN=Microsoft Windows, O=Microsoft Corporation"}'),
+            "Valid: Microsoft Windows",
+        )
 
     def test_stale_branding_markers_removed(self):
         self.assertNotIn("c" + "odex-branding", TEXT.lower())
