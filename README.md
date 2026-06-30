@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.24-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.24"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.25-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.25"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -103,7 +103,7 @@ On startup, PyWall can collect unknown outbound apps for a timed review window w
 
 ### History & Timeline
 
-SQLite-backed connection log with full-text search and filters (process, service, parent, package, signer, country, time range). Per-process sent/received byte deltas and app identity fields are captured from `psutil`/Windows metadata and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
+SQLite-backed connection log with full-text search and filters (process, service, parent, package, signer, country, evidence source, time range). Per-process sent/received byte deltas and app identity fields are captured from `psutil`/Windows metadata and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, event source/event ID/filter metadata where available, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
 
 ### Bandwidth Quotas
 
@@ -176,6 +176,8 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `doh_action` | `warn` | DoH response: `warn`, `block`, or `ignore` |
 | `ids_rules_enabled` | `true` | Enable IDS-lite connection metadata rules |
 | `ids_rules_path` | `%APPDATA%/PyWall/ids_rules.yaral` | YARA-style rule file path |
+| `event_correlation_enabled` | `true` | Store Windows Filtering Platform event evidence from Security Event ID 5157 |
+| `sysmon_event_correlation_enabled` | `false` | Optionally store Sysmon Event ID 3 network observations when Sysmon is installed |
 | `geoip_provider` | `ipwhois` | GeoIP source: `ipwhois`, `maxmind`, or `disabled`; plaintext providers are not used |
 | `geoip_https_endpoint` | `https://ipwho.is/{ip}` | HTTPS GeoIP endpoint template used by the default provider |
 | `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
@@ -253,7 +255,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 |-----------|------|
 | `FWManager` | PowerShell-backed firewall CRUD with in-memory rule name cache and managed-rule tamper detection |
 | `ConnWorker` | Background thread polling `psutil.net_connections()` |
-| `EvtWorker` | Windows Security Event Log monitor (audit events) |
+| `EvtWorker` | Windows Security Event ID 5157 and optional Sysmon Event ID 3 monitor with event evidence fields |
 | `DNSWorker` / `WhoWorker` / `GeoIPWorker` | Async resolution with LRU caches |
 | `ThreatDetector` | Port scan, brute force, and periodic beacon heuristics |
 | `MITRE_MAPPINGS` | ATT&CK tactic/technique metadata attached to detector events |

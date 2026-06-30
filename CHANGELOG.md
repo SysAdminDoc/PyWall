@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.25] - 2026-06-30
+
+- Added: Connection history now stores event evidence fields (`event_source`, event ID, record ID, rule/layer name, and filter ID) for WFP/Sysmon-backed rows.
+- Added: History view can filter all rows, event-backed rows, or psutil-only rows.
+- Added: `EvtWorker` can persist Security Event ID 5157 evidence by default and optional Sysmon Event ID 3 network observations when configured.
+
 ## [v4.1.24] - 2026-06-30
 
 - Added: Timed learning review for unknown outbound apps that groups candidates by signer, executable path, parent process, and process name without per-connection prompts.

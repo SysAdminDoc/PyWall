@@ -157,7 +157,7 @@ def load_runtime(*names):
         "QThread": FakeQThread,
         "pyqtSignal": lambda *args, **kwargs: FakeSignal(),
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.24",
+        "APP_VERSION": "4.1.25",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),
@@ -332,7 +332,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             db = ns["ConnDB"]()
             cols = {r[1] for r in db._conn.execute("PRAGMA table_info(connections)").fetchall()}
             sess_cols = {r[1] for r in db._conn.execute("PRAGMA table_info(connection_sessions)").fetchall()}
-            for column in ("svc", "parent", "package", "signer", "bytes_sent", "bytes_recv"):
+            for column in ("svc", "parent", "package", "signer", "bytes_sent", "bytes_recv", "event_source", "event_id", "event_record_id", "rule_name", "filter_id"):
                 self.assertIn(column, cols)
                 self.assertIn(column, sess_cols)
 
@@ -368,6 +368,33 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(session[12], "Dnscache")
             self.assertEqual(session[17], 120)
             self.assertEqual(session[18], 240)
+            event_ci = ns["CI"](
+                key="e1",
+                ts="12:00:01",
+                src="Event",
+                dir="Out",
+                proto="TCP",
+                la="127.0.0.1",
+                lp="51000",
+                ra="203.0.113.25",
+                rp="443",
+                host="event.example.net",
+                proc="blocked.exe",
+                pid=84,
+                state="Blocked",
+                stat="FW:BLOCKED",
+                event_source="Security",
+                event_id=5157,
+                event_record_id=12345,
+                rule_name="FWPM_LAYER_ALE_AUTH_CONNECT_V4",
+                filter_id="987",
+            )
+            db.insert_batch([event_ci])
+            event_rows = db.search("", evidence="event")
+            self.assertEqual(event_rows[0][21], "Security")
+            self.assertEqual(event_rows[0][22], 5157)
+            self.assertEqual(event_rows[0][24], "FWPM_LAYER_ALE_AUTH_CONNECT_V4")
+            self.assertTrue(all(not row[21] for row in db.search("", evidence="psutil")))
             db._conn.close()
 
     def test_threat_detector_thresholds_emit_mitre_events(self):

@@ -90,13 +90,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Add optional Sysmon/WFP event correlation for connection evidence
-  Why: psutil polling can miss short-lived connections and lacks event IDs; Windows event 5157 and Sysmon Event ID 3 provide auditable evidence.
-  Evidence: `EvtWorker` 5157 polling in `PyWall.py`; Microsoft event 5157 docs; Sysmon network connection docs; Sniffnet display-filter issue signal.
-  Touches: `EvtWorker`, `ConnDB`, history/security tabs, report/export code, tests with mocked events.
-  Acceptance: When enabled, history rows can include event source, event ID, rule/filter metadata where available, and a filter for psutil-only versus event-backed observations.
-  Complexity: L
-
 - [ ] P2 - Add notification fatigue controls and digesting
   Why: Security tools lose trust when alerts are either too noisy or too silent; peer products expose discreet alerts, unseen-host notifications, and batch decisions.
   Evidence: GlassWire discreet alerts; Sniffnet unseen-host notification issue; OpenSnitch/Portmaster prompt batching issue signal.

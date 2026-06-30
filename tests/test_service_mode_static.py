@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.24"])
+        self.assertEqual(versions, ["4.1.25"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -129,6 +129,10 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("learning_mode_enabled", TEXT)
         self.assertIn("learning_mode_window_minutes", TEXT)
         self.assertIn("allow_program", TEXT)
+        self.assertIn("event_correlation_enabled", TEXT)
+        self.assertIn("sysmon_event_correlation_enabled", TEXT)
+        self.assertIn("event_source", TEXT)
+        self.assertIn("event_record_id", TEXT)
 
     def test_firewall_command_literals_escape_powershell_metacharacters(self):
         ns = load_helpers(
@@ -294,6 +298,25 @@ class ServiceModeStaticTests(unittest.TestCase):
             "fw.allow_program",
             "fw.block_program",
             "review {len(self.learning.groups())}",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_event_correlation_history_is_wired(self):
+        for token in (
+            "event_source",
+            "event_id",
+            "event_record_id",
+            "rule_name",
+            "filter_id",
+            "event_source=CASE WHEN",
+            "sysmon_event_correlation_enabled",
+            "Microsoft-Windows-Sysmon/Operational",
+            "event_source=\"Security\"",
+            "event_source=\"Sysmon\"",
+            "Event Backed",
+            "psutil Only",
+            "self._evt_w.ready.connect(self._on_event_connections)",
+            "self.conn_db.insert_batch(evts)",
         ):
             self.assertIn(token, TEXT)
 

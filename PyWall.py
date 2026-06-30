@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.24 - Windows Firewall & Network Command Center
+PyWall v4.1.25 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.24"
+APP_VERSION = "4.1.25"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -207,6 +207,8 @@ CONFIG_DEFAULTS = {
     "doh_action": "warn",
     "ids_rules_enabled": True,
     "ids_rules_path": IDS_RULES_PATH,
+    "event_correlation_enabled": True,
+    "sysmon_event_correlation_enabled": False,
     "geoip_provider": "ipwhois",
     "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
     "geoip_mmdb_path": "",
@@ -750,6 +752,7 @@ class CI:
     state:str=""; path:str=""; org:str="-"; cmd:str=""
     stat:str="-"; country:str="-"; cc:str=""
     category:str=""; bytes_sent:int=0; bytes_recv:int=0
+    event_source:str=""; event_id:int=0; event_record_id:int=0; rule_name:str=""; filter_id:str=""
 
 @dataclass
 class LearningReviewGroup:
@@ -1470,11 +1473,11 @@ class ConnDB:
         self._conn.execute("PRAGMA journal_mode=WAL"); self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
         cols={r[1] for r in self._conn.execute("PRAGMA table_info(connections)").fetchall()}
-        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0"}.items():
+        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","event_source":"TEXT DEFAULT ''","event_id":"INTEGER DEFAULT 0","event_record_id":"INTEGER DEFAULT 0","rule_name":"TEXT DEFAULT ''","filter_id":"TEXT DEFAULT ''"}.items():
             if name not in cols: self._conn.execute(f"ALTER TABLE connections ADD COLUMN {name} {ddl}")
         self._conn.execute("CREATE TABLE IF NOT EXISTS connection_sessions (key TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,samples INTEGER DEFAULT 0,active INTEGER DEFAULT 1)")
         sess_cols={r[1] for r in self._conn.execute("PRAGMA table_info(connection_sessions)").fetchall()}
-        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","samples":"INTEGER DEFAULT 0","active":"INTEGER DEFAULT 1"}.items():
+        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","samples":"INTEGER DEFAULT 0","active":"INTEGER DEFAULT 1","event_source":"TEXT DEFAULT ''","event_id":"INTEGER DEFAULT 0","event_record_id":"INTEGER DEFAULT 0","rule_name":"TEXT DEFAULT ''","filter_id":"TEXT DEFAULT ''"}.items():
             if name not in sess_cols: self._conn.execute(f"ALTER TABLE connection_sessions ADD COLUMN {name} {ddl}")
         for idx in ["CREATE INDEX IF NOT EXISTS idx_ts ON connections(ts)","CREATE INDEX IF NOT EXISTS idx_proc ON connections(proc)","CREATE INDEX IF NOT EXISTS idx_ra ON connections(ra)"]:
             self._conn.execute(idx)
@@ -1484,8 +1487,8 @@ class ConnDB:
     def insert_batch(self,items):
         with self._lock:
             try:
-                self._conn.executemany("INSERT OR IGNORE INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,stat,country,cc,category,bytes_sent,bytes_recv) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [(c.ts,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv) for c in items])
+                self._conn.executemany("INSERT OR IGNORE INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,stat,country,cc,category,bytes_sent,bytes_recv,event_source,event_id,event_record_id,rule_name,filter_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(c.ts,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv,c.event_source,c.event_id,c.event_record_id,c.rule_name,c.filter_id) for c in items])
                 self._upsert_sessions(items)
                 self._conn.commit()
             except: pass
@@ -1493,32 +1496,36 @@ class ConnDB:
         now=datetime.datetime.now().isoformat(timespec="seconds")
         self._conn.execute("UPDATE connection_sessions SET active=0")
         for c in items:
-            self._conn.execute("INSERT OR IGNORE INTO connection_sessions (key,first_seen,last_seen,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,stat,country,cc,category,bytes_sent,bytes_recv,samples,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (c.key,now,now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,0,0,0,1))
-            self._conn.execute("UPDATE connection_sessions SET last_seen=?,src=?,dir=?,proto=?,la=?,lp=?,ra=?,rp=?,host=?,proc=?,pid=?,svc=?,parent=?,package=?,signer=?,state=?,org=?,stat=?,country=?,cc=?,category=?,bytes_sent=bytes_sent+?,bytes_recv=bytes_recv+?,samples=samples+1,active=1 WHERE key=?",
-                (now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv,c.key))
-    def search(self,query="",limit=500,offset=0):
+            self._conn.execute("INSERT OR IGNORE INTO connection_sessions (key,first_seen,last_seen,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,stat,country,cc,category,bytes_sent,bytes_recv,samples,active,event_source,event_id,event_record_id,rule_name,filter_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (c.key,now,now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,0,0,0,1,c.event_source,c.event_id,c.event_record_id,c.rule_name,c.filter_id))
+            self._conn.execute("UPDATE connection_sessions SET last_seen=?,src=?,dir=?,proto=?,la=?,lp=?,ra=?,rp=?,host=?,proc=?,pid=?,svc=?,parent=?,package=?,signer=?,state=?,org=?,stat=?,country=?,cc=?,category=?,bytes_sent=bytes_sent+?,bytes_recv=bytes_recv+?,samples=samples+1,active=1,event_source=CASE WHEN ?!='' THEN ? ELSE event_source END,event_id=CASE WHEN ?>0 THEN ? ELSE event_id END,event_record_id=CASE WHEN ?>0 THEN ? ELSE event_record_id END,rule_name=CASE WHEN ?!='' THEN ? ELSE rule_name END,filter_id=CASE WHEN ?!='' THEN ? ELSE filter_id END WHERE key=?",
+                (now,c.src,c.dir,c.proto,c.la,c.lp,c.ra,c.rp,c.host,c.proc,c.pid,c.svc,c.parent,c.package,c.signer,c.state,c.org,c.stat,c.country,c.cc,c.category,c.bytes_sent,c.bytes_recv,c.event_source,c.event_source,c.event_id,c.event_id,c.event_record_id,c.event_record_id,c.rule_name,c.rule_name,c.filter_id,c.filter_id,c.key))
+    def search(self,query="",limit=500,offset=0,evidence="all"):
         with self._lock:
             try:
                 w,p=[],[]
-                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ?)"); p.extend([f"%{query}%"]*8)
+                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ? OR event_source LIKE ? OR rule_name LIKE ? OR filter_id LIKE ?)"); p.extend([f"%{query}%"]*11)
+                if evidence=="event": w.append("event_source!=''")
+                elif evidence=="psutil": w.append("(event_source IS NULL OR event_source='')")
                 where=" WHERE "+" AND ".join(w) if w else ""
-                sql=f"SELECT ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,country,stat,bytes_sent,bytes_recv FROM connections{where} ORDER BY id DESC LIMIT ? OFFSET ?"
+                sql=f"SELECT ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,state,org,country,stat,bytes_sent,bytes_recv,event_source,event_id,event_record_id,rule_name,filter_id FROM connections{where} ORDER BY id DESC LIMIT ? OFFSET ?"
                 p.extend([limit,offset]); return self._conn.execute(sql,p).fetchall()
             except: return []
-    def search_sessions(self,query="",limit=500,offset=0):
+    def search_sessions(self,query="",limit=500,offset=0,evidence="all"):
         with self._lock:
             try:
                 w,p=[],[]
-                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ?)"); p.extend([f"%{query}%"]*8)
+                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ? OR event_source LIKE ? OR rule_name LIKE ? OR filter_id LIKE ?)"); p.extend([f"%{query}%"]*11)
+                if evidence=="event": w.append("event_source!=''")
+                elif evidence=="psutil": w.append("(event_source IS NULL OR event_source='')")
                 where=" WHERE "+" AND ".join(w) if w else ""
-                sql=f"SELECT first_seen,last_seen,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bytes_sent,bytes_recv,stat FROM connection_sessions{where} ORDER BY active DESC,last_seen DESC LIMIT ? OFFSET ?"
+                sql=f"SELECT first_seen,last_seen,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bytes_sent,bytes_recv,stat,event_source,event_id,rule_name,filter_id FROM connection_sessions{where} ORDER BY active DESC,last_seen DESC LIMIT ? OFFSET ?"
                 p.extend([limit,offset]); rows=self._conn.execute(sql,p).fetchall(); out=[]
-                for fs,ls,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bs,br,stat in rows:
+                for fs,ls,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bs,br,stat,event_source,event_id,rule_name,filter_id in rows:
                     dur=0
                     try: dur=int((datetime.datetime.fromisoformat(ls)-datetime.datetime.fromisoformat(fs)).total_seconds())
                     except: pass
-                    out.append((fs,ls,dur,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bs,br,stat))
+                    out.append((fs,ls,dur,active,proto,la,lp,ra,rp,host,proc,pid,svc,parent,package,signer,samples,bs,br,stat,event_source,event_id,rule_name,filter_id))
                 return out
             except: return []
     def get_stats(self):
@@ -2715,17 +2722,32 @@ class ConnWorker(QThread):
 
 class EvtWorker(QThread):
     ready=pyqtSignal(list); new_block=pyqtSignal(object); need_signer=pyqtSignal(str)
-    def __init__(s): super().__init__(); s._stop=TEvent(); s._last_id=0
+    def __init__(s):
+        super().__init__(); s._stop=TEvent(); s._last_id=0; s._last_sysmon_id=0
+        s._config_mtime=None; s._enabled=True; s._sysmon_enabled=False
     def run(s):
         while not s._stop.is_set():
-            try: s._poll()
+            try:
+                s._reload_config_if_changed()
+                if s._enabled: s._poll()
             except: pass
             s._stop.wait(3)
+    def _reload_config_if_changed(s):
+        result=load_runtime_config()
+        if s._config_mtime == result.mtime: return
+        cfg=result.data
+        s._enabled=bool(cfg.get("event_correlation_enabled",True))
+        s._sysmon_enabled=bool(cfg.get("sysmon_event_correlation_enabled",False))
+        s._config_mtime=result.mtime
     def _poll(s):
+        s._poll_wfp()
+        if s._sysmon_enabled: s._poll_sysmon()
+    def _poll_wfp(s):
         cmd=("Get-WinEvent -FilterHashtable @{LogName='Security';Id=5157} -MaxEvents 50 -EA SilentlyContinue | "
              "Select-Object RecordId, TimeCreated, @{N='SrcAddr';E={$_.Properties[3].Value}}, @{N='SrcPort';E={$_.Properties[4].Value}}, "
              "@{N='DstAddr';E={$_.Properties[5].Value}}, @{N='DstPort';E={$_.Properties[6].Value}}, @{N='Proto';E={$_.Properties[7].Value}}, "
-             "@{N='PID';E={$_.Properties[0].Value}}, @{N='AppPath';E={$_.Properties[1].Value}} | ConvertTo-Json -Compress")
+             "@{N='PID';E={$_.Properties[0].Value}}, @{N='AppPath';E={$_.Properties[1].Value}}, @{N='FilterId';E={$_.Properties[8].Value}}, "
+             "@{N='LayerName';E={$_.Properties[9].Value}} | ConvertTo-Json -Compress")
         ok,out=_ps(cmd,20)
         if not ok or not out: return
         try:
@@ -2734,7 +2756,8 @@ class EvtWorker(QThread):
         except: return
         evts=[]
         for e in data:
-            rid=e.get("RecordId",0)
+            try: rid=int(e.get("RecordId",0) or 0)
+            except: rid=0
             if rid<=s._last_id: continue
             s._last_id=max(s._last_id,rid)
             proto={6:"TCP",17:"UDP"}.get(e.get("Proto"),str(e.get("Proto","")))
@@ -2755,10 +2778,47 @@ class EvtWorker(QThread):
                 except: ts=str(ts_raw)[-8:]
             key=f"E|{proto}|{sa}:{sp}|{da}:{dp}|{rid}"
             cat=categorize_traffic(dns_c.get(da,"-"),da,dp)
+            filter_id=str(e.get("FilterId","") or "")
+            rule_name=str(e.get("LayerName","") or "")
             ci=CI(key=key,ts=ts,src="Event",dir="Out",proto=proto,la=sa,lp=sp,ra=da,rp=dp,host=dns_c.get(da,"-"),
                 proc=proc,pid=pid,svc=svc,parent=parent,package=package,signer=signer,
-                state="Blocked",path=app,org=who_c.get(da,"-"),stat="FW:BLOCKED",country="-",cc="",category=cat)
+                state="Blocked",path=app,org=who_c.get(da,"-"),stat="FW:BLOCKED",country="-",cc="",category=cat,
+                event_source="Security",event_id=5157,event_record_id=int(rid or 0),rule_name=rule_name,filter_id=filter_id)
             evts.append(ci); s.new_block.emit(ci)
+        if evts: s.ready.emit(evts)
+    def _poll_sysmon(s):
+        cmd=("$events=Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=3} -MaxEvents 50 -EA SilentlyContinue; "
+             "$events | ForEach-Object { $x=[xml]$_.ToXml(); $d=@{}; foreach($n in $x.Event.EventData.Data){$d[$n.Name]=$n.'#text'}; "
+             "[PSCustomObject]@{RecordId=$_.RecordId;TimeCreated=$_.TimeCreated;Image=$d.Image;ProcessId=$d.ProcessId;SourceIp=$d.SourceIp;SourcePort=$d.SourcePort;"
+             "DestinationIp=$d.DestinationIp;DestinationPort=$d.DestinationPort;Protocol=$d.Protocol;Initiated=$d.Initiated;RuleName=$d.RuleName} } | ConvertTo-Json -Compress")
+        ok,out=_ps(cmd,20)
+        if not ok or not out: return
+        try:
+            data=json.loads(out)
+            if isinstance(data,dict): data=[data]
+        except: return
+        evts=[]
+        for e in data:
+            try: rid=int(e.get("RecordId",0) or 0)
+            except: rid=0
+            if rid<=s._last_sysmon_id: continue
+            s._last_sysmon_id=max(s._last_sysmon_id,rid)
+            app=_nt_to_dos(str(e.get("Image","") or "")); pid=int(e.get("ProcessId",0) or 0); proc=Path(app).name if app else "?"
+            proto=str(e.get("Protocol","") or "").upper(); sa=str(e.get("SourceIp","") or ""); sp=str(e.get("SourcePort","") or "")
+            da=str(e.get("DestinationIp","") or ""); dp=str(e.get("DestinationPort","") or "")
+            initiated=str(e.get("Initiated","") or "").lower() != "false"; direction="Out" if initiated else "In"
+            svc=_service_names_for_pid(pid); parent="-"; package=_package_identity_from_path(app); signer=_cached_signer_label(app)
+            if pid>0:
+                try: parent=_parent_identity_from_process(psutil.Process(pid))
+                except: pass
+            if signer=="..." and app: s.need_signer.emit(app)
+            ts_raw=e.get("TimeCreated",""); ts=str(ts_raw)[-8:] if ts_raw else datetime.datetime.now().strftime("%H:%M:%S")
+            key=f"S|{proto}|{sa}:{sp}|{da}:{dp}|{rid}"
+            cat=categorize_traffic(dns_c.get(da,"-"),da,dp)
+            evts.append(CI(key=key,ts=ts,src="Sysmon",dir=direction,proto=proto,la=sa,lp=sp,ra=da,rp=dp,host=dns_c.get(da,"-"),
+                proc=proc,pid=pid,svc=svc,parent=parent,package=package,signer=signer,state="Observed",path=app,org=who_c.get(da,"-"),
+                stat="EVENT:SYSMON",country="-",cc="",category=cat,event_source="Sysmon",event_id=3,event_record_id=int(rid or 0),
+                rule_name=str(e.get("RuleName","") or ""),filter_id=""))
         if evts: s.ready.emit(evts)
     def stop(s): s._stop.set()
 
@@ -3048,6 +3108,7 @@ class HeadlessMonitor(QObject):
         self._conn_w.need_signer.connect(self._sign_w.add)
         self._evt_w.need_signer.connect(self._sign_w.add)
         self._evt_w.new_block.connect(self._on_fw_blocked)
+        self._evt_w.ready.connect(self._on_event_connections)
         self._dns_mon.start(); self._conn_w.start(); self._evt_w.start()
         self._ipc.start()
         self._timer.timeout.connect(self._tick)
@@ -3189,6 +3250,8 @@ class HeadlessMonitor(QObject):
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
+    def _on_event_connections(self, evts):
+        if evts: self.conn_db.insert_batch(evts)
 
     def _tick(self):
         self._reload_config_if_changed()
@@ -4345,11 +4408,12 @@ class HistoryTab(QWidget):
         self.search=QLineEdit(); self.search.setPlaceholderText("Search by IP, host, process..."); self.search.setFixedWidth(250)
         self.search.returnPressed.connect(self._do_search); tb.addWidget(self.search)
         self.mode=QComboBox(); self.mode.addItems(["Events","Sessions"]); self.mode.currentTextChanged.connect(lambda _:self._do_search()); tb.addWidget(self.mode)
+        self.evidence=QComboBox(); self.evidence.addItems(["All Evidence","Event Backed","psutil Only"]); self.evidence.currentTextChanged.connect(lambda _:self._do_search()); tb.addWidget(self.evidence)
         tb.addWidget(_make_toolbar_btn("Search","primary",self._do_search)); tb.addStretch()
         self.count_lbl=QLabel(""); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
         self.table=QTableWidget(0,21)
-        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv"])
+        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv","Evidence","Event","Rule","Filter"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True); self.table.setAlternatingRowColors(True)
@@ -4366,24 +4430,29 @@ class HistoryTab(QWidget):
         self._offset=max(0,self._offset+d*500); self._load()
     def _set_cols(self,cols):
         self.table.setColumnCount(len(cols)); self.table.setHorizontalHeaderLabels(cols)
+    def _evidence_filter(self):
+        text=self.evidence.currentText()
+        if text.startswith("Event"): return "event"
+        if text.startswith("psutil"): return "psutil"
+        return "all"
     def _load(self):
         if self.mode.currentText()=="Sessions":
             self._load_sessions(); return
-        rows=self.cdb.search(self.search.text().strip(),500,self._offset)
-        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv"])
+        rows=self.cdb.search(self.search.text().strip(),500,self._offset,self._evidence_filter())
+        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv","Evidence","Event","Record","Rule","Filter"])
         self.table.setRowCount(len(rows))
         for i,r in enumerate(rows):
-            for j,v in enumerate(r[:21]):
+            for j,v in enumerate(r[:26]):
                 if j in (19,20): v=_fmt_bytes(v)
                 self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
         self.count_lbl.setText(f"{len(rows)} results"); self.total_lbl.setText(f"Total: {self.cdb.count()}")
     def _load_sessions(self):
-        rows=self.cdb.search_sessions(self.search.text().strip(),500,self._offset)
-        self._set_cols(["First","Last","Duration","Active","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","Samples","Sent","Recv","Status"])
+        rows=self.cdb.search_sessions(self.search.text().strip(),500,self._offset,self._evidence_filter())
+        self._set_cols(["First","Last","Duration","Active","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","Samples","Sent","Recv","Status","Evidence","Event","Rule","Filter"])
         self.table.setRowCount(len(rows))
         for i,r in enumerate(rows):
-            vals=list(r[:20]); vals[2]=_fmt_duration(vals[2]); vals[3]="ON" if vals[3] else "OFF"; vals[17]=_fmt_bytes(vals[17]); vals[18]=_fmt_bytes(vals[18])
+            vals=list(r[:24]); vals[2]=_fmt_duration(vals[2]); vals[3]="ON" if vals[3] else "OFF"; vals[17]=_fmt_bytes(vals[17]); vals[18]=_fmt_bytes(vals[18])
             for j,v in enumerate(vals): self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
         self.count_lbl.setText(f"{len(rows)} sessions"); self.total_lbl.setText(f"Sessions: {self.cdb.get_stats().get('sessions',0)}")
@@ -4769,8 +4838,11 @@ class MainWindow(QMainWindow):
             self._on_ids_hit(hit)
 
     def _on_evt_batch(self,evts):
-        # Merge event worker data into connections view
-        pass
+        if evts:
+            self.conn_db.insert_batch(evts)
+            try:
+                if self._tabs.currentWidget() is self._history: self._history._load()
+            except: pass
 
     def _on_quota_event(self,ev):
         self._update_status(f"Quota blocked {ev.app}" if ev.blocked else f"Quota hit {ev.app}")
