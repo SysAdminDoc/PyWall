@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.23] - 2026-06-30
+
+- Added: Managed firewall rule tamper detection for external create/delete/enable/disable/field changes to `PW_` and legacy `HG_` rules.
+- Added: Tamper events are logged to `firewall_tamper.log` with before/after snapshots and surfaced in the firewall tab and service status.
+- Added: Firewall tab actions can restore the latest drift event or accept the current managed-rule state as the new baseline.
+
 ## [v4.1.22] - 2026-06-30
 
 - Added: Passive plugin manifest registry for `%APPDATA%/PyWall/plugins` with declared hooks, network/file permissions, trust-state reporting, and default-deny execution gates.

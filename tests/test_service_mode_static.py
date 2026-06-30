@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.22"])
+        self.assertEqual(versions, ["4.1.23"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -121,6 +121,10 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("plugin_disabled_ids", TEXT)
         self.assertIn("can_execute", TEXT)
         self.assertIn("plugin_events.log", TEXT)
+        self.assertIn("FirewallTamperEvent", TEXT)
+        self.assertIn("firewall_tamper.log", TEXT)
+        self.assertIn("restore_last_tamper", TEXT)
+        self.assertIn("accept_current_rules", TEXT)
 
     def test_firewall_command_literals_escape_powershell_metacharacters(self):
         ns = load_helpers(
@@ -253,6 +257,24 @@ class ServiceModeStaticTests(unittest.TestCase):
             "\"plugins\": self._plugins.scan",
             "Scan Plugins",
             "Plugin manifests scanned; no plugin code executed",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_firewall_tamper_detection_is_wired(self):
+        for token in (
+            "class FirewallTamperEvent",
+            "FW_TAMPER_LOG_PATH",
+            "_managed_baseline",
+            "_local_changes",
+            "_detect_tamper",
+            "_record_tamper",
+            "Managed rule externally deleted",
+            "Managed rule externally created",
+            "\"firewall_tamper\": fw.tamper_summary()",
+            "Restore Drift",
+            "Accept Drift",
+            "WARNING: {tamper.get('pending')}",
+            "fw.get_all_rules(force_refresh=True)",
         ):
             self.assertIn(token, TEXT)
 

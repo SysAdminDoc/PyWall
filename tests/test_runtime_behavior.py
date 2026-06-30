@@ -29,6 +29,7 @@ TREE = ast.parse(SRC.read_text(encoding="utf-8"))
 BASE_NAMES = {
     "CI",
     "FWRule",
+    "FirewallTamperEvent",
     "ThreatEvent",
     "IDSRule",
     "MITRE_MAPPINGS",
@@ -45,6 +46,9 @@ BASE_NAMES = {
     "_build_remove_firewall_rule_cmd",
     "_build_set_firewall_rule_enabled_cmd",
     "_build_rule_exists_cmd",
+    "_firewall_tamper_log",
+    "_fw_rule_diff",
+    "_fw_rule_snapshot",
     "CONFIG_SCHEMA_VERSION",
     "GEOIP_HTTPS_ENDPOINT",
     "PLUGIN_ALLOWED_HOOKS",
@@ -52,6 +56,7 @@ BASE_NAMES = {
     "PLUGIN_ID_RE",
     "PLUGIN_LOG_PATH",
     "PLUGIN_MANIFEST_NAMES",
+    "FW_TAMPER_LOG_PATH",
     "DOMAIN_RE",
     "IPV4_RE",
     "WILDCARD_RE",
@@ -150,7 +155,7 @@ def load_runtime(*names):
         "QThread": FakeQThread,
         "pyqtSignal": lambda *args, **kwargs: FakeSignal(),
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.22",
+        "APP_VERSION": "4.1.23",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),
@@ -159,6 +164,7 @@ def load_runtime(*names):
         "FEED_CACHE_DIR": os.path.join(tempfile.gettempdir(), "pywall-feed-cache"),
         "PLUGINS_DIR": os.path.join(tempfile.gettempdir(), "pywall-plugins"),
         "PLUGIN_LOG_PATH": os.path.join(tempfile.gettempdir(), "plugin_events.log"),
+        "FW_TAMPER_LOG_PATH": os.path.join(tempfile.gettempdir(), "firewall_tamper.log"),
         "FW_PFX": "PW_",
         "LEGACY_FW_PFX": ("HG_",),
         "FW_RULE_PREFIXES": ("PW_", "HG_"),
@@ -225,6 +231,51 @@ class RuntimeBehaviorTests(unittest.TestCase):
         ok, _ = engine.delete_rule("PW_Runtime")
         self.assertTrue(ok)
         self.assertNotIn("PW_Runtime", engine._known_names)
+
+    def test_firewall_engine_detects_external_tamper_and_suppresses_local_changes(self):
+        ns = load_runtime("FirewallEngine")
+        with tempfile.TemporaryDirectory() as td:
+            ns["FW_TAMPER_LOG_PATH"] = os.path.join(td, "firewall_tamper.log")
+            engine = ns["FirewallEngine"]()
+            original = ns["FWRule"](
+                name="PW_TestRule",
+                direction="Outbound",
+                action="Block",
+                enabled=True,
+                remote_addr="203.0.113.8",
+                remote_port="443",
+                protocol="TCP",
+                source="pywall",
+            )
+            engine._detect_tamper([original])
+            self.assertEqual(engine.tamper_summary()["pending"], 0)
+
+            disabled = ns["FWRule"](
+                name="PW_TestRule",
+                direction="Outbound",
+                action="Block",
+                enabled=False,
+                remote_addr="203.0.113.8",
+                remote_port="443",
+                protocol="TCP",
+                source="pywall",
+            )
+            events = engine._detect_tamper([disabled])
+            self.assertEqual(events[-1].change, "disabled")
+            self.assertEqual(engine.tamper_summary()["pending"], 1)
+            self.assertIn("enabled: True -> False", events[-1].details)
+            self.assertIn("PW_TestRule", pathlib.Path(ns["FW_TAMPER_LOG_PATH"]).read_text(encoding="utf-8"))
+
+            engine._fetch_all = lambda: [disabled]
+            ok, msg = engine.accept_current_rules()
+            self.assertTrue(ok)
+            self.assertIn("Accepted", msg)
+            self.assertEqual(engine.tamper_summary()["pending"], 0)
+
+            engine._detect_tamper([disabled])
+            engine._mark_local_change("PW_TestRule")
+            engine._detect_tamper([original])
+            self.assertEqual(engine.tamper_summary()["pending"], 0)
 
     def test_conn_db_migrates_identity_columns_and_searches_sessions(self):
         ns = load_runtime("ConnDB")

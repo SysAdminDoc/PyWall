@@ -90,13 +90,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Detect and surface external firewall rule tampering
-  Why: PyWall caches rule names and manages `PW_`/legacy rules, but Windows Firewall can be changed by other tools, installers, or policy.
-  Evidence: `FirewallEngine._known_names` and rule refresh paths in `PyWall.py`; TinyWall tamper protection; Windows Firewall Control secure-rules model.
-  Touches: `FirewallEngine`, firewall tab, service snapshots, diagnostics/log DB, tests.
-  Acceptance: External create/delete/disable changes to managed rules are detected on refresh/service tick, logged with before/after state, and surfaced as a warning with restore/reconcile actions.
-  Complexity: M
-
 - [ ] P1 - Add first-run learning review without noisy per-connection prompts
   Why: Competitors prove learning mode is valuable, but PyWall's no-confirmation philosophy needs a batch review model instead of modal prompts.
   Evidence: TinyWall learning mode; OpenSnitch interactive prompts; GlassWire ask-to-connect; existing roadmap notes for multi-select toasts.

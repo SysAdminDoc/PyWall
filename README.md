@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.22-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.22"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.23-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.23"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -58,6 +58,7 @@ Full management of **all** Windows Firewall rules (not just ones PyWall created)
 - Open file location for any rule's program
 - Rule editor with **auto-detected dropdowns** populated from live connections
 - Destructive firewall reset first writes a timestamped `.wfw` rollback export and exposes restore/import from the Tools tab
+- Managed `PW_` and legacy `HG_` rules are checked for external create/delete/enable/disable drift on refresh, logged with before/after snapshots, and can be restored or accepted from the firewall tab
 
 ### Toast Notifications
 
@@ -231,6 +232,7 @@ config.json     Settings, app profiles, blocklists
 feed_cache/    Last-good raw blocklist downloads with feed provenance in `pywall.db`
 plugins/       Passive plugin manifests; plugin code is default-denied until explicitly enabled
 plugin_events.log  Manifest validation and plugin guardrail diagnostics
+firewall_tamper.log  Managed-rule drift events with before/after snapshots
 service.log     Background service status and auto-block log (%ProgramData%/PyWall on Windows)
 service.token   ACL-restricted local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state
@@ -243,7 +245,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 
 | Component | Role |
 |-----------|------|
-| `FWManager` | PowerShell-backed firewall CRUD with in-memory rule name cache |
+| `FWManager` | PowerShell-backed firewall CRUD with in-memory rule name cache and managed-rule tamper detection |
 | `ConnWorker` | Background thread polling `psutil.net_connections()` |
 | `EvtWorker` | Windows Security Event Log monitor (audit events) |
 | `DNSWorker` / `WhoWorker` / `GeoIPWorker` | Async resolution with LRU caches |

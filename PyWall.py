@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.22 - Windows Firewall & Network Command Center
+PyWall v4.1.23 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.22"
+APP_VERSION = "4.1.23"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -158,6 +158,7 @@ IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
 FEED_CACHE_DIR = os.path.join(CONFIG_DIR, "feed_cache")
 PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
 PLUGIN_LOG_PATH = os.path.join(CONFIG_DIR, "plugin_events.log")
+FW_TAMPER_LOG_PATH = os.path.join(CONFIG_DIR, "firewall_tamper.log")
 PLUGIN_MANIFEST_NAMES = ("pywall-plugin.json", "plugin.json")
 PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,79}$")
 PLUGIN_ALLOWED_HOOKS = {
@@ -756,6 +757,22 @@ class FWRule:
     local_port:str="Any"; protocol:str="Any"; program:str=""; source:str="system"
 
 @dataclass
+class FirewallTamperEvent:
+    ts:str=""; change:str=""; rule_name:str=""
+    before:dict=field(default_factory=dict); after:dict=field(default_factory=dict)
+    details:str=""
+
+    def as_dict(self):
+        return {
+            "ts": self.ts,
+            "change": self.change,
+            "rule_name": self.rule_name,
+            "before": dict(self.before or {}),
+            "after": dict(self.after or {}),
+            "details": self.details,
+        }
+
+@dataclass
 class ThreatEvent:
     ts:str=""; type:str=""; severity:str="medium"; source_ip:str=""
     details:str=""; action_taken:str=""; blocked:bool=False
@@ -1142,6 +1159,39 @@ def _timestamped_fw_export_path(prefix="fw_before_reset"):
 def _is_managed_rule_name(name):
     return any(str(name or "").startswith(pfx) for pfx in FW_RULE_PREFIXES)
 
+def _fw_rule_snapshot(rule):
+    return {
+        "name": str(rule.name or ""),
+        "desc": str(rule.desc or ""),
+        "direction": str(rule.direction or "Outbound"),
+        "action": str(rule.action or "Block"),
+        "enabled": bool(rule.enabled),
+        "profile": str(rule.profile or "Any"),
+        "group": str(rule.group or ""),
+        "remote_addr": str(rule.remote_addr or ""),
+        "local_addr": str(rule.local_addr or ""),
+        "remote_port": str(rule.remote_port or ""),
+        "local_port": str(rule.local_port or ""),
+        "protocol": str(rule.protocol or ""),
+        "program": str(rule.program or ""),
+    }
+
+def _fw_rule_diff(before, after):
+    changed=[]
+    before=before or {}; after=after or {}
+    for key in ("enabled","direction","action","profile","remote_addr","local_addr","remote_port","local_port","protocol","program","desc"):
+        if before.get(key) != after.get(key):
+            changed.append(f"{key}: {before.get(key)} -> {after.get(key)}")
+    return "; ".join(changed)
+
+def _firewall_tamper_log(event):
+    try:
+        os.makedirs(os.path.dirname(FW_TAMPER_LOG_PATH), exist_ok=True)
+        with open(FW_TAMPER_LOG_PATH,"a",encoding="utf-8") as f:
+            f.write(json.dumps(event.as_dict(), sort_keys=True) + "\n")
+    except: pass
+    log.warning(f"Firewall tamper detected: {event.details}")
+
 # NT device path -> DOS path mapping
 _drive_map = None
 def _nt_to_dos(path):
@@ -1419,8 +1469,23 @@ class FirewallEngine:
     def __init__(self):
         self._rule_cache=[]; self._cache_lock=Lock(); self._cache_time=0; self._cache_ttl=120
         self._known_names=set(); self._known_names_loaded=False
+        self._tamper_lock=Lock(); self._managed_baseline=None; self._tamper_events=[]; self._local_changes={}
     def _invalidate(self):
         with self._cache_lock: self._cache_time=0
+    def _mark_local_change(self,name):
+        if not name: return
+        with self._tamper_lock:
+            self._local_changes[str(name)] = time.time() + 45
+    def _consume_local_change(self,name):
+        now=time.time()
+        with self._tamper_lock:
+            for stale,expiry in list(self._local_changes.items()):
+                if expiry < now: self._local_changes.pop(stale,None)
+            expiry=self._local_changes.get(str(name))
+            if expiry and expiry >= now:
+                self._local_changes.pop(str(name),None)
+                return True
+        return False
     def rule_exists(self,name):
         with self._cache_lock:
             if self._known_names_loaded: return name in self._known_names
@@ -1432,24 +1497,28 @@ class FirewallEngine:
         try: cmd = _build_new_firewall_rule_cmd(name,direction,action,remote_addr,remote_port,local_addr,local_port,protocol,program,profile,desc,enabled)
         except ValueError as e: return False, str(e)
         ok,out=_ps(cmd,20)
-        if ok: self._invalidate(); self._known_names.add(name)
+        if ok:
+            self._mark_local_change(name); self._invalidate(); self._known_names.add(name)
         return ok,out
     def delete_rule(self,name):
         try: cmd = _build_remove_firewall_rule_cmd(name)
         except ValueError as e: return False, str(e)
         ok,out=_ps(cmd,15)
-        if ok: self._invalidate(); self._known_names.discard(name)
+        if ok:
+            self._mark_local_change(name); self._invalidate(); self._known_names.discard(name)
         return ok,out
     def enable_rule(self,name,enabled=True):
         try: cmd = _build_set_firewall_rule_enabled_cmd(name,enabled)
         except ValueError: return False
         ok,_=_ps(cmd,10)
-        if ok: self._invalidate()
+        if ok:
+            self._mark_local_change(name); self._invalidate()
         return ok
     def get_all_rules(self,force_refresh=False):
         with self._cache_lock:
             if not force_refresh and self._rule_cache and (time.time()-self._cache_time)<self._cache_ttl: return list(self._rule_cache)
         rules=self._fetch_all()
+        self._detect_tamper(rules)
         with self._cache_lock: self._rule_cache=rules; self._cache_time=time.time(); self._known_names={r.name for r in rules}; self._known_names_loaded=True
         return rules
     def _fetch_all(self):
@@ -1477,6 +1546,87 @@ class FirewallEngine:
                     except: continue
             except Exception as e: log.warning(f"Rule parse error: {e}")
         return rules
+    def _managed_snapshots(self,rules):
+        return {r.name:_fw_rule_snapshot(r) for r in (rules or []) if r.name and _is_managed_rule_name(r.name)}
+    def _detect_tamper(self,rules):
+        current=self._managed_snapshots(rules)
+        with self._tamper_lock:
+            previous=self._managed_baseline
+            if previous is None:
+                self._managed_baseline=current
+                return []
+        events=[]
+        for name in sorted(set(previous) - set(current)):
+            if self._consume_local_change(name): continue
+            events.append(self._record_tamper("deleted",name,previous.get(name),{}))
+        for name in sorted(set(current) - set(previous)):
+            if self._consume_local_change(name): continue
+            events.append(self._record_tamper("created",name,{},current.get(name)))
+        for name in sorted(set(previous) & set(current)):
+            before=previous.get(name) or {}; after=current.get(name) or {}
+            if before == after: continue
+            if self._consume_local_change(name): continue
+            if before.get("enabled") is True and after.get("enabled") is False:
+                change="disabled"
+            elif before.get("enabled") is False and after.get("enabled") is True:
+                change="enabled"
+            else:
+                change="modified"
+            events.append(self._record_tamper(change,name,before,after))
+        with self._tamper_lock:
+            self._managed_baseline=current
+        return events
+    def _record_tamper(self,change,name,before,after):
+        diff=_fw_rule_diff(before,after)
+        if change=="created": details=f"Managed rule externally created: {name}"
+        elif change=="deleted": details=f"Managed rule externally deleted: {name}"
+        else: details=f"Managed rule externally {change}: {name}; {diff}"
+        event=FirewallTamperEvent(datetime.datetime.now().isoformat(timespec="seconds"),change,name,before or {},after or {},details)
+        with self._tamper_lock:
+            self._tamper_events.append(event)
+            self._tamper_events=self._tamper_events[-200:]
+        _firewall_tamper_log(event)
+        return event
+    def get_tamper_events(self,limit=50):
+        with self._tamper_lock:
+            return list(self._tamper_events[-int(limit or 50):])
+    def tamper_summary(self):
+        events=self.get_tamper_events(200)
+        latest=events[-1] if events else None
+        return {
+            "pending": len(events),
+            "latest": latest.as_dict() if latest else {},
+            "log_path": FW_TAMPER_LOG_PATH,
+        }
+    def accept_current_rules(self):
+        rules=self._fetch_all()
+        current=self._managed_snapshots(rules)
+        with self._tamper_lock:
+            self._managed_baseline=current
+            self._tamper_events=[]
+            self._local_changes={}
+        with self._cache_lock:
+            self._rule_cache=rules; self._cache_time=time.time(); self._known_names={r.name for r in rules}; self._known_names_loaded=True
+        return True, f"Accepted {len(current)} managed firewall rules as current baseline"
+    def restore_last_tamper(self):
+        events=self.get_tamper_events(1)
+        if not events: return False, "No firewall tamper events to restore"
+        event=events[-1]
+        if event.change=="created":
+            ok,out=self.delete_rule(event.rule_name)
+            if ok: self.accept_current_rules()
+            return ok,out
+        before=event.before or {}
+        if not before.get("name"): return False, "Tamper event has no prior rule snapshot"
+        if self.rule_exists(before["name"]):
+            self.delete_rule(before["name"])
+        ok,out=self.create_rule(before["name"], before.get("direction","Outbound"), before.get("action","Block"),
+            remote_addr=before.get("remote_addr",""), remote_port=before.get("remote_port",""),
+            local_addr=before.get("local_addr",""), local_port=before.get("local_port",""),
+            protocol=before.get("protocol",""), program=before.get("program",""),
+            profile=before.get("profile","Any"), desc=before.get("desc",""), enabled=before.get("enabled",True))
+        if ok: self.accept_current_rules()
+        return ok,out
     def block_ip(self,ip,direction="Outbound"):
         safe=ip.replace(":","-").replace("/","_"); nm=f"{FW_PFX}Block_{safe}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
@@ -2867,6 +3017,7 @@ class HeadlessMonitor(QObject):
             "geoip": self._geo_w.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
+            "firewall_tamper": fw.tamper_summary(),
             "identity_fields": ["service", "parent_process", "uwp_package", "signer_trust"],
             "signer": self._sign_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
@@ -2943,12 +3094,15 @@ class HeadlessMonitor(QObject):
         now = time.time()
         if now - self._last_summary >= 60:
             self._last_summary = now
+            try: fw.get_all_rules(force_refresh=True)
+            except Exception as e: _service_log(f"Firewall tamper scan failed: {e}", "WARNING")
             stats = self.conn_db.get_stats()
             qstats = self._quota.snapshot()
             dstats = self._doh.snapshot()
             istats = self._ids.snapshot()
             gstats = self._geo_w.snapshot()
-            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {istats.get('hits',0)} IDS hits, geoip {gstats.get('provider')} {gstats.get('lookups',0)}/{gstats.get('unknown',0)}, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
+            tamper=fw.tamper_summary()
+            _service_log(f"Service heartbeat: {stats['total']} events, {stats.get('active_sessions',0)} active sessions, {stats['blocked']} blocked, {len(self._blocked_ips)} auto-blocked IPs, {qstats.get('blocked',0)} quota blocks, {dstats.get('detected',0)} DoH hits, {istats.get('hits',0)} IDS hits, tamper {tamper.get('pending',0)}, geoip {gstats.get('provider')} {gstats.get('lookups',0)}/{gstats.get('unknown',0)}, {_fmt_bytes(stats.get('bytes_sent',0))}/{_fmt_bytes(stats.get('bytes_recv',0))} sent/recv")
             self._save_service_state(clean_shutdown=False)
 
     def _enforce_threats(self):
@@ -3693,6 +3847,8 @@ class FirewallTab(QWidget):
         tb.addStretch()
         tb.addWidget(_make_toolbar_btn("+ New Rule","primary",self._new_rule))
         tb.addWidget(_make_toolbar_btn("Refresh","dim",self._do_search))
+        tb.addWidget(_make_toolbar_btn("Restore Drift","warning",self._restore_tamper))
+        tb.addWidget(_make_toolbar_btn("Accept Drift","dim",self._accept_tamper))
         self.del_all_btn=_make_toolbar_btn("Delete All HG","danger",self._delete_all_hg); tb.addWidget(self.del_all_btn)
         lo.addLayout(tb)
         self.prog_lbl=QLabel(""); self.prog_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;"); lo.addWidget(self.prog_lbl)
@@ -3723,7 +3879,12 @@ class FirewallTab(QWidget):
             elif "Allow" in f: rules=[r for r in rules if r.action=="Allow"]
             self.table.setSortingEnabled(False); self._model.set_rules(rules); self.table.setSortingEnabled(True)
             hg_ct=sum(1 for r in self._rules if r.source=="pywall")
-            self.slbl.setText(f"{len(rules)} shown  |  {len(self._rules)} total  |  {hg_ct} PyWall rules")
+            msg=f"{len(rules)} shown  |  {len(self._rules)} total  |  {hg_ct} PyWall rules"
+            tamper=fw.tamper_summary()
+            if tamper.get("pending"):
+                latest=tamper.get("latest",{})
+                msg += f"  |  WARNING: {tamper.get('pending')} managed-rule drift event(s); latest {latest.get('change','?')} {latest.get('rule_name','')}"
+            self.slbl.setText(msg)
         except Exception as e:
             self.slbl.setText(f"Error loading rules: {e}"); log.warning(f"_apply_filter error: {e}")
     def _ctx_menu(self,pos):
@@ -3752,6 +3913,14 @@ class FirewallTab(QWidget):
         for name in hg:
             try: fw.delete_rule(name)
             except: pass
+        self._do_search()
+    def _restore_tamper(self):
+        ok,out=fw.restore_last_tamper()
+        self.slbl.setText(f"Restored latest managed-rule drift" if ok else f"Restore failed: {out}")
+        self._do_search()
+    def _accept_tamper(self):
+        ok,out=fw.accept_current_rules()
+        self.slbl.setText(out if ok else f"Accept failed: {out}")
         self._do_search()
     def _new_rule(self):
         dlg=NewRuleDialog(self)
@@ -4109,11 +4278,12 @@ class ToolsTab(QWidget):
         tls=s.get("tls_sni",{}) if isinstance(s.get("tls_sni",{}),dict) else {}
         signer=s.get("signer",{}) if isinstance(s.get("signer",{}),dict) else {}
         plugins=s.get("plugins",{}) if isinstance(s.get("plugins",{}),dict) else {}
+        tamper=s.get("firewall_tamper",{}) if isinstance(s.get("firewall_tamper",{}),dict) else {}
         msg=(f"RUNNING v{s.get('version','?')} | {s.get('status','')} | uptime {mins}m | "
              f"live {s.get('live_connections',0)} | sessions {s.get('active_sessions',0)}/{s.get('sessions',0)} | history {s.get('history_total',0)} | auto-blocked {s.get('auto_blocked_ips',0)} | "
              f"quotas {q.get('configured',0)}/{q.get('blocked',0)} | doh {doh.get('action','warn')} {doh.get('detected',0)}/{doh.get('blocked',0)} | ids {ids.get('rules',0)} {ids.get('hits',0)}/{ids.get('blocked',0)} | "
              f"geoip {geo.get('provider','ipwhois')} {geo.get('lookups',0)}/{geo.get('unknown',0)} | sni {'on' if tls.get('enabled') else 'off'} {tls.get('seen',0)} | "
-             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | plugins {plugins.get('executable',0)}/{plugins.get('total',0)} invalid {plugins.get('invalid',0)} | "
+             f"signers {signer.get('cached',0)}/{signer.get('queued',0)} | plugins {plugins.get('executable',0)}/{plugins.get('total',0)} invalid {plugins.get('invalid',0)} | tamper {tamper.get('pending',0)} | "
              f"bytes {_fmt_bytes(s.get('bytes_sent',0))}/{_fmt_bytes(s.get('bytes_recv',0))} | config {s.get('last_config_reload','')} {cfg_state} | {prev_txt}")
         self.service_lbl.setText(msg)
         self.slbl.setText("Service IPC query succeeded")
