@@ -90,13 +90,6 @@ Windows Firewall GUI + network monitor (~2.6k lines PyQt5, single file). Roadmap
 
 ## Research-Driven Additions
 
-- [ ] P1 - Add feed provenance, cache, and checksum controls for imported blocklists
-  Why: URL imports and future update checks need trust and rollback metadata before marketplace-style feeds expand.
-  Evidence: `ImportWorker` URL fetch path in `PyWall.py`; Portmaster remote block/allow list issue signal; simplewall/Portmaster blocklist update models.
-  Touches: `ImportWorker`, `HostsDB`, blocklist import UI, config paths, tests.
-  Acceptance: Each feed records source URL, fetched timestamp, item count, hash, last-good cache path, and failure reason; failed updates keep the last-good feed and show a status/log entry.
-  Complexity: M
-
 - [ ] P1 - Add plugin manifest permissions and execution guardrails
   Why: README advertises drop-in Python plugins, but unbounded local plugin execution would become the riskiest extension path.
   Evidence: README plugin claims; Portmaster extension issue signal; OpenSnitch SIEM/blocklist integration patterns.

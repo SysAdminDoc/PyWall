@@ -55,7 +55,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             and target.id == "APP_VERSION"
             and isinstance(node.value, ast.Constant)
         ]
-        self.assertEqual(versions, ["4.1.20"])
+        self.assertEqual(versions, ["4.1.21"])
 
     def test_service_cli_actions_are_declared(self):
         for action in ("install", "remove", "start", "stop", "restart", "status", "run"):
@@ -215,6 +215,19 @@ class ServiceModeStaticTests(unittest.TestCase):
             "config_recovered",
             "config_backup_path",
             "Config recovered",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_feed_provenance_cache_and_checksum_are_wired(self):
+        for token in (
+            "FEED_CACHE_DIR",
+            "feed_sources",
+            "feed_source_success",
+            "feed_source_failure",
+            "_feed_cache_path",
+            "_parse_import_text",
+            "hashlib.sha256(raw_bytes).hexdigest()",
+            "using cached feed",
         ):
             self.assertIn(token, TEXT)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.20 - Windows Firewall & Network Command Center
+PyWall v4.1.21 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.20"
+APP_VERSION = "4.1.21"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -155,7 +155,8 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
 REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
 IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
-os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True)
+FEED_CACHE_DIR = os.path.join(CONFIG_DIR, "feed_cache")
+os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True); os.makedirs(FEED_CACHE_DIR, exist_ok=True)
 SERVICE_NAME = "PyWallService"
 SERVICE_DISPLAY_NAME = "PyWall Background Service"
 SERVICE_DESCRIPTION = "Headless PyWall connection monitor and threat auto-blocker."
@@ -603,6 +604,20 @@ def normalize_line(line):
         return norm, dom, changed
     return None, None, False
 
+def _feed_cache_path(name, url):
+    slug=re.sub(r"[^a-zA-Z0-9_.-]+","_",str(name or "feed")).strip("._")[:60] or "feed"
+    digest=hashlib.sha256(str(url or name or slug).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(FEED_CACHE_DIR, f"{slug}_{digest}.txt")
+
+def _parse_import_text(text, normalize=True):
+    lines=str(text or "").splitlines()
+    if not normalize: return list(lines)
+    out=[]
+    for line in lines:
+        norm,_,_=normalize_line(line)
+        if norm: out.append(norm)
+    return out
+
 def clean_hosts_content(lines, whitelist_set):
     stats = {"total":len(lines),"blanks":0,"comments":0,"whitelist":0,"dupes":0,"invalid":0,"transformed":0}
     seen, kept = set(), []
@@ -972,9 +987,10 @@ class HostsDB:
             c=self.conn
             c.execute("CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY,status TEXT DEFAULT 'blocked',category TEXT DEFAULT '',source TEXT DEFAULT 'manual',date_added TEXT,date_modified TEXT,hit_count INTEGER DEFAULT 0,notes TEXT DEFAULT '')")
             c.execute("CREATE TABLE IF NOT EXISTS dns_feed (domain TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,hit_count INTEGER DEFAULT 1,last_process TEXT DEFAULT '',hidden INTEGER DEFAULT 0)")
+            c.execute("CREATE TABLE IF NOT EXISTS feed_sources (source_name TEXT PRIMARY KEY,url TEXT,fetched_at TEXT,item_count INTEGER DEFAULT 0,sha256 TEXT DEFAULT '',last_good_cache_path TEXT DEFAULT '',failure_reason TEXT DEFAULT '',status TEXT DEFAULT 'unknown')")
             c.execute("CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT,domain TEXT,action TEXT,process_name TEXT DEFAULT '',details TEXT DEFAULT '')")
             c.execute("CREATE TABLE IF NOT EXISTS diagnostic_log (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT,domain TEXT,session_id TEXT)")
-            for idx in ["CREATE INDEX IF NOT EXISTS idx_log_ts ON log(timestamp)","CREATE INDEX IF NOT EXISTS idx_feed_last ON dns_feed(last_seen)","CREATE INDEX IF NOT EXISTS idx_feed_hidden ON dns_feed(hidden)"]:
+            for idx in ["CREATE INDEX IF NOT EXISTS idx_log_ts ON log(timestamp)","CREATE INDEX IF NOT EXISTS idx_feed_last ON dns_feed(last_seen)","CREATE INDEX IF NOT EXISTS idx_feed_hidden ON dns_feed(hidden)","CREATE INDEX IF NOT EXISTS idx_feed_src_url ON feed_sources(url)","CREATE INDEX IF NOT EXISTS idx_feed_src_status ON feed_sources(status)"]:
                 c.execute(idx)
             c.commit()
     def _now(self): return datetime.datetime.now().isoformat()
@@ -1030,6 +1046,31 @@ class HostsDB:
         with self.lock: self.conn.execute("UPDATE dns_feed SET hidden=1 WHERE domain LIKE ?",(f"%{root}",)); self.conn.commit()
     def feed_count(self,hidden=False):
         with self.lock: return self.conn.execute(f"SELECT COUNT(*) FROM dns_feed WHERE hidden={'1' if hidden else '0'}").fetchone()[0]
+    def feed_source_success(self,name,url,item_count,sha256_value,cache_path):
+        with self.lock:
+            n=self._now()
+            self.conn.execute("INSERT OR REPLACE INTO feed_sources (source_name,url,fetched_at,item_count,sha256,last_good_cache_path,failure_reason,status) VALUES (?,?,?,?,?,?,?,?)",
+                (str(name),str(url),n,int(item_count or 0),str(sha256_value or ""),str(cache_path or ""),"","ok"))
+            self.conn.commit()
+            return self.feed_source_get(name)
+    def feed_source_failure(self,name,url,reason):
+        with self.lock:
+            n=self._now(); existing=self.feed_source_get(name) or {}
+            cache=existing.get("last_good_cache_path","")
+            self.conn.execute("INSERT OR REPLACE INTO feed_sources (source_name,url,fetched_at,item_count,sha256,last_good_cache_path,failure_reason,status) VALUES (?,?,?,?,?,?,?,?)",
+                (str(name),str(url),n,int(existing.get("item_count",0) or 0),str(existing.get("sha256","") or ""),cache,str(reason or ""),"failed"))
+            self.conn.commit()
+            return self.feed_source_get(name)
+    def feed_source_get(self,name):
+        row=self.conn.execute("SELECT source_name,url,fetched_at,item_count,sha256,last_good_cache_path,failure_reason,status FROM feed_sources WHERE source_name=?",(str(name),)).fetchone()
+        if not row: return None
+        keys=("source_name","url","fetched_at","item_count","sha256","last_good_cache_path","failure_reason","status")
+        return dict(zip(keys,row))
+    def feed_sources_get(self,limit=200):
+        with self.lock:
+            rows=self.conn.execute("SELECT source_name,url,fetched_at,item_count,sha256,last_good_cache_path,failure_reason,status FROM feed_sources ORDER BY fetched_at DESC LIMIT ?",(int(limit or 200),)).fetchall()
+            keys=("source_name","url","fetched_at","item_count","sha256","last_good_cache_path","failure_reason","status")
+            return [dict(zip(keys,row)) for row in rows]
     def log_event(self,domain,action,proc='',details=''):
         with self.lock:
             self.conn.execute("INSERT INTO log (timestamp,domain,action,process_name,details) VALUES (?,?,?,?,?)",(self._now(),domain.lower(),action,proc,details))
@@ -2252,8 +2293,8 @@ class EvtWorker(QThread):
 
 class ImportWorker(QThread):
     progress=pyqtSignal(int,int,str); log_msg=pyqtSignal(str,bool); finished=pyqtSignal(list); cancelled=pyqtSignal()
-    def __init__(self,sources,normalize=True):
-        super().__init__(); self.sources=sources; self.normalize=normalize; self._stop=False
+    def __init__(self,sources,normalize=True,db=None):
+        super().__init__(); self.sources=sources; self.normalize=normalize; self.db=db; self._stop=False
     def cancel(self): self._stop=True
     def run(self):
         acc=[]
@@ -2262,13 +2303,30 @@ class ImportWorker(QThread):
             self.progress.emit(i,len(self.sources),name)
             try:
                 req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 PyWall/4.1'})
-                with urllib.request.urlopen(req,timeout=20) as resp: raw=resp.read().decode('utf-8',errors='ignore').splitlines()
-                if self.normalize:
-                    for line in raw:
-                        norm,dom,_=normalize_line(line)
-                        if norm: acc.append(norm)
-                else: acc.extend(raw)
-            except Exception as e: self.log_msg.emit(f"Failed: {name} — {e}",True)
+                with urllib.request.urlopen(req,timeout=20) as resp: raw_bytes=resp.read()
+                text=raw_bytes.decode('utf-8',errors='ignore')
+                parsed=_parse_import_text(text,self.normalize)
+                acc.extend(parsed)
+                digest=hashlib.sha256(raw_bytes).hexdigest()
+                cache_path=_feed_cache_path(name,url)
+                os.makedirs(os.path.dirname(cache_path),exist_ok=True)
+                with open(cache_path,"wb") as f: f.write(raw_bytes)
+                if self.db: self.db.feed_source_success(name,url,len(parsed),digest,cache_path)
+                self.log_msg.emit(f"Fetched {name}: {len(parsed)} entries ({digest[:12]})",False)
+            except Exception as e:
+                reason=str(e)
+                meta=self.db.feed_source_failure(name,url,reason) if self.db else None
+                cache_path=(meta or {}).get("last_good_cache_path","")
+                if cache_path and os.path.exists(cache_path):
+                    try:
+                        with open(cache_path,"rb") as f: raw_bytes=f.read()
+                        parsed=_parse_import_text(raw_bytes.decode('utf-8',errors='ignore'),self.normalize)
+                        acc.extend(parsed)
+                        self.log_msg.emit(f"Failed: {name} - using cached feed ({len(parsed)} entries)",True)
+                        continue
+                    except Exception as ce:
+                        reason=f"{reason}; cache read failed: {ce}"
+                self.log_msg.emit(f"Failed: {name} - {reason}",True)
         self.finished.emit(acc)
 
 class RuleScanWorker(QThread):
@@ -3129,12 +3187,14 @@ class ArsenalTab(QWidget):
     def _import_single(self,name,url): self._start([(name,url)])
     def _start(self,sources):
         if self._worker and self._worker.isRunning(): return
-        self._worker=ImportWorker(sources,self.mode.currentIndex()==0)
+        self._worker=ImportWorker(sources,self.mode.currentIndex()==0,self.db)
         self._worker.progress.connect(self._on_prog); self._worker.finished.connect(self._on_done)
+        self._worker.log_msg.connect(self._on_log)
         self._worker.cancelled.connect(self._on_cancel)
         self.progress.setVisible(True); self.progress.setMaximum(len(sources)); self.progress.setValue(0)
         self.prog_lbl.setVisible(True); self.stop_btn.setVisible(True); self._worker.start()
     def _on_prog(self,i,total,name): self.progress.setValue(i); self.prog_lbl.setText(f"Importing {i+1}/{total}: {name}")
+    def _on_log(self,msg,is_error): self.prog_lbl.setText(msg)
     def _on_done(self,lines):
         self.progress.setVisible(False); self.stop_btn.setVisible(False)
         if lines: self.editor.append_lines(lines); self.prog_lbl.setText(f"Done — {len(lines)} entries")

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.20-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.20"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.21-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.21"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -83,6 +83,10 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 - IDS-lite YARA-style rule file for connection metadata matches
 - Custom IP/domain blocklist enforcement
 - VirusTotal and related research links from domain context menus
+
+### Blocklist Imports
+
+Built-in blocklist imports record source URL, fetch timestamp, parsed item count, SHA-256 checksum, last-good cache path, and failure reason. If a feed update fails, PyWall keeps the last-good cached feed available and reports the fallback in the Blocklists status line.
 
 ### Application Control
 
@@ -217,6 +221,7 @@ PyWall.py  (~3,900 lines, single file)
 pywall.db       Domain/feed/log SQLite database
 connections.db  Connection history SQLite database
 config.json     Settings, app profiles, blocklists
+feed_cache/    Last-good raw blocklist downloads with feed provenance in `pywall.db`
 service.log     Background service status and auto-block log (%ProgramData%/PyWall on Windows)
 service.token   ACL-restricted local named-pipe IPC token (%ProgramData%/PyWall on Windows)
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state

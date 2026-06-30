@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ast
 import datetime
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -46,14 +47,46 @@ BASE_NAMES = {
     "_build_rule_exists_cmd",
     "CONFIG_SCHEMA_VERSION",
     "GEOIP_HTTPS_ENDPOINT",
+    "DOMAIN_RE",
+    "IPV4_RE",
+    "WILDCARD_RE",
+    "MULTI_TLDS",
     "CONFIG_DEFAULTS",
     "ConfigLoadResult",
+    "looks_like_domain",
+    "get_root_domain",
+    "normalize_line",
+    "_feed_cache_path",
+    "_parse_import_text",
     "_coerce_config_value",
     "_validate_runtime_config",
     "_write_json_atomic",
     "_config_backup_path",
     "load_runtime_config",
 }
+
+class FakeSignal:
+    def __init__(self, *args, **kwargs):
+        self.events = []
+
+    def emit(self, *args):
+        self.events.append(args)
+
+    def connect(self, callback):
+        self.callback = callback
+
+class FakeQThread:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def isRunning(self):
+        return False
+
+    def start(self):
+        self.run()
+
+    def wait(self, timeout=0):
+        return True
 
 
 def load_runtime(*names):
@@ -80,6 +113,7 @@ def load_runtime(*names):
         "fnmatch": __import__("fnmatch"),
         "hmac": hmac,
         "html": __import__("html"),
+        "hashlib": hashlib,
         "ipaddress": ipaddress,
         "io": __import__("io"),
         "json": json,
@@ -100,16 +134,20 @@ def load_runtime(*names):
         "threading": threading,
         "time": time,
         "TEvent": threading.Event,
-        "urllib": __import__("urllib"),
+        "urllib": __import__("urllib.request"),
         "webbrowser": __import__("webbrowser"),
         "QObject": object,
         "QTimer": object,
+        "QThread": FakeQThread,
+        "pyqtSignal": lambda *args, **kwargs: FakeSignal(),
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.20",
+        "APP_VERSION": "4.1.21",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),
         "CONN_DB_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-connections.db"),
+        "DB_PATH": os.path.join(tempfile.gettempdir(), "pywall-test.db"),
+        "FEED_CACHE_DIR": os.path.join(tempfile.gettempdir(), "pywall-feed-cache"),
         "FW_PFX": "PW_",
         "LEGACY_FW_PFX": ("HG_",),
         "FW_RULE_PREFIXES": ("PW_", "HG_"),
@@ -429,6 +467,69 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(result.data["geoip_https_endpoint"], "https://ipwho.is/{ip}")
             self.assertEqual(result.data["service_poll_seconds"], 1.0)
             self.assertEqual(result.data["unknown_future_key"], 42)
+
+    def test_import_worker_records_feed_provenance_and_uses_last_good_cache(self):
+        ns = load_runtime("HostsDB", "ImportWorker")
+
+        class Capture:
+            def __init__(self):
+                self.events = []
+
+            def emit(self, *args):
+                self.events.append(args)
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self.payload
+
+        with tempfile.TemporaryDirectory() as td:
+            ns["DB_PATH"] = os.path.join(td, "pywall.db")
+            ns["FEED_CACHE_DIR"] = os.path.join(td, "feed_cache")
+            db = ns["HostsDB"]()
+            payload = b"0.0.0.0 ads.example\ntracker.example\n# comment\n"
+            urlopen_orig = ns["urllib"].request.urlopen
+            try:
+                ns["urllib"].request.urlopen = lambda req, timeout=20: FakeResponse(payload)
+                worker = ns["ImportWorker"]([("Unit Feed", "https://example.test/feed.txt")], True, db)
+                worker.finished = Capture()
+                worker.log_msg = Capture()
+                worker.run()
+
+                expected = ["0.0.0.0 ads.example", "0.0.0.0 tracker.example"]
+                self.assertEqual(worker.finished.events[-1][0], expected)
+                source = db.feed_source_get("Unit Feed")
+                self.assertEqual(source["status"], "ok")
+                self.assertEqual(source["item_count"], 2)
+                self.assertEqual(source["sha256"], __import__("hashlib").sha256(payload).hexdigest())
+                self.assertTrue(os.path.exists(source["last_good_cache_path"]))
+
+                def fail_urlopen(req, timeout=20):
+                    raise OSError("offline")
+
+                ns["urllib"].request.urlopen = fail_urlopen
+                retry = ns["ImportWorker"]([("Unit Feed", "https://example.test/feed.txt")], True, db)
+                retry.finished = Capture()
+                retry.log_msg = Capture()
+                retry.run()
+
+                self.assertEqual(retry.finished.events[-1][0], expected)
+                failed = db.feed_source_get("Unit Feed")
+                self.assertEqual(failed["status"], "failed")
+                self.assertIn("offline", failed["failure_reason"])
+                self.assertIn("using cached feed", retry.log_msg.events[-1][0])
+            finally:
+                ns["urllib"].request.urlopen = urlopen_orig
+                try: db.conn.close()
+                except: pass
 
 
 if __name__ == "__main__":

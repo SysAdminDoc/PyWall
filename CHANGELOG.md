@@ -2,6 +2,12 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.1.21] - 2026-06-30
+
+- Added: Blocklist imports now record feed provenance, source URL, fetch timestamp, item count, SHA-256 checksum, last-good cache path, status, and failure reason.
+- Added: Built-in feed imports cache raw last-good downloads under `%APPDATA%/PyWall/feed_cache` and fall back to them when a later update fails.
+- Changed: Blocklists tab now surfaces import success/failure/cache fallback messages from the worker.
+
 ## [v4.1.20] - 2026-06-30
 
 - Added: Versioned `config.json` validation with `schema_version`, typed defaults, warnings for unknown/invalid fields, and corrupt-file backup/recovery.
