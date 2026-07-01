@@ -87,6 +87,11 @@ BASE_NAMES = {
     "SEVERITY_LEVELS",
     "NotifDigestEntry",
     "NotificationController",
+    "SIGNER_UNSIGNED",
+    "SIGNER_VALID_PREFIX",
+    "signer_trust_state",
+    "signer_family",
+    "group_connections_by_signer",
     "_REDACT_KEYS",
     "_redact_config",
     "_timestamped_fw_export_path",
@@ -823,6 +828,37 @@ class RuntimeBehaviorTests(unittest.TestCase):
         ctrl = ns["NotificationController"]({"notif_severity_threshold": "low"})
         ctrl._launch_time = time.time()
         self.assertFalse(ctrl.should_notify("k1", severity="high", title="t", message="m"))
+
+    def test_signer_trust_state_classification(self):
+        ns = load_runtime("signer_trust_state", "signer_family", "group_connections_by_signer")
+        self.assertEqual(ns["signer_trust_state"]("Valid: Microsoft Corporation"), "signed")
+        self.assertEqual(ns["signer_trust_state"](""), "unsigned")
+        self.assertEqual(ns["signer_trust_state"]("-"), "unsigned")
+        self.assertEqual(ns["signer_trust_state"]("Expired: Old Corp"), "changed")
+        self.assertEqual(ns["signer_trust_state"]("Invalid: Bad Cert"), "changed")
+        self.assertEqual(ns["signer_trust_state"]("Some Other Label"), "unknown")
+
+    def test_signer_family_normalization(self):
+        ns = load_runtime("signer_family")
+        self.assertEqual(ns["signer_family"]("Valid: Microsoft Corporation"), "Microsoft Corporation")
+        self.assertEqual(ns["signer_family"]("Invalid: Old Corp"), "Old Corp")
+        self.assertEqual(ns["signer_family"]("-"), "(unsigned)")
+        self.assertEqual(ns["signer_family"](""), "(unsigned)")
+
+    def test_group_connections_by_signer(self):
+        ns = load_runtime("group_connections_by_signer")
+        ci1 = ns["CI"](proc="edge.exe", signer="Valid: Microsoft Corporation", ra="10.0.0.1", bytes_sent=100, bytes_recv=200)
+        ci2 = ns["CI"](proc="chrome.exe", signer="Valid: Google LLC", ra="10.0.0.2", bytes_sent=50, bytes_recv=50)
+        ci3 = ns["CI"](proc="unknown.exe", signer="-", ra="10.0.0.3")
+        ci4 = ns["CI"](proc="explorer.exe", signer="Valid: Microsoft Corporation", ra="10.0.0.4", bytes_sent=10)
+        groups = ns["group_connections_by_signer"]([ci1, ci2, ci3, ci4])
+        self.assertEqual(len(groups), 3)
+        ms_group = next(g for g in groups if g["signer"] == "Microsoft Corporation")
+        self.assertEqual(ms_group["count"], 2)
+        self.assertEqual(ms_group["trust"], "signed")
+        self.assertIn("edge.exe", ms_group["procs"])
+        unsigned_group = next(g for g in groups if g["signer"] == "(unsigned)")
+        self.assertEqual(unsigned_group["trust"], "unsigned")
 
     def test_redact_config_strips_secrets(self):
         ns = load_runtime("_redact_config")

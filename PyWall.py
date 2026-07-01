@@ -950,6 +950,43 @@ class LearningReviewCollector:
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
+SIGNER_UNSIGNED = {"", "-", "...", "Unknown", "Not signed", "Unsigned"}
+SIGNER_VALID_PREFIX = "Valid:"
+
+def signer_trust_state(signer_label):
+    if not signer_label or signer_label in SIGNER_UNSIGNED:
+        return "unsigned"
+    if str(signer_label).startswith(SIGNER_VALID_PREFIX):
+        return "signed"
+    if "Expired" in str(signer_label) or "Invalid" in str(signer_label):
+        return "changed"
+    return "unknown"
+
+def signer_family(signer_label):
+    s = str(signer_label or "").strip()
+    if s in SIGNER_UNSIGNED:
+        return "(unsigned)"
+    for prefix in ("Valid: ", "Invalid: ", "Expired: "):
+        if s.startswith(prefix):
+            return s[len(prefix):].strip()
+    return s or "(unsigned)"
+
+def group_connections_by_signer(conns):
+    groups = defaultdict(lambda: {"signer": "", "trust": "", "procs": set(), "ips": set(), "count": 0, "bytes_total": 0})
+    for ci in (conns or []):
+        family = signer_family(ci.signer)
+        g = groups[family]
+        g["signer"] = family
+        g["trust"] = signer_trust_state(ci.signer)
+        g["procs"].add(ci.proc or "?")
+        if ci.ra and ci.ra not in ("*", ""): g["ips"].add(ci.ra)
+        g["count"] += 1
+        g["bytes_total"] += (ci.bytes_sent or 0) + (ci.bytes_recv or 0)
+    out = []
+    for family, g in sorted(groups.items(), key=lambda kv: (-kv[1]["count"], kv[0])):
+        out.append({"signer": family, "trust": g["trust"], "procs": sorted(g["procs"]), "ips_count": len(g["ips"]), "count": g["count"], "bytes_total": g["bytes_total"]})
+    return out
+
 @dataclass
 class FWRule:
     name:str=""; desc:str=""; direction:str="Outbound"; action:str="Block"
@@ -4043,6 +4080,8 @@ class ConnectionsTab(QWidget):
         p_cb=QComboBox(); p_cb.addItems(["All","TCP","UDP"]); p_cb.currentTextChanged.connect(lambda v:setattr(self,'_filter_pro',v)); tb.addWidget(p_cb)
         cat_cb=QComboBox(); cat_cb.addItems(["All"]+sorted(_CATEGORIES.keys())+["LAN","Web","DNS","Email",""])
         cat_cb.currentTextChanged.connect(lambda v:setattr(self,'_filter_cat',v)); tb.addWidget(cat_cb)
+        self._view_cb=QComboBox(); self._view_cb.addItems(["Connections","Signer Groups"])
+        self._view_cb.currentTextChanged.connect(self._on_view_change); tb.addWidget(self._view_cb)
         tb.addStretch()
         self.count_lbl=QLabel("0 connections"); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
@@ -4214,8 +4253,34 @@ class ConnectionsTab(QWidget):
             addr=r.remote_addr if r.remote_addr not in ("Any","*") else r.program or "Any"
             self.rules_tbl.setItem(i,3,QTableWidgetItem(addr[:40]))
     def update_data(self,conns):
-        self._data=conns; self.learning.observe(conns); self._learning_refresh(); self._update_table()
+        self._data=conns; self.learning.observe(conns); self._learning_refresh()
+        if self._view_cb.currentText()=="Signer Groups": self._show_signer_groups()
+        else: self._update_table()
+    def _on_view_change(self,text):
+        if text=="Signer Groups": self._show_signer_groups()
+        else: self._update_table()
+    def _show_signer_groups(self):
+        groups=group_connections_by_signer(self._data)
+        cols=["Signer Family","Trust","Apps","Unique IPs","Connections","Total Traffic"]
+        self.table.setSortingEnabled(False); self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels(cols); self.table.setRowCount(len(groups))
+        trust_colors={"signed":C['green'],"unsigned":C['peach'],"changed":C['red'],"unknown":C['overlay']}
+        for i,g in enumerate(groups):
+            self.table.setItem(i,0,QTableWidgetItem(g["signer"]))
+            trust_item=QTableWidgetItem(g["trust"].upper())
+            trust_item.setForeground(QColor(trust_colors.get(g["trust"],C['text'])))
+            trust_item.setToolTip({"signed":"Authenticode-signed","unsigned":"No digital signature","changed":"Signature expired or invalid","unknown":"Trust state unknown"}.get(g["trust"],""))
+            self.table.setItem(i,1,trust_item)
+            self.table.setItem(i,2,QTableWidgetItem(", ".join(g["procs"][:5])))
+            ct=QTableWidgetItem(str(g["ips_count"])); ct.setTextAlignment(Qt.AlignCenter); self.table.setItem(i,3,ct)
+            cc=QTableWidgetItem(str(g["count"])); cc.setTextAlignment(Qt.AlignCenter); self.table.setItem(i,4,cc)
+            self.table.setItem(i,5,QTableWidgetItem(_fmt_bytes(g["bytes_total"])))
+        self.table.setSortingEnabled(True)
+        self.count_lbl.setText(f"{len(groups)} signer groups | {len(self._data)} connections")
     def _update_table(self):
+        cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Service","Parent","Package","Signer","Owner","Country","Category","Sent","Recv","Status"]
+        if self.table.columnCount()!=len(cols):
+            self.table.setColumnCount(len(cols)); self.table.setHorizontalHeaderLabels(cols)
         f=self._filter_txt.lower(); fd=self._filter_dir; fp=self._filter_pro; fc=self._filter_cat
         filtered=[]
         for ci in self._data:
