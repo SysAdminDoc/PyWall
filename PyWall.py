@@ -173,7 +173,7 @@ PLUGIN_ALLOWED_HOOKS = {
     "service_snapshot",
 }
 PLUGIN_ALLOWED_PERMISSION_KEYS = {"network", "files", "firewall", "notifications", "reports", "config"}
-os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True); os.makedirs(FEED_CACHE_DIR, exist_ok=True); os.makedirs(PLUGINS_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True); os.makedirs(FAVICON_DIR, exist_ok=True); os.makedirs(FEED_CACHE_DIR, exist_ok=True); os.makedirs(PLUGINS_DIR, exist_ok=True); os.makedirs(TRANSLATION_DIR, exist_ok=True)
 SERVICE_NAME = "PyWallService"
 SERVICE_DISPLAY_NAME = "PyWall Background Service"
 SERVICE_DESCRIPTION = "Headless PyWall connection monitor and threat auto-blocker."
@@ -4187,10 +4187,12 @@ class ConnectionsTab(QWidget):
         for i,ci in enumerate(filtered):
             sc={"-":C['text'],"HOSTS:BLOCK":C['peach'],"FW:BLOCKED":C['red'],"POLICY:BLOCK":C['red']}
             color=QColor(sc.get(ci.stat,C['red'] if "BLOCK" in ci.stat else C['text']))
+            stat_meaning={"HOSTS:BLOCK":"Blocked by hosts file","FW:BLOCKED":"Blocked by firewall rule","POLICY:BLOCK":"Blocked by policy","-":"Allowed"}.get(ci.stat,f"Status: {ci.stat}")
             vals=[ci.ts,ci.dir,ci.proto,ci.la,ci.lp,ci.ra,ci.rp,ci.host,ci.proc,str(ci.pid),ci.svc,ci.parent,ci.package,ci.signer,ci.org,f"{ci.country}",ci.category,_fmt_bytes(ci.bytes_sent),_fmt_bytes(ci.bytes_recv),ci.stat]
             for j,v in enumerate(vals):
                 it=QTableWidgetItem(v)
                 if ci.stat!="-": it.setForeground(color)
+                if j==len(vals)-1: it.setToolTip(stat_meaning)
                 self.table.setItem(i,j,it)
         self.table.setSortingEnabled(True)
         self.count_lbl.setText(f"{len(filtered)}/{len(self._data)} connections | review {len(self.learning.groups())}")
@@ -4880,6 +4882,8 @@ class MainWindow(QMainWindow):
         self._status_dot=QLabel(); self._status_dot.setFixedSize(_dp(8),_dp(8))
         self._status_dot.setStyleSheet(f"background:{C['overlay']};border-radius:{_dp(4)}px;border:none;"); tb.addWidget(self._status_dot)
         self._status_lbl=QLabel("STARTING"); self._status_lbl.setStyleSheet(f"color:{C['overlay']};font-size:{_dp(10)}px;font-weight:700;border:none;letter-spacing:0.5px;"); tb.addWidget(self._status_lbl)
+        _a11y(self._status_dot,"Monitor status indicator","Shows whether monitors are active")
+        _a11y(self._status_lbl,"Monitor status","Current monitoring state")
 
         # Admin badge
         try:
@@ -4896,6 +4900,8 @@ class MainWindow(QMainWindow):
         bwl=QHBoxLayout(bw_frame); bwl.setContentsMargins(0,0,0,0); bwl.setSpacing(_dp(14))
         self._bw_up=QLabel("\u25B2 -- B/s"); self._bw_up.setStyleSheet(f"color:{C['blue']};font-size:{_dp(10)}px;font-weight:600;border:none;font-family:'Cascadia Code','Consolas',monospace;")
         self._bw_dn=QLabel("\u25BC -- B/s"); self._bw_dn.setStyleSheet(f"color:{C['teal']};font-size:{_dp(10)}px;font-weight:600;border:none;font-family:'Cascadia Code','Consolas',monospace;")
+        _a11y(self._bw_up,"Upload bandwidth","Current upload speed",tooltip="Upload speed")
+        _a11y(self._bw_dn,"Download bandwidth","Current download speed",tooltip="Download speed")
         bwl.addWidget(self._bw_up); bwl.addWidget(self._bw_dn); tb.addWidget(bw_frame)
 
         # Connection toggle
@@ -4903,6 +4909,7 @@ class MainWindow(QMainWindow):
         self._conn_btn.setCursor(Qt.PointingHandCursor); self._conn_btn.setFixedHeight(_dp(28))
         self._conn_btn.setStyleSheet(f"background:{C['surface0']};color:{C['overlay']};padding:4px 16px;border-radius:{_dp(6)}px;font-weight:700;font-size:{_dp(9)}px;border:none;letter-spacing:0.5px;")
         self._conn_btn.clicked.connect(self._toggle_conn_monitor); tb.addWidget(self._conn_btn)
+        _a11y(self._conn_btn,"Toggle connection monitor","Start or stop the live connection monitor",tooltip="Toggle connection monitoring")
 
         root.addWidget(top)
 
@@ -4926,6 +4933,7 @@ class MainWindow(QMainWindow):
         # Utilities
         self._diag=DiagnosticTab(self.db,self.hm); self._tabs.addTab(self._diag,"Diagnostic")
         self._tools=ToolsTab(self.db,self.hm); self._tabs.addTab(self._tools,"Tools")
+        _a11y(self._tabs,"Main navigation tabs","Switch between PyWall views")
 
         # Lazy-load firewall on first tab switch
         self._fw_loaded=False
@@ -5072,8 +5080,11 @@ class MainWindow(QMainWindow):
     def _update_status(self,msg):
         active=self._monitoring or self._conn_monitoring
         c=C['green'] if active else C['red']
+        state="Active" if active else "Inactive"
         self._status_dot.setStyleSheet(f"background:{c};border-radius:{_dp(4)}px;border:none;")
         self._status_lbl.setText(msg.upper()[:30]); self._status_lbl.setStyleSheet(f"color:{c};font-size:{_dp(10)}px;font-weight:700;border:none;letter-spacing:0.5px;")
+        _a11y(self._status_dot,f"Monitor {state}",f"Monitors are {state.lower()}")
+        self._status_lbl.setToolTip(f"Monitor state: {state} - {msg}")
 
     # ── System Tray ──
     def _build_tray(self):
@@ -5147,6 +5158,7 @@ def main():
         app.setStyle("Fusion")
         app.setApplicationName(APP_NAME)
         app.setStyleSheet(DARK_STYLE)
+        load_translation(app)
         _init_fav_cache()  # Must happen AFTER QApplication exists
         w=MainWindow(); w.show()
         sys.exit(app.exec_())
