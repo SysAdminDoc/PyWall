@@ -181,7 +181,7 @@ def load_runtime(*names):
         "QThread": FakeQThread,
         "pyqtSignal": lambda *args, **kwargs: FakeSignal(),
         "APP_NAME": "PyWall",
-        "APP_VERSION": "4.1.26",
+        "APP_VERSION": "4.2.0",
         "BLOCK_IPS": {"0.0.0.0", "127.0.0.1", "::0", "::1"},
         "CONFIG_DIR": tempfile.gettempdir(),
         "CONFIG_PATH": os.path.join(tempfile.gettempdir(), "pywall-test-config.json"),

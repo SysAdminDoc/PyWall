@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.26-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.26"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.2.0-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.2.0"/>
 </p>
 
 <h1 align="center">PyWall</h1>
@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white" alt="Windows"/>
   <img src="https://img.shields.io/badge/License-MIT-22C55E" alt="License"/>
-  <img src="https://img.shields.io/badge/Lines-~3.9k-F59E0B" alt="Lines"/>
+  <img src="https://img.shields.io/badge/Lines-~5.4k-F59E0B" alt="Lines"/>
 </p>
 
 ---
@@ -101,9 +101,21 @@ Live connection rows show process names, paths, PIDs, service/package/parent/sig
 
 On startup, PyWall can collect unknown outbound apps for a timed review window without prompting on every connection. The Connections tab groups candidates by signer, executable path, parent process, and process name, then lets you allow or block selected groups in one batch; the default behavior is collect-only until you choose an action.
 
+### Signer Trust Groups
+
+Live connections can be viewed grouped by Authenticode signer family. Each group shows the trust state (signed/unsigned/changed), member apps, unique IP count, and aggregate traffic. Unsigned and expired-signer apps are highlighted for review.
+
 ### History & Timeline
 
-SQLite-backed connection log with full-text search and filters (process, service, parent, package, signer, country, evidence source, time range). Per-process sent/received byte deltas and app identity fields are captured from `psutil`/Windows metadata and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, event source/event ID/filter metadata where available, and one-click daily/weekly CSV + HTML usage reports. Auto-pruning by configurable retention period.
+SQLite-backed connection log with full-text search and Wireshark-style display filters (e.g. `proc contains "chrome" and rp in ("443","80") and bytes_sent >= 1000`). Per-process sent/received byte deltas and app identity fields are captured from `psutil`/Windows metadata and rolled into per-connection sessions with first/last seen, duration, samples, cumulative totals, event source/event ID/filter metadata where available, and one-click daily/weekly CSV + HTML usage reports. History can be exported to filtered CSV or JSON. Auto-pruning by configurable retention period. Schema migrations use `PRAGMA user_version` for safe upgrades.
+
+### Forensic Export
+
+One-click incident bundle from the Tools tab: produces a timestamped ZIP archive containing filtered connection history (CSV + JSON), redacted config snapshot, service and crash logs, firewall tamper log, and firewall rules export.
+
+### Notification Controls
+
+Configurable notification fatigue controls: severity threshold filtering (low/medium/high), per-alert snooze with cooldown, startup warmup suppression, and optional periodic digest of suppressed alerts.
 
 ### Bandwidth Quotas
 
@@ -188,6 +200,10 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `detect_portscan` | `true` | Port scan detection |
 | `detect_bruteforce` | `true` | Brute force detection |
 | `vt_api_key` | `""` | VirusTotal API key |
+| `notif_severity_threshold` | `low` | Minimum alert severity to show: `low`, `medium`, or `high` |
+| `notif_snooze_minutes` | `5` | Cooldown minutes between repeated alerts for the same key |
+| `notif_digest_enabled` | `false` | Accumulate suppressed alerts and show a periodic digest |
+| `notif_digest_interval_minutes` | `15` | Interval between digest notifications |
 
 IDS-lite rule example:
 
@@ -228,7 +244,7 @@ If dependencies are missing, startup exits with the exact `pip install -r requir
 ## Architecture
 
 ```
-PyWall.py  (~3,900 lines, single file)
+PyWall.py  (~5,400 lines, single file)
 ```
 
 **Runtime files** (auto-created in `%APPDATA%/PyWall/`):
@@ -271,6 +287,9 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
 | `FirewallRuleTableModel` | QAbstractTableModel-backed firewall rule table for large rule sets |
+| `NotificationController` | Centralized tray notification gating with severity filter, snooze, warmup, and digest |
+| `DisplayFilter` | Wireshark-style field-based filter parser for history and live connection views |
+| `create_forensic_bundle` | Timestamped ZIP incident archive with history, config, logs, and firewall rules |
 | `MainWindow` | PyQt5 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
 
 ---
@@ -281,7 +300,7 @@ Some areas that could use work:
 
 - **Rule scheduling** -- engine and UI for scheduled enable/disable windows
 - **Plugin system** -- execution hooks and plugin implementations on top of the existing manifest guardrails
-- **Localization** -- i18n support
+- **Localization** -- translation catalog files for `translations/` directory (i18n plumbing is in place)
 - **Unit tests** -- test coverage for FWManager and detection logic
 
 PRs welcome. Open an issue first for larger changes.

@@ -2,6 +2,19 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## [v4.2.0] - 2026-06-30
+
+- Added: SQLite schema migrations using `PRAGMA user_version` for `ConnDB` (v2) and `HostsDB` (v1), replacing inline column checks.
+- Added: `ConnDB.export_history()` exports filtered connection history to CSV or JSON. History tab has Export CSV/JSON buttons.
+- Added: `NotificationController` centralizes tray notification decisions with configurable severity threshold (`notif_severity_threshold`), per-key snooze (`notif_snooze_minutes`), and optional periodic digest (`notif_digest_enabled`).
+- Added: Accessibility names, descriptions, and tooltips on top bar controls, status indicator, connection toggle, bandwidth labels, tab widget, and connection status cells.
+- Added: Qt translation loading from `translations/` directory at startup via `load_translation()`.
+- Added: `create_forensic_bundle()` produces timestamped ZIP incident archives with filtered history, redacted config, service/crash/tamper logs, and firewall rules export.
+- Added: `signer_trust_state()` and `signer_family()` classify Authenticode labels. `group_connections_by_signer()` aggregates live connections by publisher family.
+- Added: Connections tab "Signer Groups" view mode with color-coded trust column.
+- Added: `DisplayFilter` parser for Wireshark-style field expressions (`proc contains "chrome" and rp in ("443","80")`), applied in History and Connections tabs.
+- Changed: Status cells include descriptive text tooltips alongside color for accessibility.
+
 ## [v4.1.25] - 2026-06-30
 
 - Added: Connection history now stores event evidence fields (`event_source`, event ID, record ID, rule/layer name, and filter ID) for WFP/Sysmon-backed rows.
