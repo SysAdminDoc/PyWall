@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/PyWall-v4.1.25-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.25"/>
+  <img src="https://img.shields.io/badge/PyWall-v4.1.26-3B82F6?style=for-the-badge&labelColor=1A1A24" alt="PyWall v4.1.26"/>
 </p>
 
 <h1 align="center">PyWall</h1>
