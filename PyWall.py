@@ -2393,6 +2393,49 @@ def export_usage_reports(report_dir=None):
         exports.append({"period": period, "csv": csv_path, "html": html_path, "rows": len(rows)})
     return exports
 
+# ─── Forensic Export Bundle ──────────────────────────────────────────────────
+_REDACT_KEYS = {"vt_api_key","service_token","api_key","password","secret"}
+
+def _redact_config(cfg):
+    out={}
+    for k,v in (cfg if isinstance(cfg,dict) else {}).items():
+        if any(rk in k.lower() for rk in _REDACT_KEYS):
+            out[k]="[REDACTED]" if v else ""
+        elif isinstance(v,dict): out[k]=_redact_config(v)
+        else: out[k]=v
+    return out
+
+def create_forensic_bundle(output_path,since=None,until=None,query=""):
+    import zipfile
+    stamp=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not output_path:
+        os.makedirs(REPORT_DIR,exist_ok=True)
+        output_path=os.path.join(REPORT_DIR,f"pywall-incident-{stamp}.zip")
+    manifest={"generator":f"{APP_NAME} v{APP_VERSION}","created":stamp,"since":since or "","until":until or "","query":query}
+    cdb=ConnDB()
+    history_csv=cdb.export_history(fmt="csv",query=query,since=since,until=until)
+    history_json=cdb.export_history(fmt="json",query=query,since=since,until=until)
+    try:
+        with open(CONFIG_PATH,"r",encoding="utf-8") as cf: config_raw=json.load(cf)
+    except: config_raw={}
+    config_safe=_redact_config(config_raw)
+    with zipfile.ZipFile(output_path,"w",zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json",json.dumps(manifest,indent=2))
+        zf.writestr("history.csv",history_csv)
+        zf.writestr("history.json",history_json)
+        zf.writestr("config_redacted.json",json.dumps(config_safe,indent=2))
+        for log_name,log_path in [("service.log",SERVICE_LOG_PATH),("crash.log",os.path.join(CONFIG_DIR,"crash.log")),("firewall_tamper.log",FW_TAMPER_LOG_PATH),("plugin_events.log",PLUGIN_LOG_PATH)]:
+            if os.path.isfile(log_path):
+                try: zf.write(log_path,log_name)
+                except: pass
+        fw_path=_timestamped_fw_export_path("incident_fw")
+        ok,_=_export_firewall_config(fw_path)
+        if ok and os.path.isfile(fw_path):
+            zf.write(fw_path,"firewall_rules.wfw")
+            try: os.remove(fw_path)
+            except: pass
+    return output_path
+
 MITRE_MAPPINGS = {
     "PORT_SCAN": {
         "tactic": "Discovery",
@@ -4676,6 +4719,7 @@ class ToolsTab(QWidget):
         g3l.addWidget(_make_toolbar_btn("Clear Favicon Cache","dim",self._clear_favicons))
         g3l.addWidget(_make_toolbar_btn("Prune History (30d)","dim",self._prune_history))
         g3l.addWidget(_make_toolbar_btn("Export Usage Reports","primary",self._export_usage_reports))
+        g3l.addWidget(_make_toolbar_btn("Forensic Bundle","primary",self._create_forensic_bundle))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
         # Plugin trust boundary tools
         gplug=QGroupBox("Plugin Guardrails"); gplugl=QHBoxLayout(gplug)
@@ -4784,6 +4828,14 @@ class ToolsTab(QWidget):
             self.slbl.setText(f"Exported usage reports to {REPORT_DIR}: {names}")
         except Exception as e:
             self.slbl.setText(f"Usage report export failed: {e}")
+    def _create_forensic_bundle(self):
+        path,_=QFileDialog.getSaveFileName(self,"Save Forensic Bundle",os.path.join(REPORT_DIR,f"pywall-incident-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),"ZIP files (*.zip)")
+        if not path: return
+        try:
+            result=create_forensic_bundle(path)
+            self.slbl.setText(f"Forensic bundle saved to {os.path.basename(result)}")
+        except Exception as e:
+            self.slbl.setText(f"Forensic bundle failed: {e}")
     def _open_config(self):
         if sys.platform=='win32': os.startfile(CONFIG_DIR)
         else: subprocess.Popen(['xdg-open',CONFIG_DIR])

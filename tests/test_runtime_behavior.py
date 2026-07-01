@@ -87,6 +87,12 @@ BASE_NAMES = {
     "SEVERITY_LEVELS",
     "NotifDigestEntry",
     "NotificationController",
+    "_REDACT_KEYS",
+    "_redact_config",
+    "_timestamped_fw_export_path",
+    "_export_firewall_config",
+    "_import_firewall_config",
+    "create_forensic_bundle",
 }
 
 class FakeSignal:
@@ -140,6 +146,7 @@ def load_runtime(*names):
         "hashlib": hashlib,
         "ipaddress": ipaddress,
         "io": __import__("io"),
+        "zipfile": __import__("zipfile"),
         "json": json,
         "log": SimpleNamespace(warning=lambda *a, **k: None),
         "Lock": threading.Lock,
@@ -187,6 +194,9 @@ def load_runtime(*names):
         "PRIV_RE": re.compile(r"^(0\.0\.0\.0|127\.|::1$|::$|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|fe80:|fd)"),
         "SERVICE_NAME": "PyWallService",
         "SERVICE_STATE_PATH": os.path.join(tempfile.gettempdir(), "service_state.json"),
+        "SERVICE_LOG_PATH": os.path.join(tempfile.gettempdir(), "pywall-service.log"),
+        "REPORT_DIR": os.path.join(tempfile.gettempdir(), "pywall-reports"),
+        "QUOTA_STATE_PATH": os.path.join(tempfile.gettempdir(), "quota_state.json"),
         "WINDOWS_HEADER": ["# hosts"],
         "_fmt_bytes": lambda n: f"{int(n or 0)} B",
         "_nt_to_dos": lambda p: p,
@@ -813,6 +823,42 @@ class RuntimeBehaviorTests(unittest.TestCase):
         ctrl = ns["NotificationController"]({"notif_severity_threshold": "low"})
         ctrl._launch_time = time.time()
         self.assertFalse(ctrl.should_notify("k1", severity="high", title="t", message="m"))
+
+    def test_redact_config_strips_secrets(self):
+        ns = load_runtime("_redact_config")
+        cfg = {"theme": "Charcoal", "vt_api_key": "secret123", "nested": {"api_key": "xyz"}, "safe": "ok"}
+        redacted = ns["_redact_config"](cfg)
+        self.assertEqual(redacted["theme"], "Charcoal")
+        self.assertEqual(redacted["vt_api_key"], "[REDACTED]")
+        self.assertEqual(redacted["nested"]["api_key"], "[REDACTED]")
+        self.assertEqual(redacted["safe"], "ok")
+
+    def test_forensic_bundle_creates_zip(self):
+        ns = load_runtime("create_forensic_bundle", "ConnDB")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            ns["CONN_DB_PATH"] = os.path.join(td, "conn.db")
+            ns["CONFIG_PATH"] = os.path.join(td, "config.json")
+            ns["SERVICE_LOG_PATH"] = os.path.join(td, "service.log")
+            ns["FW_TAMPER_LOG_PATH"] = os.path.join(td, "tamper.log")
+            ns["PLUGIN_LOG_PATH"] = os.path.join(td, "plugin.log")
+            ns["CONFIG_DIR"] = td
+            ns["REPORT_DIR"] = td
+            with open(ns["CONFIG_PATH"], "w") as f:
+                json.dump({"theme": "Nord", "vt_api_key": "secret"}, f)
+            ns["_export_firewall_config"] = lambda p: (False, "skip")
+            out_path = os.path.join(td, "bundle.zip")
+            result = ns["create_forensic_bundle"](out_path)
+            self.assertTrue(os.path.isfile(result))
+            import zipfile
+            with zipfile.ZipFile(result) as zf:
+                names = zf.namelist()
+                self.assertIn("manifest.json", names)
+                self.assertIn("history.csv", names)
+                self.assertIn("history.json", names)
+                self.assertIn("config_redacted.json", names)
+                config_data = json.loads(zf.read("config_redacted.json"))
+                self.assertEqual(config_data["vt_api_key"], "[REDACTED]")
+                self.assertEqual(config_data["theme"], "Nord")
 
 
 if __name__ == "__main__":
