@@ -79,6 +79,11 @@ BASE_NAMES = {
     "_plugin_log",
     "_safe_plugin_id",
     "load_runtime_config",
+    "CONN_DB_VERSION",
+    "HOSTS_DB_VERSION",
+    "CONN_EXPORT_COLUMNS",
+    "_conn_db_migrate",
+    "_hosts_db_migrate",
 }
 
 class FakeSignal:
@@ -715,6 +720,61 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 ns["urllib"].request.urlopen = urlopen_orig
                 try: db.conn.close()
                 except: pass
+
+
+    def test_conn_db_migration_from_v0_creates_full_schema(self):
+        ns = load_runtime("ConnDB")
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "conn_v0.db")
+            ns["CONN_DB_PATH"] = db_path
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
+            conn.commit()
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
+            conn.close()
+            cdb = ns["ConnDB"]()
+            self.assertEqual(cdb.schema_version(), ns["CONN_DB_VERSION"])
+            cols = {r[1] for r in cdb._conn.execute("PRAGMA table_info(connections)").fetchall()}
+            for expected in ("svc","parent","package","signer","bytes_sent","bytes_recv","event_source","event_id","rule_name","filter_id"):
+                self.assertIn(expected, cols)
+            cdb._conn.close()
+
+    def test_conn_db_fresh_creates_at_current_version(self):
+        ns = load_runtime("ConnDB")
+        with tempfile.TemporaryDirectory() as td:
+            ns["CONN_DB_PATH"] = os.path.join(td, "conn_fresh.db")
+            cdb = ns["ConnDB"]()
+            self.assertEqual(cdb.schema_version(), ns["CONN_DB_VERSION"])
+            cdb._conn.close()
+
+    def test_conn_db_export_history_csv_and_json(self):
+        ns = load_runtime("ConnDB")
+        with tempfile.TemporaryDirectory() as td:
+            ns["CONN_DB_PATH"] = os.path.join(td, "conn_export.db")
+            cdb = ns["ConnDB"]()
+            cdb._conn.execute("INSERT INTO connections (ts,src,dir,proto,la,lp,ra,rp,host,proc,pid,state,org,stat,country,cc,category) VALUES ('2026-01-01T00:00:00','psutil','Out','TCP','10.0.0.1','12345','93.184.216.34','443','example.com','chrome.exe',100,'ESTABLISHED','Example Org','ALLOW','US','US','Web')")
+            cdb._conn.commit()
+            csv_out = cdb.export_history(fmt="csv", query="chrome")
+            self.assertIn("chrome.exe", csv_out)
+            self.assertIn("example.com", csv_out)
+            self.assertIn("ts,src,dir", csv_out)
+            json_out = cdb.export_history(fmt="json", query="chrome")
+            parsed = json.loads(json_out)
+            self.assertEqual(len(parsed), 1)
+            self.assertEqual(parsed[0]["proc"], "chrome.exe")
+            empty = cdb.export_history(fmt="csv", query="nonexistent_query_xyz")
+            lines = empty.strip().split("\n")
+            self.assertEqual(len(lines), 1)
+            cdb._conn.close()
+
+    def test_hosts_db_migration_sets_user_version(self):
+        ns = load_runtime("HostsDB")
+        with tempfile.TemporaryDirectory() as td:
+            ns["DB_PATH"] = os.path.join(td, "hosts_fresh.db")
+            db = ns["HostsDB"]()
+            ver = db.conn.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(ver, ns["HOSTS_DB_VERSION"])
+            db.conn.close()
 
 
 if __name__ == "__main__":

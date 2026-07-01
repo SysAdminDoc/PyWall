@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyWall v4.1.25 - Windows Firewall & Network Command Center
+PyWall v4.1.26 - Windows Firewall & Network Command Center
 Combined hosts file management + Windows Firewall control + live connection
 monitoring. Block domains via hosts file OR firewall rules. Full local system control.
 """
@@ -134,7 +134,7 @@ log = logging.getLogger("PyWall"); logging.basicConfig(level=logging.WARNING)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 APP_NAME = "PyWall"
-APP_VERSION = "4.1.25"
+APP_VERSION = "4.1.26"
 FW_PFX = "PW_"  # Firewall rule prefix
 LEGACY_FW_PFX = ("HG_",)
 FW_RULE_PREFIXES = (FW_PFX,) + LEGACY_FW_PFX
@@ -157,6 +157,7 @@ REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
 IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
 FEED_CACHE_DIR = os.path.join(CONFIG_DIR, "feed_cache")
 PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
+TRANSLATION_DIR = os.path.join(CONFIG_DIR, "translations")
 PLUGIN_LOG_PATH = os.path.join(CONFIG_DIR, "plugin_events.log")
 FW_TAMPER_LOG_PATH = os.path.join(CONFIG_DIR, "firewall_tamper.log")
 PLUGIN_MANIFEST_NAMES = ("pywall-plugin.json", "plugin.json")
@@ -323,6 +324,34 @@ def load_runtime_config(path=CONFIG_PATH, recover=True):
         try: mtime=os.path.getmtime(path)
         except: mtime=None
         return ConfigLoadResult(data=dict(CONFIG_DEFAULTS),mtime=mtime,recovered=bool(backup),backup_path=backup,warnings=warnings)
+
+_active_translator = None
+
+def _tr(text):
+    return QCoreApplication.translate("PyWall", str(text or ""))
+
+def load_translation(app, locale_name=None):
+    global _active_translator
+    locale_name = locale_name or QLocale.system().name()
+    translator = QTranslator(app)
+    loaded = translator.load(f"pywall_{locale_name}", TRANSLATION_DIR)
+    if not loaded and "_" in locale_name:
+        loaded = translator.load(f"pywall_{locale_name.split('_',1)[0]}", TRANSLATION_DIR)
+    if loaded:
+        app.installTranslator(translator)
+        _active_translator = translator
+    return bool(loaded)
+
+def _a11y(widget, name, desc="", tooltip=None):
+    try: widget.setAccessibleName(_tr(name))
+    except: pass
+    if desc:
+        try: widget.setAccessibleDescription(_tr(desc))
+        except: pass
+    if tooltip:
+        try: widget.setToolTip(_tr(tooltip))
+        except: pass
+    return widget
 
 @dataclass
 class PluginManifest:
@@ -1354,15 +1383,7 @@ class HostsDB:
     def __init__(self):
         self.conn=sqlite3.connect(DB_PATH,check_same_thread=False); self.conn.execute("PRAGMA journal_mode=WAL"); self.lock=Lock()
         with self.lock:
-            c=self.conn
-            c.execute("CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY,status TEXT DEFAULT 'blocked',category TEXT DEFAULT '',source TEXT DEFAULT 'manual',date_added TEXT,date_modified TEXT,hit_count INTEGER DEFAULT 0,notes TEXT DEFAULT '')")
-            c.execute("CREATE TABLE IF NOT EXISTS dns_feed (domain TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,hit_count INTEGER DEFAULT 1,last_process TEXT DEFAULT '',hidden INTEGER DEFAULT 0)")
-            c.execute("CREATE TABLE IF NOT EXISTS feed_sources (source_name TEXT PRIMARY KEY,url TEXT,fetched_at TEXT,item_count INTEGER DEFAULT 0,sha256 TEXT DEFAULT '',last_good_cache_path TEXT DEFAULT '',failure_reason TEXT DEFAULT '',status TEXT DEFAULT 'unknown')")
-            c.execute("CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT,domain TEXT,action TEXT,process_name TEXT DEFAULT '',details TEXT DEFAULT '')")
-            c.execute("CREATE TABLE IF NOT EXISTS diagnostic_log (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT,domain TEXT,session_id TEXT)")
-            for idx in ["CREATE INDEX IF NOT EXISTS idx_log_ts ON log(timestamp)","CREATE INDEX IF NOT EXISTS idx_feed_last ON dns_feed(last_seen)","CREATE INDEX IF NOT EXISTS idx_feed_hidden ON dns_feed(hidden)","CREATE INDEX IF NOT EXISTS idx_feed_src_url ON feed_sources(url)","CREATE INDEX IF NOT EXISTS idx_feed_src_status ON feed_sources(status)"]:
-                c.execute(idx)
-            c.commit()
+            _hosts_db_migrate(self.conn)
     def _now(self): return datetime.datetime.now().isoformat()
     def add_domain(self,domain,status='blocked',source='manual'):
         with self.lock: n=self._now(); self.conn.execute("INSERT OR REPLACE INTO domains (domain,status,category,source,date_added,date_modified) VALUES (?,?,?,?,?,?)",(domain.lower().strip(),status,'',source,n,n)); self.conn.commit()
@@ -1467,23 +1488,53 @@ class HostsDB:
                 'top_blocked':c.execute("SELECT domain,COUNT(*) FROM log WHERE action='blocked' GROUP BY domain ORDER BY 2 DESC LIMIT 10").fetchall()}
 
 # ─── Connection History Database ─────────────────────────────────────────────
+CONN_DB_VERSION = 2
+
+def _conn_db_migrate(conn):
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver >= CONN_DB_VERSION:
+        return
+    if ver < 1:
+        conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,event_source TEXT DEFAULT '',event_id INTEGER DEFAULT 0,event_record_id INTEGER DEFAULT 0,rule_name TEXT DEFAULT '',filter_id TEXT DEFAULT '',UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
+        conn.execute("CREATE TABLE IF NOT EXISTS connection_sessions (key TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,samples INTEGER DEFAULT 0,active INTEGER DEFAULT 1,event_source TEXT DEFAULT '',event_id INTEGER DEFAULT 0,event_record_id INTEGER DEFAULT 0,rule_name TEXT DEFAULT '',filter_id TEXT DEFAULT '')")
+    if ver < 2:
+        cols={r[1] for r in conn.execute("PRAGMA table_info(connections)").fetchall()}
+        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","event_source":"TEXT DEFAULT ''","event_id":"INTEGER DEFAULT 0","event_record_id":"INTEGER DEFAULT 0","rule_name":"TEXT DEFAULT ''","filter_id":"TEXT DEFAULT ''"}.items():
+            if name not in cols: conn.execute(f"ALTER TABLE connections ADD COLUMN {name} {ddl}")
+        sess_cols={r[1] for r in conn.execute("PRAGMA table_info(connection_sessions)").fetchall()}
+        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","samples":"INTEGER DEFAULT 0","active":"INTEGER DEFAULT 1","event_source":"TEXT DEFAULT ''","event_id":"INTEGER DEFAULT 0","event_record_id":"INTEGER DEFAULT 0","rule_name":"TEXT DEFAULT ''","filter_id":"TEXT DEFAULT ''"}.items():
+            if name not in sess_cols: conn.execute(f"ALTER TABLE connection_sessions ADD COLUMN {name} {ddl}")
+    for idx in ["CREATE INDEX IF NOT EXISTS idx_ts ON connections(ts)","CREATE INDEX IF NOT EXISTS idx_proc ON connections(proc)","CREATE INDEX IF NOT EXISTS idx_ra ON connections(ra)"]:
+        conn.execute(idx)
+    for idx in ["CREATE INDEX IF NOT EXISTS idx_sess_last ON connection_sessions(last_seen)","CREATE INDEX IF NOT EXISTS idx_sess_proc ON connection_sessions(proc)","CREATE INDEX IF NOT EXISTS idx_sess_ra ON connection_sessions(ra)","CREATE INDEX IF NOT EXISTS idx_sess_active ON connection_sessions(active)"]:
+        conn.execute(idx)
+    conn.execute(f"PRAGMA user_version={CONN_DB_VERSION}")
+    conn.commit()
+
+HOSTS_DB_VERSION = 1
+
+def _hosts_db_migrate(conn):
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver >= HOSTS_DB_VERSION:
+        return
+    if ver < 1:
+        conn.execute("CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY,status TEXT DEFAULT 'blocked',category TEXT DEFAULT '',source TEXT DEFAULT 'manual',date_added TEXT,date_modified TEXT,hit_count INTEGER DEFAULT 0,notes TEXT DEFAULT '')")
+        conn.execute("CREATE TABLE IF NOT EXISTS dns_feed (domain TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,hit_count INTEGER DEFAULT 1,last_process TEXT DEFAULT '',hidden INTEGER DEFAULT 0)")
+        conn.execute("CREATE TABLE IF NOT EXISTS feed_sources (source_name TEXT PRIMARY KEY,url TEXT,fetched_at TEXT,item_count INTEGER DEFAULT 0,sha256 TEXT DEFAULT '',last_good_cache_path TEXT DEFAULT '',failure_reason TEXT DEFAULT '',status TEXT DEFAULT 'unknown')")
+        conn.execute("CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT,domain TEXT,action TEXT,process_name TEXT DEFAULT '',details TEXT DEFAULT '')")
+        conn.execute("CREATE TABLE IF NOT EXISTS diagnostic_log (id INTEGER PRIMARY KEY AUTOINCREMENT,timestamp TEXT,domain TEXT,session_id TEXT)")
+        for idx in ["CREATE INDEX IF NOT EXISTS idx_log_ts ON log(timestamp)","CREATE INDEX IF NOT EXISTS idx_feed_last ON dns_feed(last_seen)","CREATE INDEX IF NOT EXISTS idx_feed_hidden ON dns_feed(hidden)","CREATE INDEX IF NOT EXISTS idx_feed_src_url ON feed_sources(url)","CREATE INDEX IF NOT EXISTS idx_feed_src_status ON feed_sources(status)"]:
+            conn.execute(idx)
+    conn.execute(f"PRAGMA user_version={HOSTS_DB_VERSION}")
+    conn.commit()
+
+CONN_EXPORT_COLUMNS = ["ts","src","dir","proto","la","lp","ra","rp","host","proc","pid","svc","parent","package","signer","state","org","country","stat","bytes_sent","bytes_recv","event_source","event_id","event_record_id","rule_name","filter_id"]
+
 class ConnDB:
     def __init__(self):
         self._lock=Lock(); self._conn=sqlite3.connect(CONN_DB_PATH,check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL"); self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,UNIQUE(ts,proto,la,lp,ra,rp,pid) ON CONFLICT IGNORE)")
-        cols={r[1] for r in self._conn.execute("PRAGMA table_info(connections)").fetchall()}
-        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","event_source":"TEXT DEFAULT ''","event_id":"INTEGER DEFAULT 0","event_record_id":"INTEGER DEFAULT 0","rule_name":"TEXT DEFAULT ''","filter_id":"TEXT DEFAULT ''"}.items():
-            if name not in cols: self._conn.execute(f"ALTER TABLE connections ADD COLUMN {name} {ddl}")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS connection_sessions (key TEXT PRIMARY KEY,first_seen TEXT,last_seen TEXT,src TEXT,dir TEXT,proto TEXT,la TEXT,lp TEXT,ra TEXT,rp TEXT,host TEXT,proc TEXT,pid INTEGER,svc TEXT DEFAULT '-',parent TEXT DEFAULT '-',package TEXT DEFAULT '-',signer TEXT DEFAULT '-',state TEXT,org TEXT,stat TEXT,country TEXT,cc TEXT,category TEXT,bytes_sent INTEGER DEFAULT 0,bytes_recv INTEGER DEFAULT 0,samples INTEGER DEFAULT 0,active INTEGER DEFAULT 1)")
-        sess_cols={r[1] for r in self._conn.execute("PRAGMA table_info(connection_sessions)").fetchall()}
-        for name,ddl in {"svc":"TEXT DEFAULT '-'","parent":"TEXT DEFAULT '-'","package":"TEXT DEFAULT '-'","signer":"TEXT DEFAULT '-'","bytes_sent":"INTEGER DEFAULT 0","bytes_recv":"INTEGER DEFAULT 0","samples":"INTEGER DEFAULT 0","active":"INTEGER DEFAULT 1","event_source":"TEXT DEFAULT ''","event_id":"INTEGER DEFAULT 0","event_record_id":"INTEGER DEFAULT 0","rule_name":"TEXT DEFAULT ''","filter_id":"TEXT DEFAULT ''"}.items():
-            if name not in sess_cols: self._conn.execute(f"ALTER TABLE connection_sessions ADD COLUMN {name} {ddl}")
-        for idx in ["CREATE INDEX IF NOT EXISTS idx_ts ON connections(ts)","CREATE INDEX IF NOT EXISTS idx_proc ON connections(proc)","CREATE INDEX IF NOT EXISTS idx_ra ON connections(ra)"]:
-            self._conn.execute(idx)
-        for idx in ["CREATE INDEX IF NOT EXISTS idx_sess_last ON connection_sessions(last_seen)","CREATE INDEX IF NOT EXISTS idx_sess_proc ON connection_sessions(proc)","CREATE INDEX IF NOT EXISTS idx_sess_ra ON connection_sessions(ra)","CREATE INDEX IF NOT EXISTS idx_sess_active ON connection_sessions(active)"]:
-            self._conn.execute(idx)
-        self._conn.commit()
+        _conn_db_migrate(self._conn)
     def insert_batch(self,items):
         with self._lock:
             try:
@@ -1566,6 +1617,29 @@ class ConnDB:
     def count(self):
         with self._lock:
             try: return self._conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
+            except: return 0
+    def export_history(self,fmt="csv",query="",since=None,until=None,evidence="all",limit=50000):
+        with self._lock:
+            try:
+                w,p=[],[]
+                if query: w.append("(host LIKE ? OR proc LIKE ? OR ra LIKE ? OR org LIKE ? OR svc LIKE ? OR parent LIKE ? OR package LIKE ? OR signer LIKE ?)"); p.extend([f"%{query}%"]*8)
+                if since: w.append("ts>=?"); p.append(since)
+                if until: w.append("ts<=?"); p.append(until)
+                if evidence=="event": w.append("event_source!=''")
+                elif evidence=="psutil": w.append("(event_source IS NULL OR event_source='')")
+                where=" WHERE "+" AND ".join(w) if w else ""
+                sql=f"SELECT {','.join(CONN_EXPORT_COLUMNS)} FROM connections{where} ORDER BY id DESC LIMIT ?"
+                p.append(limit); rows=self._conn.execute(sql,p).fetchall()
+            except: return ""
+        if fmt=="json":
+            return json.dumps([dict(zip(CONN_EXPORT_COLUMNS,r)) for r in rows],indent=2,default=str)
+        buf=io.StringIO()
+        w=csv.writer(buf); w.writerow(CONN_EXPORT_COLUMNS)
+        for r in rows: w.writerow(r)
+        return buf.getvalue()
+    def schema_version(self):
+        with self._lock:
+            try: return self._conn.execute("PRAGMA user_version").fetchone()[0]
             except: return 0
 
 
@@ -3422,16 +3496,40 @@ def _btn(text,cls,cb,w=None,h=None):
     b=QPushButton(text); b.setProperty("class",cls); b.setFixedHeight(h)
     b.setCursor(Qt.PointingHandCursor)
     if w: b.setFixedWidth(_dp(w) if isinstance(w,int) else w)
+    _a11y(b,text,tooltip=text)
     b.clicked.connect(cb); return b
 
 def _make_toolbar_btn(text,cls,cb):
     b=QPushButton(text); b.setProperty("class",cls); b.setCursor(Qt.PointingHandCursor)
-    b.setFixedHeight(_dp(30)); b.clicked.connect(cb); return b
+    b.setFixedHeight(_dp(30)); _a11y(b,text,tooltip=text); b.clicked.connect(cb); return b
+
+def _a11y_item(text, tooltip=None):
+    item=QTableWidgetItem(str(text) if text is not None else "")
+    label=str(text) if text is not None else ""
+    item.setToolTip(str(tooltip or label))
+    try: item.setData(Qt.AccessibleTextRole,label)
+    except: pass
+    return item
+
+def _status_item(text, color=None, meaning=None):
+    item=_a11y_item(text, meaning or text)
+    if color is not None: item.setForeground(QColor(color) if isinstance(color,str) else color)
+    try: item.setData(Qt.AccessibleDescriptionRole, meaning or text)
+    except: pass
+    return item
+
+def _a11y_table(table, name, desc=""):
+    _a11y(table,name,desc or name)
+    try:
+        table.setToolTip(_tr(desc or name))
+        table.setAlternatingRowColors(True)
+    except: pass
+    return table
 
 _CTX_STYLE = f"QMenu{{background:{C['mantle']};color:{C['text']};border:1px solid {C['surface1']};border-radius:10px;padding:6px;}}QMenu::item{{padding:7px 22px;border-radius:5px;}}QMenu::item:selected{{background:{C['surface0']};}}QMenu::separator{{height:1px;background:{C['surface0']};margin:4px 8px;}}"
 
 def _set_domain_item(table,row,col,domain):
-    item=QTableWidgetItem(domain)
+    item=_a11y_item(domain, f"Domain {domain}")
     if _fav_cache:
         px=_fav_cache.get(domain)
         if px and not px.isNull(): item.setIcon(QIcon(px))
@@ -3838,6 +3936,7 @@ class ConnectionsTab(QWidget):
         self.table=QTableWidget(0,20)
         cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Service","Parent","Package","Signer","Owner","Country","Category","Sent","Recv","Status"]
         self.table.setHorizontalHeaderLabels(cols); self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        _a11y_table(self.table,"Live connections table","Live connection rows with text status, process identity, signer, service, country, and byte counters")
         self.table.verticalHeader().setVisible(False); self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setIconSize(QSize(16,16))
         widths=[58,35,38,100,50,110,50,150,100,42,95,110,130,120,90,65,75,70,70,90]
@@ -3860,6 +3959,7 @@ class ConnectionsTab(QWidget):
         self.learn_lbl.setWordWrap(True); self.learn_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;")
         rl.addWidget(self.learn_lbl)
         self.learn_tbl=QTableWidget(0,4); self.learn_tbl.setHorizontalHeaderLabels(["App","Signer / Parent","Seen","Endpoints"])
+        _a11y_table(self.learn_tbl,"Learning review table","Grouped unknown outbound apps ready for batch allow or block decisions")
         self.learn_tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
         for i,w in [(1,130),(2,45),(3,115)]: self.learn_tbl.setColumnWidth(i,w)
         self.learn_tbl.verticalHeader().setVisible(False); self.learn_tbl.setAlternatingRowColors(True)
@@ -3874,6 +3974,7 @@ class ConnectionsTab(QWidget):
         # HG rules mini-panel
         rl.addWidget(QLabel("PyWall FW Rules"))
         self.rules_tbl=QTableWidget(0,4); self.rules_tbl.setHorizontalHeaderLabels(["Name","Action","Direction","Addr"])
+        _a11y_table(self.rules_tbl,"PyWall firewall rules table","Managed firewall rules created by PyWall")
         self.rules_tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch); self.rules_tbl.verticalHeader().setVisible(False)
         self.rules_tbl.setEditTriggers(QTableWidget.NoEditTriggers); self.rules_tbl.setMaximumHeight(200)
         self.rules_tbl.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4409,7 +4510,10 @@ class HistoryTab(QWidget):
         self.search.returnPressed.connect(self._do_search); tb.addWidget(self.search)
         self.mode=QComboBox(); self.mode.addItems(["Events","Sessions"]); self.mode.currentTextChanged.connect(lambda _:self._do_search()); tb.addWidget(self.mode)
         self.evidence=QComboBox(); self.evidence.addItems(["All Evidence","Event Backed","psutil Only"]); self.evidence.currentTextChanged.connect(lambda _:self._do_search()); tb.addWidget(self.evidence)
-        tb.addWidget(_make_toolbar_btn("Search","primary",self._do_search)); tb.addStretch()
+        tb.addWidget(_make_toolbar_btn("Search","primary",self._do_search))
+        tb.addWidget(_make_toolbar_btn("Export CSV","dim",lambda:self._export_filtered("csv")))
+        tb.addWidget(_make_toolbar_btn("Export JSON","dim",lambda:self._export_filtered("json")))
+        tb.addStretch()
         self.count_lbl=QLabel(""); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
         self.table=QTableWidget(0,21)
@@ -4456,6 +4560,16 @@ class HistoryTab(QWidget):
             for j,v in enumerate(vals): self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
         self.count_lbl.setText(f"{len(rows)} sessions"); self.total_lbl.setText(f"Sessions: {self.cdb.get_stats().get('sessions',0)}")
+    def _export_filtered(self,fmt):
+        ext="json" if fmt=="json" else "csv"
+        path,_=QFileDialog.getSaveFileName(self,f"Export History ({ext.upper()})",os.path.join(REPORT_DIR,f"pywall-history-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"),f"{ext.upper()} files (*.{ext})")
+        if not path: return
+        data=self.cdb.export_history(fmt=fmt,query=self.search.text().strip(),evidence=self._evidence_filter())
+        try:
+            os.makedirs(os.path.dirname(path),exist_ok=True)
+            with open(path,"w",encoding="utf-8") as f: f.write(data)
+            self.count_lbl.setText(f"Exported to {os.path.basename(path)}")
+        except Exception as e: self.count_lbl.setText(f"Export failed: {e}")
 
 
 # ─── Tools Tab ───────────────────────────────────────────────────────────────
