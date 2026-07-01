@@ -2393,6 +2393,76 @@ class IDSRuleEngine:
     def snapshot(s):
         with s._lock: return {"enabled":s._enabled,"path":s._path,"rules":len(s._rules),"hits":s._hits,"blocked":s._blocked}
 
+# ─── Display Filter Grammar ─────────────────────────────────────────────────
+DISPLAY_FILTER_FIELDS = {"proc","host","ra","rp","la","lp","proto","dir","stat","country","org","category","svc","parent","package","signer","event_source","rule_name","filter_id","bytes_sent","bytes_recv","bytes_total"}
+DISPLAY_FILTER_OPS = (">=","<=",">","<","contains","matches","==","!=","in")
+
+class DisplayFilterError(Exception):
+    pass
+
+class DisplayFilter:
+    def __init__(self, expression):
+        self._expr = str(expression or "").strip()
+        self._terms = []
+        if self._expr:
+            self._parse()
+
+    def _parse(self):
+        for term_str in re.split(r'\s+and\s+', self._expr, flags=re.I):
+            term = term_str.strip()
+            if not term: continue
+            parsed = False
+            for op in DISPLAY_FILTER_OPS:
+                if op in term:
+                    left, right = term.split(op, 1)
+                    field = left.strip().lower()
+                    if field not in DISPLAY_FILTER_FIELDS:
+                        raise DisplayFilterError(f"Unknown field: {field}")
+                    self._terms.append((field, op, right.strip()))
+                    parsed = True
+                    break
+            if not parsed:
+                raise DisplayFilterError(f"No operator in: {term}")
+
+    def matches(self, row_dict):
+        for field, op, rhs_raw in self._terms:
+            val = str(row_dict.get(field, "") or "")
+            rhs = rhs_raw.strip("\"'")
+            if op == "contains":
+                if rhs.lower() not in val.lower(): return False
+            elif op == "matches":
+                try:
+                    if not re.search(rhs, val, re.I): return False
+                except: return False
+            elif op == "==":
+                if val.lower() != rhs.lower(): return False
+            elif op == "!=":
+                if val.lower() == rhs.lower(): return False
+            elif op == "in":
+                vals = {x.strip().strip("\"'").lower() for x in rhs.strip("()[]").split(",")}
+                if val.lower() not in vals: return False
+            elif op in (">=", "<=", ">", "<"):
+                try:
+                    lv, rv = float(val or 0), float(rhs or 0)
+                    if op == ">=" and not (lv >= rv): return False
+                    if op == "<=" and not (lv <= rv): return False
+                    if op == ">" and not (lv > rv): return False
+                    if op == "<" and not (lv < rv): return False
+                except ValueError:
+                    return False
+        return True
+
+    @property
+    def valid(self):
+        return True
+
+    @staticmethod
+    def try_parse(expression):
+        try:
+            return DisplayFilter(expression), None
+        except DisplayFilterError as e:
+            return None, str(e)
+
 def export_usage_reports(report_dir=None):
     report_dir = report_dir or REPORT_DIR
     os.makedirs(report_dir, exist_ok=True)
@@ -4281,14 +4351,22 @@ class ConnectionsTab(QWidget):
         cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Service","Parent","Package","Signer","Owner","Country","Category","Sent","Recv","Status"]
         if self.table.columnCount()!=len(cols):
             self.table.setColumnCount(len(cols)); self.table.setHorizontalHeaderLabels(cols)
-        f=self._filter_txt.lower(); fd=self._filter_dir; fp=self._filter_pro; fc=self._filter_cat
+        f=self._filter_txt.strip(); fd=self._filter_dir; fp=self._filter_pro; fc=self._filter_cat
+        df=None
+        if f and any(f" {op} " in f or f" {op}" in f for op in ("contains","matches","==","!=","in",">=","<=",">","<")):
+            df,err=DisplayFilter.try_parse(f)
+            if err: df=None
         filtered=[]
         for ci in self._data:
             if fd!="All" and ci.dir!=fd: continue
             if fp!="All" and ci.proto!=fp: continue
             if fc!="All" and ci.category!=fc: continue
-            hay=" ".join([ci.host,ci.proc,ci.ra,ci.org or "",ci.country,ci.svc,ci.parent,ci.package,ci.signer]).lower()
-            if f and f not in hay: continue
+            if df:
+                row={"proc":ci.proc,"host":ci.host,"ra":ci.ra,"rp":ci.rp,"la":ci.la,"lp":ci.lp,"proto":ci.proto,"dir":ci.dir,"stat":ci.stat,"country":ci.country,"org":ci.org or "","category":ci.category,"svc":ci.svc,"parent":ci.parent,"package":ci.package,"signer":ci.signer,"bytes_sent":str(ci.bytes_sent),"bytes_recv":str(ci.bytes_recv),"bytes_total":str((ci.bytes_sent or 0)+(ci.bytes_recv or 0))}
+                if not df.matches(row): continue
+            elif f:
+                hay=" ".join([ci.host,ci.proc,ci.ra,ci.org or "",ci.country,ci.svc,ci.parent,ci.package,ci.signer]).lower()
+                if f.lower() not in hay: continue
             filtered.append(ci)
         self._filtered=filtered
         self.table.setSortingEnabled(False); self.table.setRowCount(len(filtered))
@@ -4687,7 +4765,7 @@ class HistoryTab(QWidget):
         lo=QVBoxLayout(self); lo.setContentsMargins(12,12,12,12); lo.setSpacing(8)
         hdr=QLabel("Connection History"); hdr.setStyleSheet(f"font-size:14px;font-weight:800;color:{C['blue']};"); lo.addWidget(hdr)
         tb=QHBoxLayout(); tb.setSpacing(6)
-        self.search=QLineEdit(); self.search.setPlaceholderText("Search by IP, host, process..."); self.search.setFixedWidth(250)
+        self.search=QLineEdit(); self.search.setPlaceholderText('Search or filter: proc contains "chrome" and rp in ("443","80")'); self.search.setFixedWidth(450)
         self.search.returnPressed.connect(self._do_search); tb.addWidget(self.search)
         self.mode=QComboBox(); self.mode.addItems(["Events","Sessions"]); self.mode.currentTextChanged.connect(lambda _:self._do_search()); tb.addWidget(self.mode)
         self.evidence=QComboBox(); self.evidence.addItems(["All Evidence","Event Backed","psutil Only"]); self.evidence.currentTextChanged.connect(lambda _:self._do_search()); tb.addWidget(self.evidence)
@@ -4720,27 +4798,52 @@ class HistoryTab(QWidget):
         if text.startswith("Event"): return "event"
         if text.startswith("psutil"): return "psutil"
         return "all"
+    def _is_display_filter(self,text):
+        return any(f" {op} " in text or f" {op}" in text for op in ("contains","matches","==","!=","in",">=","<=",">","<"))
     def _load(self):
         if self.mode.currentText()=="Sessions":
             self._load_sessions(); return
-        rows=self.cdb.search(self.search.text().strip(),500,self._offset,self._evidence_filter())
-        self._set_cols(["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv","Evidence","Event","Record","Rule","Filter"])
-        self.table.setRowCount(len(rows))
-        for i,r in enumerate(rows):
+        query=self.search.text().strip()
+        cols=["Time","Src","Dir","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","State","Owner","Country","Status","Sent","Recv","Evidence","Event","Record","Rule","Filter"]
+        col_keys=["ts","src","dir","proto","la","lp","ra","rp","host","proc","pid","svc","parent","package","signer","state","org","country","stat","bytes_sent","bytes_recv","event_source","event_id","event_record_id","rule_name","filter_id"]
+        if self._is_display_filter(query):
+            df,err=DisplayFilter.try_parse(query)
+            if err:
+                self.count_lbl.setText(f"Filter error: {err}"); return
+            rows=self.cdb.search("",5000,0,self._evidence_filter())
+            filtered=[r for r in rows if df.matches(dict(zip(col_keys,r)))]
+            page=filtered[self._offset:self._offset+500]
+        else:
+            rows=self.cdb.search(query,500,self._offset,self._evidence_filter())
+            page=rows; filtered=rows
+        self._set_cols(cols)
+        self.table.setRowCount(len(page))
+        for i,r in enumerate(page):
             for j,v in enumerate(r[:26]):
                 if j in (19,20): v=_fmt_bytes(v)
                 self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
-        self.count_lbl.setText(f"{len(rows)} results"); self.total_lbl.setText(f"Total: {self.cdb.count()}")
+        self.count_lbl.setText(f"{len(filtered)} results"); self.total_lbl.setText(f"Total: {self.cdb.count()}")
     def _load_sessions(self):
-        rows=self.cdb.search_sessions(self.search.text().strip(),500,self._offset,self._evidence_filter())
+        query=self.search.text().strip()
+        sess_keys=["first_seen","last_seen","duration","active","proto","la","lp","ra","rp","host","proc","pid","svc","parent","package","signer","samples","bytes_sent","bytes_recv","stat","event_source","event_id","rule_name","filter_id"]
+        if self._is_display_filter(query):
+            df,err=DisplayFilter.try_parse(query)
+            if err:
+                self.count_lbl.setText(f"Filter error: {err}"); return
+            rows=self.cdb.search_sessions("",5000,0,self._evidence_filter())
+            filtered=[r for r in rows if df.matches(dict(zip(sess_keys,r)))]
+            page=filtered[self._offset:self._offset+500]
+        else:
+            rows=self.cdb.search_sessions(query,500,self._offset,self._evidence_filter())
+            page=rows; filtered=rows
         self._set_cols(["First","Last","Duration","Active","Proto","Local","L.Port","Remote","R.Port","Host","Process","PID","Service","Parent","Package","Signer","Samples","Sent","Recv","Status","Evidence","Event","Rule","Filter"])
-        self.table.setRowCount(len(rows))
-        for i,r in enumerate(rows):
+        self.table.setRowCount(len(page))
+        for i,r in enumerate(page):
             vals=list(r[:24]); vals[2]=_fmt_duration(vals[2]); vals[3]="ON" if vals[3] else "OFF"; vals[17]=_fmt_bytes(vals[17]); vals[18]=_fmt_bytes(vals[18])
             for j,v in enumerate(vals): self.table.setItem(i,j,QTableWidgetItem(str(v) if v else ""))
         self.page_lbl.setText(f"Page {self._offset//500+1}")
-        self.count_lbl.setText(f"{len(rows)} sessions"); self.total_lbl.setText(f"Sessions: {self.cdb.get_stats().get('sessions',0)}")
+        self.count_lbl.setText(f"{len(filtered)} sessions"); self.total_lbl.setText(f"Sessions: {self.cdb.get_stats().get('sessions',0)}")
     def _export_filtered(self,fmt):
         ext="json" if fmt=="json" else "csv"
         path,_=QFileDialog.getSaveFileName(self,f"Export History ({ext.upper()})",os.path.join(REPORT_DIR,f"pywall-history-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"),f"{ext.upper()} files (*.{ext})")

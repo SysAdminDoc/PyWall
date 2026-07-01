@@ -92,6 +92,10 @@ BASE_NAMES = {
     "signer_trust_state",
     "signer_family",
     "group_connections_by_signer",
+    "DISPLAY_FILTER_FIELDS",
+    "DISPLAY_FILTER_OPS",
+    "DisplayFilterError",
+    "DisplayFilter",
     "_REDACT_KEYS",
     "_redact_config",
     "_timestamped_fw_export_path",
@@ -859,6 +863,43 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertIn("edge.exe", ms_group["procs"])
         unsigned_group = next(g for g in groups if g["signer"] == "(unsigned)")
         self.assertEqual(unsigned_group["trust"], "unsigned")
+
+    def test_display_filter_contains_and_equals(self):
+        ns = load_runtime("DisplayFilter")
+        df = ns["DisplayFilter"]('proc contains "chrome" and rp == "443"')
+        self.assertTrue(df.matches({"proc": "chrome.exe", "rp": "443"}))
+        self.assertFalse(df.matches({"proc": "chrome.exe", "rp": "80"}))
+        self.assertFalse(df.matches({"proc": "firefox.exe", "rp": "443"}))
+
+    def test_display_filter_in_operator(self):
+        ns = load_runtime("DisplayFilter")
+        df = ns["DisplayFilter"]('rp in ("443","80","8080")')
+        self.assertTrue(df.matches({"rp": "443"}))
+        self.assertTrue(df.matches({"rp": "80"}))
+        self.assertFalse(df.matches({"rp": "22"}))
+
+    def test_display_filter_numeric_comparison(self):
+        ns = load_runtime("DisplayFilter")
+        df = ns["DisplayFilter"]("bytes_sent >= 1000")
+        self.assertTrue(df.matches({"bytes_sent": "5000"}))
+        self.assertFalse(df.matches({"bytes_sent": "100"}))
+
+    def test_display_filter_not_equals(self):
+        ns = load_runtime("DisplayFilter")
+        df = ns["DisplayFilter"]('stat != "-"')
+        self.assertTrue(df.matches({"stat": "FW:BLOCKED"}))
+        self.assertFalse(df.matches({"stat": "-"}))
+
+    def test_display_filter_invalid_field(self):
+        ns = load_runtime("DisplayFilter")
+        df, err = ns["DisplayFilter"].try_parse("bogusfield contains test")
+        self.assertIsNone(df)
+        self.assertIn("Unknown field", err)
+
+    def test_display_filter_empty_matches_all(self):
+        ns = load_runtime("DisplayFilter")
+        df = ns["DisplayFilter"]("")
+        self.assertTrue(df.matches({"proc": "anything"}))
 
     def test_redact_config_strips_secrets(self):
         ns = load_runtime("_redact_config")
