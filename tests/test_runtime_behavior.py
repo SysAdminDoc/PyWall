@@ -84,6 +84,9 @@ BASE_NAMES = {
     "CONN_EXPORT_COLUMNS",
     "_conn_db_migrate",
     "_hosts_db_migrate",
+    "SEVERITY_LEVELS",
+    "NotifDigestEntry",
+    "NotificationController",
 }
 
 class FakeSignal:
@@ -775,6 +778,41 @@ class RuntimeBehaviorTests(unittest.TestCase):
             ver = db.conn.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(ver, ns["HOSTS_DB_VERSION"])
             db.conn.close()
+
+    def test_notification_controller_severity_filter(self):
+        ns = load_runtime("NotificationController")
+        ctrl = ns["NotificationController"]({"notif_severity_threshold": "medium", "notif_snooze_minutes": 1})
+        ctrl._launch_time = time.time() - 60
+        self.assertFalse(ctrl.should_notify("k1", severity="low", title="t", message="m"))
+        self.assertTrue(ctrl.should_notify("k2", severity="medium", title="t", message="m"))
+        self.assertTrue(ctrl.should_notify("k3", severity="high", title="t", message="m"))
+
+    def test_notification_controller_snooze(self):
+        ns = load_runtime("NotificationController")
+        ctrl = ns["NotificationController"]({"notif_severity_threshold": "low", "notif_snooze_minutes": 1})
+        ctrl._launch_time = time.time() - 60
+        self.assertTrue(ctrl.should_notify("k1", severity="low", title="t", message="m"))
+        self.assertFalse(ctrl.should_notify("k1", severity="low", title="t", message="m"))
+        ctrl.snooze("k2", minutes=100)
+        self.assertFalse(ctrl.should_notify("k2", severity="high", title="t", message="m"))
+
+    def test_notification_controller_digest(self):
+        ns = load_runtime("NotificationController")
+        ctrl = ns["NotificationController"]({"notif_severity_threshold": "high", "notif_digest_enabled": True, "notif_digest_interval_minutes": 1})
+        ctrl._launch_time = time.time() - 120
+        ctrl._last_digest_time = time.time() - 120
+        ctrl.should_notify("k1", severity="low", title="Low Alert", message="low msg")
+        ctrl.should_notify("k2", severity="medium", title="Med Alert", message="med msg")
+        self.assertEqual(ctrl.pending_digest_count(), 2)
+        items = ctrl.drain_digest()
+        self.assertEqual(len(items), 2)
+        self.assertEqual(ctrl.pending_digest_count(), 0)
+
+    def test_notification_controller_warmup_blocks_all(self):
+        ns = load_runtime("NotificationController")
+        ctrl = ns["NotificationController"]({"notif_severity_threshold": "low"})
+        ctrl._launch_time = time.time()
+        self.assertFalse(ctrl.should_notify("k1", severity="high", title="t", message="m"))
 
 
 if __name__ == "__main__":

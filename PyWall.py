@@ -220,6 +220,10 @@ CONFIG_DEFAULTS = {
     "detect_portscan": True,
     "detect_bruteforce": True,
     "vt_api_key": "",
+    "notif_severity_threshold": "low",
+    "notif_snooze_minutes": 5,
+    "notif_digest_enabled": False,
+    "notif_digest_interval_minutes": 15,
 }
 
 @dataclass
@@ -264,7 +268,9 @@ def _coerce_config_value(key, value):
         raise ValueError("must be ipwhois, maxmind, or disabled")
     if key == "geoip_https_endpoint" and text and not text.lower().startswith("https://"):
         raise ValueError("must start with https://")
-    return text.lower() if key in ("doh_action","geoip_provider") else text
+    if key == "notif_severity_threshold" and text.lower() not in ("low","medium","high"):
+        raise ValueError("must be low, medium, or high")
+    return text.lower() if key in ("doh_action","geoip_provider","notif_severity_threshold") else text
 
 def _validate_runtime_config(raw):
     warnings=[]; out=dict(CONFIG_DEFAULTS)
@@ -352,6 +358,71 @@ def _a11y(widget, name, desc="", tooltip=None):
         try: widget.setToolTip(_tr(tooltip))
         except: pass
     return widget
+
+# ─── Notification Fatigue Controller ─────────────────────────────────────────
+SEVERITY_LEVELS = {"low": 0, "medium": 1, "high": 2}
+
+@dataclass
+class NotifDigestEntry:
+    key:str
+    severity:str
+    title:str
+    message:str
+    ts:float
+
+class NotificationController:
+    def __init__(self, config=None):
+        self._lock = Lock()
+        self._cooldowns = {}
+        self._snoozed = {}
+        self._digest = []
+        self._launch_time = time.time()
+        self._last_digest_time = time.time()
+        self.reload_config(config or {})
+
+    def reload_config(self, config):
+        self._threshold = SEVERITY_LEVELS.get(str(config.get("notif_severity_threshold", "low")).lower(), 0)
+        self._snooze_sec = max(60, int(config.get("notif_snooze_minutes", 5) or 5) * 60)
+        self._digest_enabled = bool(config.get("notif_digest_enabled", False))
+        self._digest_interval = max(60, int(config.get("notif_digest_interval_minutes", 15) or 15) * 60)
+        self._warmup_sec = 15
+
+    def should_notify(self, key, severity="low", title="", message=""):
+        level = SEVERITY_LEVELS.get(severity, 0)
+        now = time.time()
+        with self._lock:
+            if now - self._launch_time < self._warmup_sec:
+                return False
+            if key in self._snoozed and now < self._snoozed[key]:
+                return False
+            if level < self._threshold:
+                if self._digest_enabled:
+                    self._digest.append(NotifDigestEntry(key=key, severity=severity, title=title, message=message, ts=now))
+                return False
+            if key in self._cooldowns and now - self._cooldowns[key] < self._snooze_sec:
+                if self._digest_enabled:
+                    self._digest.append(NotifDigestEntry(key=key, severity=severity, title=title, message=message, ts=now))
+                return False
+            self._cooldowns[key] = now
+            return True
+
+    def snooze(self, key, minutes=None):
+        with self._lock:
+            self._snoozed[key] = time.time() + (minutes or self._snooze_sec // 60) * 60
+
+    def drain_digest(self):
+        now = time.time()
+        with self._lock:
+            if now - self._last_digest_time < self._digest_interval:
+                return []
+            self._last_digest_time = now
+            items = list(self._digest)
+            self._digest.clear()
+            return items
+
+    def pending_digest_count(self):
+        with self._lock:
+            return len(self._digest)
 
 @dataclass
 class PluginManifest:
@@ -4755,9 +4826,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(_dp(1300),_dp(800)); self.resize(_dp(1520),_dp(920))
         self._monitoring=False; self._conn_monitoring=False
-        self._launch_time=time.time()  # For notification warmup
-        self._notif_cooldown={}  # Rate-limit: domain -> last_notify_time
         self._config_result=load_runtime_config()
+        self._notif=NotificationController(self._config_result.data)
 
         # Core objects
         self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI")
@@ -4772,6 +4842,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_tray()
+        self._digest_timer=QTimer(self); self._digest_timer.timeout.connect(self._flush_digest); self._digest_timer.start(60000)
         self._geo_w.status_changed.connect(lambda msg:self._sbar_msg.setText(msg))
         self._tls_w.status_changed.connect(lambda msg:self._sbar_msg.setText(msg))
         self._tls_w.feed_updated.connect(self._feed.refresh)
@@ -4905,14 +4976,10 @@ class MainWindow(QMainWindow):
     def _on_blocked(self,ev):
         self.db.log_event(ev.get('domain',''),'blocked',ev.get('process',''),'Blocked by hosts file')
         self._diag.on_blocked(ev)
-        # Suppress tray notifications during warmup (first 15s) and rate-limit per domain (60s cooldown)
         if not (hasattr(self,'_tray') and self._tray): return
-        if time.time() - self._launch_time < 15: return
         domain = ev.get('domain','')
-        now = time.time()
-        if domain in self._notif_cooldown and now - self._notif_cooldown[domain] < 60: return
-        self._notif_cooldown[domain] = now
-        self._tray.showMessage(APP_NAME, f"Blocked: {domain}", QSystemTrayIcon.Warning, 2000)
+        if self._notif.should_notify(f"block:{domain}", severity="low", title="Blocked", message=domain):
+            self._tray.showMessage(APP_NAME, f"Blocked: {domain}", QSystemTrayIcon.Warning, 2000)
 
     # ── Connection Monitor ──
     def _start_conn_monitor(self):
@@ -4962,41 +5029,45 @@ class MainWindow(QMainWindow):
         self._update_status(f"Quota blocked {ev.app}" if ev.blocked else f"Quota hit {ev.app}")
         if not (hasattr(self,'_tray') and self._tray): return
         key=f"quota:{ev.period}:{ev.key}"
-        now=time.time()
-        if key in self._notif_cooldown and now-self._notif_cooldown[key]<300: return
-        self._notif_cooldown[key]=now
         title="Bandwidth quota blocked" if ev.blocked else "Bandwidth quota exceeded"
-        self._tray.showMessage(APP_NAME, f"{title}: {ev.app} {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}", QSystemTrayIcon.Warning, 4000)
+        msg=f"{title}: {ev.app} {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}"
+        if self._notif.should_notify(key, severity="medium", title=title, message=msg):
+            self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
 
     def _on_doh_event(self,ev):
         self._update_status(f"DoH blocked {ev.endpoint}" if ev.blocked else f"DoH warning {ev.endpoint}")
         if not (hasattr(self,'_tray') and self._tray): return
         key=f"doh:{ev.endpoint}:{ev.app}"
-        now=time.time()
-        if key in self._notif_cooldown and now-self._notif_cooldown[key]<300: return
-        self._notif_cooldown[key]=now
         title="DoH endpoint blocked" if ev.blocked else "DoH endpoint detected"
-        self._tray.showMessage(APP_NAME, f"{title}: {ev.app} -> {ev.endpoint}", QSystemTrayIcon.Warning, 4000)
+        msg=f"{title}: {ev.app} -> {ev.endpoint}"
+        if self._notif.should_notify(key, severity="medium", title=title, message=msg):
+            self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
 
     def _on_ids_hit(self,hit):
         self._update_status(f"IDS {hit.get('rule','rule')}")
         if not (hasattr(self,'_tray') and self._tray): return
         key=f"ids:{hit.get('rule')}:{hit.get('endpoint')}:{hit.get('app')}"
-        now=time.time()
-        if key in self._notif_cooldown and now-self._notif_cooldown[key]<300: return
-        self._notif_cooldown[key]=now
         title="IDS rule blocked" if hit.get("blocked") else "IDS rule matched"
-        self._tray.showMessage(APP_NAME, f"{title}: {hit.get('rule')} {hit.get('app')} -> {hit.get('endpoint')}", QSystemTrayIcon.Warning, 4000)
+        msg=f"{title}: {hit.get('rule')} {hit.get('app')} -> {hit.get('endpoint')}"
+        if self._notif.should_notify(key, severity="high", title=title, message=msg):
+            self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
 
     def _on_fw_block(self,ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra,'fw_blocked',ci.proc,f'FW blocked: {ci.ra}:{ci.rp}')
         if not (hasattr(self,'_tray') and self._tray): return
-        if time.time() - self._launch_time < 15: return
-        key = f"fw:{ci.ra}"
-        now = time.time()
-        if key in self._notif_cooldown and now - self._notif_cooldown[key] < 60: return
-        self._notif_cooldown[key] = now
-        self._tray.showMessage(APP_NAME, f"FW Blocked: {ci.proc} \u2192 {ci.ra}", QSystemTrayIcon.Warning, 2000)
+        key=f"fw:{ci.ra}"
+        msg=f"FW Blocked: {ci.proc} \u2192 {ci.ra}"
+        if self._notif.should_notify(key, severity="low", title="FW Blocked", message=msg):
+            self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 2000)
+
+    def _flush_digest(self):
+        items=self._notif.drain_digest()
+        if not items or not (hasattr(self,'_tray') and self._tray): return
+        summary=f"{len(items)} suppressed alert{'s' if len(items)!=1 else ''}"
+        by_type=defaultdict(int)
+        for e in items: by_type[e.severity]+=1
+        parts=[f"{n} {s}" for s,n in sorted(by_type.items(),key=lambda x:-x[1])]
+        self._tray.showMessage(APP_NAME,f"Digest: {summary} ({', '.join(parts)})",QSystemTrayIcon.Information,5000)
 
     def _update_status(self,msg):
         active=self._monitoring or self._conn_monitoring
