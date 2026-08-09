@@ -102,6 +102,10 @@ BASE_NAMES = {
     "_export_firewall_config",
     "_import_firewall_config",
     "create_forensic_bundle",
+    "RuleScheduler",
+    "RULE_SCHEDULES_PATH",
+    "SCHEDULE_DAYS",
+    "_SCHEDULE_DAY_INDEX",
 }
 
 class FakeSignal:
@@ -206,6 +210,7 @@ def load_runtime(*names):
         "SERVICE_LOG_PATH": os.path.join(tempfile.gettempdir(), "pywall-service.log"),
         "REPORT_DIR": os.path.join(tempfile.gettempdir(), "pywall-reports"),
         "QUOTA_STATE_PATH": os.path.join(tempfile.gettempdir(), "quota_state.json"),
+        "RULE_SCHEDULES_PATH": os.path.join(tempfile.gettempdir(), "rule_schedules.json"),
         "WINDOWS_HEADER": ["# hosts"],
         "_fmt_bytes": lambda n: f"{int(n or 0)} B",
         "_nt_to_dos": lambda p: p,
@@ -225,6 +230,54 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_rule_scheduler_cross_midnight_persists_and_applies(self):
+        ns = load_runtime("RuleScheduler")
+
+        class FakeFirewall:
+            def __init__(self):
+                self.rules = [ns["FWRule"](name="PW_Scheduled", enabled=True)]
+                self.calls = []
+
+            def get_all_rules(self, force_refresh=False):
+                return list(self.rules)
+
+            def enable_rule(self, name, enabled=True):
+                self.calls.append((name, enabled))
+                for rule in self.rules:
+                    if rule.name == name:
+                        rule.enabled = enabled
+                return True
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "schedules.json")
+            firewall = FakeFirewall()
+            scheduler = ns["RuleScheduler"](firewall, path=path)
+            item = scheduler.add(
+                "PW_Scheduled", ["Mon"], "22:00", "02:00",
+                active_enabled=False, outside_enabled=True,
+            )
+            self.assertEqual(item["days"], ["Mon"])
+            self.assertTrue(os.path.exists(path))
+
+            monday_late = datetime.datetime(2026, 8, 10, 23, 0)
+            result = scheduler.apply(monday_late)
+            self.assertEqual(result[0]["enabled"], False)
+            self.assertEqual(firewall.calls, [("PW_Scheduled", False)])
+
+            tuesday_early = datetime.datetime(2026, 8, 11, 1, 0)
+            self.assertTrue(scheduler.active(item["id"], tuesday_early))
+            self.assertEqual(scheduler.apply(tuesday_early), [])
+
+            tuesday_after = datetime.datetime(2026, 8, 11, 3, 0)
+            result = scheduler.apply(tuesday_after)
+            self.assertEqual(result[0]["enabled"], True)
+            self.assertEqual(firewall.calls[-1], ("PW_Scheduled", True))
+
+            reloaded = ns["RuleScheduler"](firewall, path=path)
+            self.assertEqual(reloaded.list()[0]["rule_name"], "PW_Scheduled")
+            with self.assertRaises(ValueError):
+                reloaded.add("PW_Scheduled", ["Mon"], "25:00", "02:00")
+
     def test_firewall_engine_uses_mocked_powershell_and_rejects_bad_values(self):
         ns = load_runtime("FirewallEngine")
         calls = []

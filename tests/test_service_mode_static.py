@@ -191,7 +191,6 @@ class ServiceModeStaticTests(unittest.TestCase):
     def test_readme_does_not_advertise_missing_components(self):
         stale_claims = (
             "PluginManager",
-            "RuleScheduler",
             "NetworkProfileManager",
             "AnomalyDetector",
             "ReputationScorer",
@@ -203,6 +202,18 @@ class ServiceModeStaticTests(unittest.TestCase):
         )
         for claim in stale_claims:
             self.assertNotIn(claim, README_TEXT)
+
+    def test_rule_scheduling_is_wired(self):
+        for token in (
+            "RULE_SCHEDULES_PATH",
+            "class RuleScheduler",
+            "def is_active",
+            "def apply(self, moment=None)",
+            "class RuleScheduleDialog",
+            "Schedule...",
+            "self._apply_schedules(force=True)",
+        ):
+            self.assertIn(token, TEXT)
 
     def test_runtime_dependencies_are_pinned_and_not_auto_installed(self):
         requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")

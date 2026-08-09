@@ -2,6 +2,11 @@
 
 All notable changes to PyWall will be documented in this file.
 
+## Unreleased
+
+- Added: Persistent per-rule local-time schedules with cross-midnight support, shared by the firewall tab and headless service mode.
+- Added: Firewall Rules UI for creating, toggling, removing, and applying scheduled enable/disable windows.
+
 ## [v4.2.0] - 2026-06-30
 
 - Added: SQLite schema migrations using `PRAGMA user_version` for `ConnDB` (v2) and `HostsDB` (v1), replacing inline column checks.

@@ -185,6 +185,7 @@ IPC_PIPE_NAME = r"\\.\pipe\PyWallService"
 IPC_TOKEN_PATH = os.path.join(SERVICE_STATE_DIR, "service.token")
 SERVICE_STATE_PATH = os.path.join(SERVICE_STATE_DIR, "service_state.json")
 QUOTA_STATE_PATH = os.path.join(CONFIG_DIR, "quota_state.json")
+RULE_SCHEDULES_PATH = os.path.join(CONFIG_DIR, "rule_schedules.json")
 GEOIP_HTTPS_ENDPOINT = "https://ipwho.is/{ip}"
 CONFIG_SCHEMA_VERSION = 1
 CONFIG_DEFAULTS = {
@@ -1947,7 +1948,208 @@ class FirewallEngine:
     def kill_connection(self,pid):
         try: psutil.Process(pid).terminate(); return True
         except: return False
+
+SCHEDULE_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_SCHEDULE_DAY_INDEX = {day: index for index, day in enumerate(SCHEDULE_DAYS)}
+
+class RuleScheduler:
+    """Persist and enforce local-time enable/disable windows for firewall rules."""
+    def __init__(self, firewall, path=RULE_SCHEDULES_PATH, clock=None):
+        self.firewall = firewall
+        self.path = path
+        self.clock = clock or datetime.datetime.now
+        self._lock = Lock()
+        self._schedules = []
+        self._load()
+
+    @staticmethod
+    def _time_minutes(value):
+        text = str(value or "").strip()
+        if not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", text):
+            raise ValueError(f"Invalid schedule time: {value}")
+        hour, minute = (int(part) for part in text.split(":", 1))
+        return hour * 60 + minute
+
+    @classmethod
+    def _days(cls, values):
+        if isinstance(values, str):
+            values = re.split(r"[, ]+", values.strip())
+        if not isinstance(values, (list, tuple, set)):
+            raise ValueError("Schedule days must be a list")
+        result = []
+        for value in values:
+            text = str(value or "").strip().title()[:3]
+            if text not in _SCHEDULE_DAY_INDEX:
+                raise ValueError(f"Invalid schedule day: {value}")
+            if text not in result:
+                result.append(text)
+        result.sort(key=lambda day: _SCHEDULE_DAY_INDEX[day])
+        if not result:
+            raise ValueError("Schedule needs at least one day")
+        return result
+
+    @classmethod
+    def _normalize(cls, raw, schedule_id=None):
+        if not isinstance(raw, dict):
+            raise ValueError("Schedule must be an object")
+        rule_name = str(raw.get("rule_name") or raw.get("rule") or "").strip()
+        if not rule_name or len(rule_name) > 256 or any(ord(ch) < 32 for ch in rule_name):
+            raise ValueError("Schedule rule name is invalid")
+        start = str(raw.get("start") or "").strip()
+        end = str(raw.get("end") or "").strip()
+        cls._time_minutes(start)
+        cls._time_minutes(end)
+        days = cls._days(raw.get("days", []))
+        active_enabled = bool(raw.get("active_enabled", raw.get("enabled_state", True)))
+        outside_value = raw.get("outside_enabled")
+        outside_enabled = (not active_enabled) if outside_value is None else bool(outside_value)
+        return {
+            "id": str(schedule_id or raw.get("id") or secrets.token_hex(8)),
+            "rule_name": rule_name,
+            "days": days,
+            "start": start,
+            "end": end,
+            "active_enabled": active_enabled,
+            "outside_enabled": outside_enabled,
+            "enabled": bool(raw.get("enabled", True)),
+        }
+
+    def _load(self):
+        try:
+            if not os.path.exists(self.path):
+                return
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            entries = raw.get("schedules", []) if isinstance(raw, dict) else raw
+            if not isinstance(entries, list):
+                raise ValueError("schedule file must contain a list")
+            loaded = []
+            for item in entries:
+                try:
+                    loaded.append(self._normalize(item))
+                except ValueError as e:
+                    log.warning(f"Ignoring invalid rule schedule: {e}")
+            with self._lock:
+                self._schedules = loaded
+        except Exception as e:
+            log.warning(f"Rule schedule load failed: {e}")
+
+    def _save(self):
+        with self._lock:
+            payload = {"version": 1, "schedules": [dict(item) for item in self._schedules]}
+        try:
+            _write_json_atomic(os.path.abspath(self.path), payload)
+            return True, ""
+        except Exception as e:
+            log.warning(f"Rule schedule save failed: {e}")
+            return False, str(e)
+
+    def list(self):
+        with self._lock:
+            return [dict(item, days=list(item.get("days", []))) for item in self._schedules]
+
+    def add(self, rule_name, days, start, end, active_enabled=True, outside_enabled=None, enabled=True):
+        item = self._normalize({
+            "rule_name": rule_name,
+            "days": days,
+            "start": start,
+            "end": end,
+            "active_enabled": active_enabled,
+            "outside_enabled": outside_enabled,
+            "enabled": enabled,
+        })
+        with self._lock:
+            self._schedules.append(item)
+        ok, error = self._save()
+        if not ok:
+            with self._lock:
+                self._schedules = [entry for entry in self._schedules if entry.get("id") != item["id"]]
+            raise OSError(error)
+        return dict(item, days=list(item["days"]))
+
+    def update(self, schedule_id, **changes):
+        with self._lock:
+            current = next((dict(item) for item in self._schedules if item.get("id") == str(schedule_id)), None)
+        if current is None:
+            raise KeyError(schedule_id)
+        current.update(changes)
+        updated = self._normalize(current, schedule_id=current["id"])
+        with self._lock:
+            index = next(index for index, item in enumerate(self._schedules) if item.get("id") == updated["id"])
+            self._schedules[index] = updated
+        ok, error = self._save()
+        if not ok:
+            raise OSError(error)
+        return dict(updated, days=list(updated["days"]))
+
+    def remove(self, schedule_id):
+        wanted = str(schedule_id)
+        with self._lock:
+            before = len(self._schedules)
+            self._schedules = [item for item in self._schedules if item.get("id") != wanted]
+            removed = len(self._schedules) != before
+        if removed:
+            self._save()
+        return removed
+
+    def set_enabled(self, schedule_id, enabled):
+        return self.update(schedule_id, enabled=bool(enabled))
+
+    @classmethod
+    def is_active(cls, schedule, moment):
+        days = set(cls._days(schedule.get("days", [])))
+        current_day = SCHEDULE_DAYS[moment.weekday()]
+        minute = moment.hour * 60 + moment.minute
+        start = cls._time_minutes(schedule.get("start"))
+        end = cls._time_minutes(schedule.get("end"))
+        if start == end:
+            return current_day in days
+        if start < end:
+            return current_day in days and start <= minute < end
+        previous_day = SCHEDULE_DAYS[(moment.weekday() - 1) % len(SCHEDULE_DAYS)]
+        return (current_day in days and minute >= start) or (previous_day in days and minute < end)
+
+    def active(self, schedule_id, moment=None):
+        moment = moment or self.clock()
+        with self._lock:
+            item = next((dict(entry) for entry in self._schedules if entry.get("id") == str(schedule_id)), None)
+        return bool(item and item.get("enabled") and self.is_active(item, moment))
+
+    def apply(self, moment=None):
+        moment = moment or self.clock()
+        with self._lock:
+            entries = [dict(item) for item in self._schedules if item.get("enabled")]
+        if not entries:
+            return []
+        grouped = {}
+        for item in entries:
+            grouped.setdefault(item["rule_name"], []).append(item)
+        try:
+            rules = self.firewall.get_all_rules(force_refresh=True)
+        except TypeError:
+            rules = self.firewall.get_all_rules()
+        current = {rule.name: rule for rule in (rules or [])}
+        results = []
+        for rule_name, schedules in grouped.items():
+            if rule_name not in current:
+                continue
+            target = schedules[-1]["outside_enabled"]
+            for schedule in schedules:
+                if self.is_active(schedule, moment):
+                    target = schedule["active_enabled"]
+            rule = current[rule_name]
+            if bool(rule.enabled) == bool(target):
+                continue
+            ok = self.firewall.enable_rule(rule_name, bool(target))
+            results.append({"id": schedules[-1].get("id", ""), "rule_name": rule_name, "enabled": bool(target), "ok": bool(ok)})
+        return results
+
+    def snapshot(self, moment=None):
+        moment = moment or self.clock()
+        return [dict(item, active=self.active(item["id"], moment)) for item in self.list()]
+
 fw = FirewallEngine()
+rule_scheduler = RuleScheduler(fw)
 
 # ─── Hosts File Manager ─────────────────────────────────────────────────────
 class HostsFileManager:
@@ -3382,12 +3584,14 @@ class HeadlessMonitor(QObject):
         self._last_config_warnings = []
         self._last_config_recovered = False
         self._last_config_backup_path = ""
+        self._last_schedule_apply = 0
 
     def start(self):
         _service_log(f"Headless monitor starting; auto_block={self.auto_block}")
         if self._restored_state:
             _service_log(f"Restored prior service state: saved_at={self._restored_state.get('saved_at','?')}, clean_shutdown={self._restored_state.get('clean_shutdown')}")
         self._reload_config_if_changed(force=True)
+        self._apply_schedules(force=True)
         plugins = self._plugins.scan()
         _service_log(f"Plugin guardrails scanned: {plugins.summary()}")
         self._save_service_state(clean_shutdown=False)
@@ -3476,6 +3680,7 @@ class HeadlessMonitor(QObject):
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
             "firewall_tamper": fw.tamper_summary(),
+            "rule_schedules": self._schedule_snapshot(),
             "identity_fields": ["service", "parent_process", "uwp_package", "signer_trust"],
             "signer": self._sign_w.snapshot(),
             "state_path": SERVICE_STATE_PATH,
@@ -3548,8 +3753,34 @@ class HeadlessMonitor(QObject):
     def _on_event_connections(self, evts):
         if evts: self.conn_db.insert_batch(evts)
 
+    def _schedule_snapshot(self):
+        scheduler = globals().get("rule_scheduler")
+        if scheduler is None:
+            return {"total": 0, "active": 0}
+        entries = scheduler.snapshot()
+        return {"total": len(entries), "active": sum(1 for entry in entries if entry.get("active"))}
+
+    def _apply_schedules(self, force=False):
+        now = time.time()
+        if not force and now - self._last_schedule_apply < 30:
+            return []
+        self._last_schedule_apply = now
+        scheduler = globals().get("rule_scheduler")
+        if scheduler is None:
+            return []
+        try:
+            results = scheduler.apply()
+            for result in results:
+                if result.get("ok"):
+                    _service_log(f"Scheduled firewall rule {result['rule_name']} -> {'enabled' if result['enabled'] else 'disabled'}")
+            return results
+        except Exception as e:
+            _service_log(f"Rule schedule apply failed: {e}", "WARNING")
+            return []
+
     def _tick(self):
         self._reload_config_if_changed()
+        self._apply_schedules()
         self._enforce_threats()
         now = time.time()
         if now - self._last_summary >= 60:
@@ -4433,6 +4664,8 @@ class FirewallRuleTableModel(QAbstractTableModel):
 class FirewallTab(QWidget):
     def __init__(self):
         super().__init__(); self._rules=[]; self._worker=None; self._ready=False; self._build(); self._ready=True
+        self._schedule_timer=QTimer(self); self._schedule_timer.timeout.connect(self._apply_schedules); self._schedule_timer.start(30000)
+        QTimer.singleShot(0,self._apply_schedules)
     def _build(self):
         lo=QVBoxLayout(self); lo.setContentsMargins(12,12,12,12); lo.setSpacing(8)
         hdr=QLabel("Windows Firewall Rules"); hdr.setStyleSheet(f"font-size:14px;font-weight:800;color:{C['blue']};")
@@ -4448,6 +4681,7 @@ class FirewallTab(QWidget):
         tb.addStretch()
         tb.addWidget(_make_toolbar_btn("+ New Rule","primary",self._new_rule))
         tb.addWidget(_make_toolbar_btn("Refresh","dim",self._do_search))
+        tb.addWidget(_make_toolbar_btn("Schedules","primary",self._open_schedules))
         tb.addWidget(_make_toolbar_btn("Restore Drift","warning",self._restore_tamper))
         tb.addWidget(_make_toolbar_btn("Accept Drift","dim",self._accept_tamper))
         self.del_all_btn=_make_toolbar_btn("Delete All HG","danger",self._delete_all_hg); tb.addWidget(self.del_all_btn)
@@ -4498,6 +4732,7 @@ class FirewallTab(QWidget):
         is_on=bool(rule.enabled)
         menu=QMenu(self); menu.setStyleSheet(_CTX_STYLE)
         menu.addAction("Disable" if is_on else "Enable").triggered.connect(lambda:self._toggle_rule(name,not is_on))
+        menu.addAction("Schedule...").triggered.connect(lambda:self._open_schedules(name))
         menu.addAction("Delete Rule").triggered.connect(lambda:self._delete_rule(name))
         menu.addAction("Copy Name").triggered.connect(lambda:QApplication.clipboard().setText(name))
         menu.exec_(self.table.viewport().mapToGlobal(pos))
@@ -4522,6 +4757,20 @@ class FirewallTab(QWidget):
     def _accept_tamper(self):
         ok,out=fw.accept_current_rules()
         self.slbl.setText(out if ok else f"Accept failed: {out}")
+        self._do_search()
+    def _apply_schedules(self):
+        try:
+            results=rule_scheduler.apply()
+            if results:
+                changed=sum(1 for result in results if result.get("ok"))
+                self.slbl.setText(f"Applied {changed} scheduled firewall change(s)")
+                self._do_search()
+        except Exception as e:
+            self.slbl.setText(f"Schedule error: {e}")
+    def _open_schedules(self,rule_name=""):
+        dlg=RuleScheduleDialog(self,rule_name=rule_name,available_rules=self._rules)
+        dlg.exec_()
+        self._apply_schedules()
         self._do_search()
     def _new_rule(self):
         dlg=NewRuleDialog(self)
@@ -4559,6 +4808,81 @@ class NewRuleDialog(QDialog):
             protocol=proto_arg,program=self.prog_ed.text().strip(),
             desc=f"Created by PyWall at {datetime.datetime.now():%Y-%m-%d %H:%M}")
         if ok: self.accept()
+
+class RuleScheduleDialog(QDialog):
+    def __init__(self,parent=None,rule_name="",available_rules=None):
+        super().__init__(parent); self.setWindowTitle("Firewall Rule Schedules"); self.setMinimumWidth(760)
+        self.setStyleSheet(f"QDialog{{background:{C['base']};}}QLabel{{color:{C['text']};}}")
+        lo=QVBoxLayout(self); lo.setSpacing(8); lo.setContentsMargins(16,16,16,16)
+        intro=QLabel("Enable or disable a managed rule during a local-time window. Cross-midnight windows are supported.")
+        intro.setWordWrap(True); intro.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(intro)
+        form=QGridLayout(); form.setHorizontalSpacing(8); form.setVerticalSpacing(6)
+        form.addWidget(QLabel("Rule:"),0,0); self.rule_cb=QComboBox(); self.rule_cb.setEditable(True); form.addWidget(self.rule_cb,0,1,1,5)
+        form.addWidget(QLabel("Days:"),1,0)
+        self.day_checks=[]; day_box=QHBoxLayout(); day_box.setSpacing(4)
+        for day in SCHEDULE_DAYS:
+            cb=QCheckBox(day); cb.setChecked(day in ("Mon","Tue","Wed","Thu","Fri")); self.day_checks.append(cb); day_box.addWidget(cb)
+        form.addLayout(day_box,1,1,1,5)
+        form.addWidget(QLabel("Start:"),2,0); self.start_ed=QTimeEdit(QTime(8,0)); self.start_ed.setDisplayFormat("HH:mm"); form.addWidget(self.start_ed,2,1)
+        form.addWidget(QLabel("End:"),2,2); self.end_ed=QTimeEdit(QTime(18,0)); self.end_ed.setDisplayFormat("HH:mm"); form.addWidget(self.end_ed,2,3)
+        form.addWidget(QLabel("Behavior:"),2,4); self.action_cb=QComboBox(); self.action_cb.addItems(["Enable during window","Disable during window"]); form.addWidget(self.action_cb,2,5)
+        lo.addLayout(form)
+        add_row=QHBoxLayout(); add_row.addStretch(); add_row.addWidget(_make_toolbar_btn("Add Schedule","primary",self._add)); lo.addLayout(add_row)
+        self.table=QTableWidget(0,6); self.table.setHorizontalHeaderLabels(["Enabled","Rule","Days","Window","Behavior","ID"])
+        self.table.setColumnHidden(5,True); self.table.horizontalHeader().setSectionResizeMode(1,QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.verticalHeader().setVisible(False)
+        _a11y_table(self.table,"Firewall schedules table","Scheduled enable and disable windows for firewall rules")
+        lo.addWidget(self.table,1)
+        buttons=QHBoxLayout(); buttons.addWidget(_make_toolbar_btn("Enable / Disable","dim",self._toggle)); buttons.addWidget(_make_toolbar_btn("Remove","danger",self._remove)); buttons.addStretch()
+        close=QPushButton("Close"); close.clicked.connect(self.accept); buttons.addWidget(close); lo.addLayout(buttons)
+        self.status=QLabel(""); self.status.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(self.status)
+        entries=list(available_rules or [])
+        names=[rule.name for rule in entries if getattr(rule,"name","")]
+        names.extend(item["rule_name"] for item in rule_scheduler.list() if item["rule_name"] not in names)
+        self.rule_cb.addItems(names)
+        if rule_name:
+            self.rule_cb.setCurrentText(rule_name)
+        self._reload()
+    def _reload(self):
+        entries=rule_scheduler.list(); self.table.setRowCount(len(entries))
+        for row,item in enumerate(entries):
+            enabled=QTableWidgetItem("ON" if item.get("enabled") else "OFF")
+            enabled.setForeground(QColor(C['green'] if item.get("enabled") else C['red']))
+            self.table.setItem(row,0,enabled); self.table.setItem(row,1,QTableWidgetItem(item["rule_name"]))
+            self.table.setItem(row,2,QTableWidgetItem(", ".join(item["days"])))
+            self.table.setItem(row,3,QTableWidgetItem(f"{item['start']} - {item['end']}"))
+            behavior="Enable in window" if item.get("active_enabled") else "Disable in window"
+            self.table.setItem(row,4,QTableWidgetItem(behavior))
+            ident=QTableWidgetItem(item["id"]); ident.setData(Qt.UserRole,item["id"]); self.table.setItem(row,5,ident)
+    def _selected_id(self):
+        row=self.table.currentRow(); item=self.table.item(row,5) if row>=0 else None
+        return item.data(Qt.UserRole) if item else ""
+    def _add(self):
+        rule=self.rule_cb.currentText().strip(); days=[cb.text() for cb in self.day_checks if cb.isChecked()]
+        if not rule or not days:
+            self.status.setText("Choose a rule and at least one day")
+            return
+        active=self.action_cb.currentIndex()==0
+        try:
+            rule_scheduler.add(rule,days,self.start_ed.time().toString("HH:mm"),self.end_ed.time().toString("HH:mm"),active_enabled=active,outside_enabled=not active)
+            self.status.setText("Schedule added")
+            self._reload()
+        except Exception as e:
+            self.status.setText(f"Schedule error: {e}")
+    def _toggle(self):
+        ident=self._selected_id()
+        if not ident:
+            self.status.setText("Select a schedule first")
+            return
+        entry=next((item for item in rule_scheduler.list() if item.get("id")==ident),None)
+        if entry:
+            rule_scheduler.set_enabled(ident,not entry.get("enabled",True)); self._reload(); self.status.setText("Schedule state updated")
+    def _remove(self):
+        ident=self._selected_id()
+        if not ident:
+            self.status.setText("Select a schedule first")
+            return
+        if rule_scheduler.remove(ident): self._reload(); self.status.setText("Schedule removed")
 
 
 # ─── Log Tab ─────────────────────────────────────────────────────────────────

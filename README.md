@@ -57,6 +57,7 @@ Full management of **all** Windows Firewall rules (not just ones PyWall created)
 - Browse-to-Allow / Browse-to-Block shortcuts
 - Open file location for any rule's program
 - Rule editor with **auto-detected dropdowns** populated from live connections
+- Per-rule local-time schedules can enable or disable managed rules, including cross-midnight windows; the GUI and headless service share `rule_schedules.json`
 - Destructive firewall reset first writes a timestamped `.wfw` rollback export and exposes restore/import from the Tools tab
 - Managed `PW_` and legacy `HG_` rules are checked for external create/delete/enable/disable drift on refresh, logged with before/after snapshots, and can be restored or accepted from the firewall tab
 
@@ -262,6 +263,7 @@ service.token   ACL-restricted local named-pipe IPC token (%ProgramData%/PyWall 
 service_state.json  Last service heartbeat, clean-shutdown marker, and restored auto-block dedupe state
 quota_state.json  Persisted app quota counters and enforced-cap records
 fw_backups/    Timestamped `.wfw` rollback exports before firewall reset
+rule_schedules.json  Shared per-rule enable/disable windows used by GUI and service mode
 reports/       Daily and weekly CSV/HTML app usage reports
 ```
 
@@ -287,6 +289,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
 | `FirewallRuleTableModel` | QAbstractTableModel-backed firewall rule table for large rule sets |
+| `RuleScheduler` | Persistent local-time rule windows with cross-midnight enforcement in GUI and service mode |
 | `NotificationController` | Centralized tray notification gating with severity filter, snooze, warmup, and digest |
 | `DisplayFilter` | Wireshark-style field-based filter parser for history and live connection views |
 | `create_forensic_bundle` | Timestamped ZIP incident archive with history, config, logs, and firewall rules |
@@ -298,7 +301,6 @@ reports/       Daily and weekly CSV/HTML app usage reports
 
 Some areas that could use work:
 
-- **Rule scheduling** -- engine and UI for scheduled enable/disable windows
 - **Plugin system** -- execution hooks and plugin implementations on top of the existing manifest guardrails
 - **Localization** -- translation catalog files for `translations/` directory (i18n plumbing is in place)
 - **Unit tests** -- test coverage for FWManager and detection logic
