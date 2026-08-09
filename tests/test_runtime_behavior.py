@@ -122,6 +122,8 @@ BASE_NAMES = {
     "find_firewall_rules",
     "batch_connection_targets",
     "GeoIPFence",
+    "MaxMindDBUpdater",
+    "GEOIP_UPDATE_STATE_PATH",
     "ScheduledReportEmail",
     "ExternalNotifier",
 }
@@ -233,6 +235,7 @@ def load_runtime(*names):
         "QUOTA_STATE_PATH": os.path.join(tempfile.gettempdir(), "quota_state.json"),
         "RULE_SCHEDULES_PATH": os.path.join(tempfile.gettempdir(), "rule_schedules.json"),
         "REPORT_EMAIL_STATE_PATH": os.path.join(tempfile.gettempdir(), "report_email_state.json"),
+        "GEOIP_UPDATE_STATE_PATH": os.path.join(tempfile.gettempdir(), "geoip_update_state.json"),
         "WINDOWS_HEADER": ["# hosts"],
         "_fmt_bytes": lambda n: f"{int(n or 0)} B",
         "_nt_to_dos": lambda p: p,
@@ -298,6 +301,48 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(fence.snapshot()["matched"], 2)
         self.assertEqual(fence.configure({"geoip_fence": {"mode": "allow", "countries": [], "action": "block"}}), ["geoip_fence requires at least one country"])
         self.assertEqual(fence.snapshot()["mode"], "disabled")
+
+    def test_maxmind_updater_requires_https_checksum_and_replaces_atomically(self):
+        ns = load_runtime("MaxMindDBUpdater")
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "GeoLite2-Country.mmdb")
+            state = os.path.join(td, "state.json")
+            payload = b"valid maxmind database bytes"
+            digest = hashlib.sha256(payload).hexdigest()
+            requests = []
+
+            class FakeResponse:
+                def __enter__(self): return self
+                def __exit__(self, exc_type, exc, tb): return False
+                def read(self, limit): self.limit = limit; return payload
+
+            def opener(request, timeout=30):
+                requests.append((request, timeout))
+                return FakeResponse()
+
+            updater = ns["MaxMindDBUpdater"](
+                {"geoip_mmdb_update": {"enabled": True, "url": "https://updates.example.test/country.mmdb", "sha256": digest, "path": target, "interval_hours": 1}},
+                opener=opener,
+                validator=lambda path: (path.endswith(".download"), "bad format"),
+                state_path=state,
+                clock=lambda: 100.0,
+            )
+            result = updater.update(force=True)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["updated"])
+            self.assertEqual(pathlib.Path(target).read_bytes(), payload)
+            self.assertEqual(requests[0][0].full_url, "https://updates.example.test/country.mmdb")
+            self.assertTrue(os.path.exists(state))
+
+            rejected = ns["MaxMindDBUpdater"]({"geoip_mmdb_update": {"enabled": True, "url": "http://plain.test/file", "sha256": digest, "path": target}}, state_path=os.path.join(td, "bad-state.json"))
+            self.assertFalse(rejected.snapshot()["enabled"])
+            self.assertIn("https://", rejected.snapshot()["warnings"][0])
+
+            bad = ns["MaxMindDBUpdater"]({"geoip_mmdb_update": {"enabled": True, "url": "https://updates.example.test/country.mmdb", "sha256": "0" * 64, "path": target}}, opener=opener, validator=lambda path: True, state_path=os.path.join(td, "bad-hash-state.json"), clock=lambda: 200.0)
+            bad_result = bad.update(force=True)
+            self.assertFalse(bad_result["ok"])
+            self.assertIn("checksum", bad_result["reason"])
+            self.assertEqual(pathlib.Path(target).read_bytes(), payload)
 
     def test_scheduled_report_email_sends_attachments_and_persists_cadence(self):
         ns = load_runtime("ScheduledReportEmail")
@@ -819,6 +864,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             monitor._geo_fence = FakeConfigurable({"mode": "disabled"})
             monitor._report_email = FakeConfigurable({"enabled": False})
             monitor._external_notifier = FakeConfigurable({"enabled": False})
+            monitor._mmdb_updater = FakeConfigurable({"enabled": False})
             monitor._geo_w = FakeConfigurable({"provider": "maxmind"})
             monitor._tls_w = FakeConfigurable({"enabled": True})
 
@@ -829,7 +875,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(monitor._timer.interval, 5000)
             self.assertTrue(monitor._last_config_reload)
             self.assertEqual(monitor._quota.calls[-1][0], "load")
-            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._geo_w, monitor._tls_w):
+            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._mmdb_updater, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
 

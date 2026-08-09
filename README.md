@@ -197,6 +197,7 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `geoip_provider` | `ipwhois` | GeoIP source: `ipwhois`, `maxmind`, or `disabled`; plaintext providers are not used |
 | `geoip_https_endpoint` | `https://ipwho.is/{ip}` | HTTPS GeoIP endpoint template used by the default provider |
 | `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
+| `geoip_mmdb_update` | disabled | Optional HTTPS MaxMind-compatible database updater; requires a target path, URL, and operator-supplied SHA-256 checksum before atomic replacement |
 | `geoip_fence` | `{ "mode": "disabled", "countries": [], "action": "block" }` | Optional country policy: `allow` or `deny` two-letter country codes, with `warn` or `block` action |
 | `report_email` | disabled SMTP settings | Optional scheduled daily/weekly usage report delivery; requires an operator-provided SMTP host, sender, recipients, and credentials |
 | `external_notifiers` | disabled | Optional Pushover/ntfy HTTPS delivery with severity threshold and operator-provided credentials |
@@ -272,6 +273,7 @@ quota_state.json  Persisted app quota counters and enforced-cap records
 fw_backups/    Timestamped `.wfw` rollback exports before firewall reset
 rule_schedules.json  Shared per-rule enable/disable windows used by GUI and service mode
 reports/       Daily and weekly CSV/HTML app usage reports
+geoip_update_state.json  Last MaxMind database update/check timestamps
 ```
 
 ### Internal Components
@@ -296,6 +298,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `GeoIPFence` | Default-disabled country allow/deny adapter with deduplicated firewall enforcement and service status evidence |
 | `ScheduledReportEmail` | Default-disabled SMTP adapter that attaches generated CSV/HTML reports and persists its cadence |
 | `ExternalNotifier` | Default-disabled HTTPS Pushover and ntfy adapters with severity filtering and token redaction |
+| `MaxMindDBUpdater` | Default-disabled HTTPS database updater with checksum verification, format validation, and atomic replacement |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |

@@ -156,6 +156,7 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
 REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
 REPORT_EMAIL_STATE_PATH = os.path.join(CONFIG_DIR, "report_email_state.json")
+GEOIP_UPDATE_STATE_PATH = os.path.join(CONFIG_DIR, "geoip_update_state.json")
 IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
 FEED_CACHE_DIR = os.path.join(CONFIG_DIR, "feed_cache")
 PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
@@ -217,6 +218,7 @@ CONFIG_DEFAULTS = {
     "geoip_provider": "ipwhois",
     "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
     "geoip_mmdb_path": "",
+    "geoip_mmdb_update": {"enabled": False, "url": "", "sha256": "", "path": "", "interval_hours": 168},
     "geoip_fence": {"mode": "disabled", "countries": [], "action": "block"},
     "report_email": {"enabled": False, "interval_hours": 24, "smtp_host": "", "smtp_port": 587, "username": "", "password": "", "from": "", "to": [], "use_tls": True},
     "external_notifiers": {"enabled": False, "minimum_severity": "medium", "pushover": {"enabled": False, "endpoint": "https://api.pushover.net/1/messages.json", "token": "", "user": ""}, "ntfy": {"enabled": False, "endpoint": "https://ntfy.sh", "topic": "", "token": ""}},
@@ -2434,6 +2436,81 @@ class GeoIPFence:
         with self._lock:
             return {"mode":self._mode,"action":self._action,"countries":sorted(self._countries),"checked":self._checked,"matched":self._matched,"blocked":len(self._blocked),"warnings":list(self._warnings)}
 
+class MaxMindDBUpdater:
+    """Default-disabled HTTPS MaxMind-compatible database updater."""
+    MAX_BYTES = 100 * 1024 * 1024
+    def __init__(self, config=None, opener=None, validator=None, state_path=GEOIP_UPDATE_STATE_PATH, clock=None):
+        self.opener=opener or urllib.request.urlopen; self.validator=validator or self._validate_database; self.state_path=state_path; self.clock=clock or time.time
+        self._lock=Lock(); self._config={}; self._warnings=[]; self._last_check=0.0; self._last_success=0.0; self._last_result={}
+        self._load_state(); self.configure(config or {})
+    def _load_state(self):
+        try:
+            with open(self.state_path,"r",encoding="utf-8") as f: raw=json.load(f)
+            self._last_check=float(raw.get("last_check",0) or 0); self._last_success=float(raw.get("last_success",0) or 0)
+        except: self._last_check=0.0; self._last_success=0.0
+    def _save_state(self):
+        try: _write_json_atomic(os.path.abspath(self.state_path),{"last_check":self._last_check,"last_success":self._last_success})
+        except Exception as e: log.warning(f"GeoIP update state save failed: {e}")
+    def configure(self, config=None, mtime=None):
+        cfg=config if isinstance(config,dict) else {}
+        raw=cfg.get("geoip_mmdb_update",{}) if isinstance(cfg.get("geoip_mmdb_update",{}),dict) else {}
+        enabled=bool(raw.get("enabled",False)); url=str(raw.get("url","") or "").strip(); digest=str(raw.get("sha256","") or "").strip().lower()
+        path=str(raw.get("path","") or cfg.get("geoip_mmdb_path","") or "").strip(); interval=168.0; warnings=[]
+        try: interval=max(1.0,float(raw.get("interval_hours",168) or 168))
+        except: warnings.append("geoip_mmdb_update.interval_hours must be a number")
+        if url and not url.lower().startswith("https://"): warnings.append("geoip_mmdb_update.url must use https://"); enabled=False
+        if any(ch in url for ch in ("\r","\n")): warnings.append("geoip_mmdb_update.url contains control characters"); enabled=False
+        if digest and not re.match(r"^[0-9a-f]{64}$",digest): warnings.append("geoip_mmdb_update.sha256 must be a 64-character hexadecimal digest"); enabled=False
+        if enabled and not url: warnings.append("geoip_mmdb_update requires url"); enabled=False
+        if enabled and not digest: warnings.append("geoip_mmdb_update requires sha256"); enabled=False
+        if enabled and not path: warnings.append("geoip_mmdb_update requires path or geoip_mmdb_path"); enabled=False
+        with self._lock:
+            self._config={"enabled":enabled,"url":url,"sha256":digest,"path":os.path.abspath(path) if path else "","interval_hours":interval}; self._warnings=warnings
+        return list(warnings)
+    def due(self, now=None):
+        now=self.clock() if now is None else float(now)
+        with self._lock: return bool(self._config.get("enabled") and (not self._last_check or now-self._last_check>=self._config.get("interval_hours",168)*3600))
+    def _validate_database(self, path):
+        try:
+            import maxminddb
+            reader=maxminddb.open_database(path); reader.close(); return True,""
+        except Exception as e: return False,str(e)
+    def update(self, force=False, now=None):
+        now=self.clock() if now is None else float(now)
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings)
+        if warnings: return {"ok":False,"updated":False,"reason":"; ".join(warnings)}
+        if not cfg.get("enabled"): return {"ok":True,"updated":False,"reason":"disabled"}
+        if not force and not self.due(now): return {"ok":True,"updated":False,"reason":"not due"}
+        with self._lock: self._last_check=now
+        self._save_state()
+        temp_path=""
+        try:
+            request=urllib.request.Request(cfg["url"],headers={"User-Agent":f"{APP_NAME}/{APP_VERSION}"})
+            with self.opener(request,timeout=30) as response: payload=response.read(self.MAX_BYTES+1)
+            if len(payload)>self.MAX_BYTES: raise ValueError("download exceeds 100 MiB limit")
+            actual=hashlib.sha256(payload).hexdigest()
+            if not hmac.compare_digest(actual,cfg["sha256"]): raise ValueError("sha256 checksum mismatch")
+            target=cfg["path"]; parent=os.path.dirname(target) or os.getcwd(); os.makedirs(parent,exist_ok=True)
+            with tempfile.NamedTemporaryFile(prefix=f".{os.path.basename(target)}.",suffix=".download",dir=parent,delete=False) as tmp:
+                temp_path=tmp.name; tmp.write(payload); tmp.flush(); os.fsync(tmp.fileno())
+            validation=self.validator(temp_path)
+            valid,detail=(validation if isinstance(validation,tuple) else (bool(validation),""))
+            if not valid: raise ValueError(f"database validation failed{': ' + str(detail) if detail else ''}")
+            os.replace(temp_path,target); temp_path=""
+            with self._lock: self._last_success=now; self._last_result={"ok":True,"updated":True,"path":target,"bytes":len(payload),"checked_at":now}
+            self._save_state()
+            return dict(self._last_result)
+        except Exception as e:
+            if temp_path:
+                try: os.remove(temp_path)
+                except: pass
+            result={"ok":False,"updated":False,"reason":str(e),"checked_at":now}
+            with self._lock: self._last_result=result
+            return result
+    def snapshot(self):
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings); result=dict(self._last_result); last_check=self._last_check; last_success=self._last_success
+        return {"enabled":bool(cfg.get("enabled")),"url":cfg.get("url",""),"path":cfg.get("path",""),"interval_hours":cfg.get("interval_hours",168),"last_check":last_check,"last_success":last_success,"due":self.due(),"last_result":result,"warnings":warnings}
+
 # ─── Hosts File Manager ─────────────────────────────────────────────────────
 class HostsFileManager:
     def __init__(self): self.path=HOSTS_PATH; self.entries=[]; self.raw=[]
@@ -3969,6 +4046,7 @@ class HeadlessMonitor(QObject):
         self._geo_fence = GeoIPFence("PyWallService")
         self._report_email = ScheduledReportEmail()
         self._external_notifier = ExternalNotifier()
+        self._mmdb_updater = MaxMindDBUpdater()
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -4095,6 +4173,7 @@ class HeadlessMonitor(QObject):
             "geoip_fence": self._geo_fence.snapshot(),
             "report_email": self._report_email.snapshot(),
             "external_notifiers": self._external_notifier.snapshot(),
+            "geoip_mmdb_update": self._mmdb_updater.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
             "firewall_tamper": fw.tamper_summary(),
@@ -4162,6 +4241,7 @@ class HeadlessMonitor(QObject):
         fence_warnings=self._geo_fence.configure(cfg, result.mtime) or []
         report_warnings=self._report_email.configure(cfg, result.mtime) or []
         notifier_warnings=self._external_notifier.configure(cfg, result.mtime) or []
+        mmdb_warnings=self._mmdb_updater.configure(cfg, result.mtime) or []
         self._geo_w.configure(cfg, result.mtime)
         self._tls_w.configure(cfg, result.mtime)
         self._config_mtime = result.mtime
@@ -4170,6 +4250,7 @@ class HeadlessMonitor(QObject):
         for warning in fence_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in report_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in notifier_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        for warning in mmdb_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, notifiers={self._external_notifier.snapshot().get('sent',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
@@ -4213,6 +4294,9 @@ class HeadlessMonitor(QObject):
         report_ok,report_msg=self._report_email.send()
         if report_ok: _service_log(f"Scheduled report email: {report_msg}")
         elif report_msg not in ("report email disabled","report email not due"): _service_log(report_msg,"WARNING")
+        mmdb_result=self._mmdb_updater.update()
+        if mmdb_result.get("updated"): _service_log(f"MaxMind database updated: {mmdb_result.get('path')}")
+        elif not mmdb_result.get("ok") and mmdb_result.get("reason") not in ("disabled","not due"): _service_log(f"MaxMind database update failed: {mmdb_result.get('reason')}","WARNING")
         self._enforce_threats()
         now = time.time()
         if now - self._last_summary >= 60:
@@ -5761,6 +5845,7 @@ class ToolsTab(QWidget):
         g3l.addWidget(_make_toolbar_btn("Prune History (30d)","dim",self._prune_history))
         g3l.addWidget(_make_toolbar_btn("Export Usage Reports","primary",self._export_usage_reports))
         g3l.addWidget(_make_toolbar_btn("Forensic Bundle","primary",self._create_forensic_bundle))
+        g3l.addWidget(_make_toolbar_btn("Update MaxMind DB","dim",self._update_maxmind))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
         # Plugin trust boundary tools
         gplug=QGroupBox("Plugin Guardrails"); gplugl=QVBoxLayout(gplug)
@@ -5874,6 +5959,11 @@ class ToolsTab(QWidget):
             self.slbl.setText(f"Exported usage reports to {REPORT_DIR}: {names}")
         except Exception as e:
             self.slbl.setText(f"Usage report export failed: {e}")
+    def _update_maxmind(self):
+        result=MaxMindDBUpdater(load_runtime_config().data).update(force=True)
+        if result.get("updated"): self.slbl.setText(f"MaxMind database updated: {os.path.basename(result.get('path',''))}")
+        elif result.get("reason")=="disabled": self.slbl.setText("MaxMind database updater is disabled in config")
+        else: self.slbl.setText(f"MaxMind update failed: {result.get('reason','unknown error')}")
     def _create_forensic_bundle(self):
         path,_=QFileDialog.getSaveFileName(self,"Save Forensic Bundle",os.path.join(REPORT_DIR,f"pywall-incident-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),"ZIP files (*.zip)")
         if not path: return

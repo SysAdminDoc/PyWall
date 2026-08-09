@@ -13,6 +13,7 @@ All notable changes to PyWall will be documented in this file.
 - Added: Default-disabled GeoIP country fencing with allow/deny policies, warn/block actions, deduplicated firewall enforcement, and service evidence.
 - Added: Default-disabled scheduled SMTP delivery for daily/weekly usage CSV and HTML reports with persisted cadence and attachment size limits.
 - Added: Default-disabled HTTPS Pushover and ntfy notification adapters with severity filtering, bearer support, and redacted provider tokens.
+- Added: Default-disabled MaxMind-compatible database updater with HTTPS-only downloads, SHA-256 verification, format validation, persisted cadence, and atomic replacement.
 
 ## [v4.2.0] - 2026-06-30
 
