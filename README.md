@@ -198,6 +198,7 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `geoip_https_endpoint` | `https://ipwho.is/{ip}` | HTTPS GeoIP endpoint template used by the default provider |
 | `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
 | `geoip_fence` | `{ "mode": "disabled", "countries": [], "action": "block" }` | Optional country policy: `allow` or `deny` two-letter country codes, with `warn` or `block` action |
+| `report_email` | disabled SMTP settings | Optional scheduled daily/weekly usage report delivery; requires an operator-provided SMTP host, sender, recipients, and credentials |
 | `plugins_enabled` | `false` | Global plugin execution gate; manifests are scanned but not executable unless this is true |
 | `plugin_marketplace_url` | `""` | Optional HTTPS JSON index URL used for pointer/version checks; no code is downloaded |
 | `plugin_enabled_ids` | `[]` | Explicit allowlist of plugin IDs that may execute declared hooks |
@@ -292,6 +293,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `PluginRegistry` | Passive manifest scanner with hook/permission validation, trust-state reporting, and default-deny execution gates |
 | `PluginMarketplace` | HTTPS-only marketplace pointer and version checker; downloads no plugin code |
 | `GeoIPFence` | Default-disabled country allow/deny adapter with deduplicated firewall enforcement and service status evidence |
+| `ScheduledReportEmail` | Default-disabled SMTP adapter that attaches generated CSV/HTML reports and persists its cadence |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |

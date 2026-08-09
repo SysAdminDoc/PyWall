@@ -8,8 +8,9 @@ import multiprocessing
 multiprocessing.freeze_support()
 
 import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io, html
-import tempfile, webbrowser, socket, datetime, ipaddress, logging
+import tempfile, webbrowser, socket, datetime, ipaddress, logging, smtplib
 import argparse, signal, hmac, secrets, fnmatch
+from email.message import EmailMessage
 from pathlib import Path
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -154,6 +155,7 @@ CONN_DB_PATH = os.path.join(CONFIG_DIR, "connections.db")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 FAVICON_DIR = os.path.join(CONFIG_DIR, "favicons")
 REPORT_DIR = os.path.join(CONFIG_DIR, "reports")
+REPORT_EMAIL_STATE_PATH = os.path.join(CONFIG_DIR, "report_email_state.json")
 IDS_RULES_PATH = os.path.join(CONFIG_DIR, "ids_rules.yaral")
 FEED_CACHE_DIR = os.path.join(CONFIG_DIR, "feed_cache")
 PLUGINS_DIR = os.path.join(CONFIG_DIR, "plugins")
@@ -216,6 +218,7 @@ CONFIG_DEFAULTS = {
     "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
     "geoip_mmdb_path": "",
     "geoip_fence": {"mode": "disabled", "countries": [], "action": "block"},
+    "report_email": {"enabled": False, "interval_hours": 24, "smtp_host": "", "smtp_port": 587, "username": "", "password": "", "from": "", "to": [], "use_tls": True},
     "plugins_enabled": False,
     "plugin_marketplace_url": PLUGIN_MARKETPLACE_URL,
     "plugin_enabled_ids": [],
@@ -2981,6 +2984,76 @@ def export_usage_reports(report_dir=None):
         exports.append({"period": period, "csv": csv_path, "html": html_path, "rows": len(rows)})
     return exports
 
+class ScheduledReportEmail:
+    """Default-disabled SMTP report adapter with persisted send cadence."""
+    def __init__(self, config=None, report_fn=None, smtp_factory=None, state_path=REPORT_EMAIL_STATE_PATH, clock=None):
+        self.report_fn=report_fn or export_usage_reports; self.smtp_factory=smtp_factory or smtplib.SMTP; self.state_path=state_path; self.clock=clock or time.time
+        self._lock=Lock(); self._last_sent=0; self._warnings=[]; self._config={}; self._load_state(); self.configure(config or {})
+    def _load_state(self):
+        try:
+            with open(self.state_path,"r",encoding="utf-8") as f: raw=json.load(f)
+            self._last_sent=float(raw.get("last_sent",0) or 0)
+        except: self._last_sent=0
+    def _save_state(self):
+        try: _write_json_atomic(os.path.abspath(self.state_path),{"last_sent":self._last_sent})
+        except Exception as e: log.warning(f"Report email state save failed: {e}")
+    def configure(self, config=None, mtime=None):
+        raw=(config or {}).get("report_email",{}) if isinstance(config or {},dict) else {}
+        if not isinstance(raw,dict): raw={}
+        warnings=[]; enabled=bool(raw.get("enabled",False)); host=str(raw.get("smtp_host","") or "").strip(); sender=str(raw.get("from","") or "").strip(); username=str(raw.get("username","") or "").strip(); password=str(raw.get("password","") or "")
+        try: port=int(raw.get("smtp_port",587) or 587)
+        except: port=587; warnings.append("report_email.smtp_port must be an integer")
+        try: interval=max(1.0,float(raw.get("interval_hours",24) or 24))
+        except: interval=24.0; warnings.append("report_email.interval_hours must be a number")
+        recipients=raw.get("to",[]); recipients=[str(item).strip() for item in recipients] if isinstance(recipients,list) else [str(recipients).strip()] if recipients else []
+        recipients=[item for item in recipients if item]
+        if port<1 or port>65535: warnings.append("report_email.smtp_port must be between 1 and 65535"); port=587
+        for value,field_name in ((host,"smtp_host"),(sender,"from"),(username,"username")):
+            if any(ch in value for ch in ("\r","\n")): warnings.append(f"report_email.{field_name} contains control characters")
+        if enabled and (not host or not sender or not recipients): warnings.append("report_email requires smtp_host, from, and at least one recipient"); enabled=False
+        with self._lock:
+            self._config={"enabled":enabled,"interval_hours":interval,"smtp_host":host,"smtp_port":port,"username":username,"password":password,"from":sender,"to":recipients,"use_tls":bool(raw.get("use_tls",True))}; self._warnings=warnings
+        return list(warnings)
+    def due(self, now=None):
+        now=self.clock() if now is None else float(now)
+        with self._lock: return bool(self._config.get("enabled") and (not self._last_sent or now-self._last_sent>=self._config.get("interval_hours",24)*3600))
+    def send(self, force=False, now=None):
+        now=self.clock() if now is None else float(now)
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings)
+        if warnings: return False,"; ".join(warnings)
+        if not cfg.get("enabled"): return False,"report email disabled"
+        if not force and not self.due(now): return False,"report email not due"
+        try: exports=self.report_fn()
+        except Exception as e: return False,f"report generation failed: {e}"
+        message=EmailMessage(); message["Subject"]=f"{APP_NAME} usage reports"; message["From"]=cfg["from"]; message["To"]=", ".join(cfg["to"]); message.set_content("Attached are the latest PyWall daily and weekly usage reports.")
+        for item in exports or []:
+            for field_name in ("csv","html"):
+                path=item.get(field_name) if isinstance(item,dict) else ""
+                if not path or not os.path.isfile(path): continue
+                try:
+                    with open(path,"rb") as f: payload=f.read(10*1024*1024+1)
+                    if len(payload)>10*1024*1024: return False,f"report attachment too large: {path}"
+                    subtype="csv" if field_name=="csv" else "html"; message.add_attachment(payload,maintype="text",subtype=subtype,filename=os.path.basename(path))
+                except Exception as e: return False,f"report attachment failed: {e}"
+        smtp=None
+        try:
+            smtp=self.smtp_factory(cfg["smtp_host"],cfg["smtp_port"],timeout=20)
+            if cfg.get("use_tls"): smtp.starttls()
+            if cfg.get("username"): smtp.login(cfg["username"],cfg["password"])
+            smtp.send_message(message)
+            with self._lock: self._last_sent=now
+            self._save_state()
+            return True,f"sent {len(exports or [])} report period(s)"
+        except Exception as e:
+            return False,f"report email failed: {e}"
+        finally:
+            if smtp is not None:
+                try: smtp.quit()
+                except: pass
+    def snapshot(self):
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings); last=self._last_sent
+        return {"enabled":bool(cfg.get("enabled")),"interval_hours":cfg.get("interval_hours",24),"last_sent":last,"due":self.due(),"recipients":len(cfg.get("to",[])),"warnings":warnings}
+
 # ─── Forensic Export Bundle ──────────────────────────────────────────────────
 _REDACT_KEYS = {"vt_api_key","service_token","api_key","password","secret"}
 
@@ -3841,6 +3914,7 @@ class HeadlessMonitor(QObject):
         self._doh = DoHDetector("PyWallService")
         self._ids = IDSRuleEngine("PyWallService")
         self._geo_fence = GeoIPFence("PyWallService")
+        self._report_email = ScheduledReportEmail()
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -3960,6 +4034,7 @@ class HeadlessMonitor(QObject):
             "ids": self._ids.snapshot(),
             "geoip": self._geo_w.snapshot(),
             "geoip_fence": self._geo_fence.snapshot(),
+            "report_email": self._report_email.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
             "firewall_tamper": fw.tamper_summary(),
@@ -4025,12 +4100,14 @@ class HeadlessMonitor(QObject):
         self._doh.configure(cfg, result.mtime)
         self._ids.configure(cfg, result.mtime)
         fence_warnings=self._geo_fence.configure(cfg, result.mtime) or []
+        report_warnings=self._report_email.configure(cfg, result.mtime) or []
         self._geo_w.configure(cfg, result.mtime)
         self._tls_w.configure(cfg, result.mtime)
         self._config_mtime = result.mtime
         stamp = datetime.datetime.now().isoformat(timespec="seconds")
         self._last_config_reload = f"recovered: {stamp}" if result.recovered else f"warnings: {stamp}" if result.warnings else stamp
         for warning in fence_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        for warning in report_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
@@ -4066,6 +4143,9 @@ class HeadlessMonitor(QObject):
     def _tick(self):
         self._reload_config_if_changed()
         self._apply_schedules()
+        report_ok,report_msg=self._report_email.send()
+        if report_ok: _service_log(f"Scheduled report email: {report_msg}")
+        elif report_msg not in ("report email disabled","report email not due"): _service_log(report_msg,"WARNING")
         self._enforce_threats()
         now = time.time()
         if now - self._last_summary >= 60:

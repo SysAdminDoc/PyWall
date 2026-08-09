@@ -11,6 +11,7 @@ All notable changes to PyWall will be documented in this file.
 - Added: Extended connection selection with deduplicated batch firewall and hosts-file actions for unknown public endpoints.
 - Added: HTTPS-only plugin marketplace pointer/version checks with no automatic download or execution path.
 - Added: Default-disabled GeoIP country fencing with allow/deny policies, warn/block actions, deduplicated firewall enforcement, and service evidence.
+- Added: Default-disabled scheduled SMTP delivery for daily/weekly usage CSV and HTML reports with persisted cadence and attachment size limits.
 
 ## [v4.2.0] - 2026-06-30
 

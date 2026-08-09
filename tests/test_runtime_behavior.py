@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import shutil
+import smtplib
 import sqlite3
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import time
 import unittest
 from collections import defaultdict
 from dataclasses import dataclass
+from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -117,6 +119,7 @@ BASE_NAMES = {
     "find_firewall_rules",
     "batch_connection_targets",
     "GeoIPFence",
+    "ScheduledReportEmail",
 }
 
 class FakeSignal:
@@ -184,6 +187,8 @@ def load_runtime(*names):
         "socket": __import__("socket"),
         "sqlite3": sqlite3,
         "subprocess": subprocess,
+        "smtplib": smtplib,
+        "EmailMessage": EmailMessage,
         "sys": sys,
         "tempfile": tempfile,
         "threading": threading,
@@ -223,6 +228,7 @@ def load_runtime(*names):
         "REPORT_DIR": os.path.join(tempfile.gettempdir(), "pywall-reports"),
         "QUOTA_STATE_PATH": os.path.join(tempfile.gettempdir(), "quota_state.json"),
         "RULE_SCHEDULES_PATH": os.path.join(tempfile.gettempdir(), "rule_schedules.json"),
+        "REPORT_EMAIL_STATE_PATH": os.path.join(tempfile.gettempdir(), "report_email_state.json"),
         "WINDOWS_HEADER": ["# hosts"],
         "_fmt_bytes": lambda n: f"{int(n or 0)} B",
         "_nt_to_dos": lambda p: p,
@@ -258,6 +264,38 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(fence.snapshot()["matched"], 2)
         self.assertEqual(fence.configure({"geoip_fence": {"mode": "allow", "countries": [], "action": "block"}}), ["geoip_fence requires at least one country"])
         self.assertEqual(fence.snapshot()["mode"], "disabled")
+
+    def test_scheduled_report_email_sends_attachments_and_persists_cadence(self):
+        ns = load_runtime("ScheduledReportEmail")
+        with tempfile.TemporaryDirectory() as td:
+            csv_path = os.path.join(td, "daily.csv")
+            html_path = os.path.join(td, "daily.html")
+            pathlib.Path(csv_path).write_text("app,total\nunit.exe,1 B\n", encoding="utf-8")
+            pathlib.Path(html_path).write_text("<html>unit</html>", encoding="utf-8")
+            sent = []
+
+            class FakeSMTP:
+                def __init__(self, host, port, timeout=20): sent.append(("connect", host, port, timeout))
+                def starttls(self): sent.append(("tls",))
+                def login(self, username, password): sent.append(("login", username, password))
+                def send_message(self, message): sent.append(("message", message))
+                def quit(self): sent.append(("quit",))
+
+            cfg = {"report_email": {"enabled": True, "interval_hours": 24, "smtp_host": "smtp.example.test", "smtp_port": 587, "username": "user", "password": "secret", "from": "pywall@example.test", "to": ["admin@example.test"], "use_tls": True}}
+            plugin = ns["ScheduledReportEmail"](
+                cfg,
+                report_fn=lambda: [{"period": "daily", "csv": csv_path, "html": html_path, "rows": 1}],
+                smtp_factory=FakeSMTP,
+                state_path=os.path.join(td, "state.json"),
+                clock=lambda: 100.0,
+            )
+            ok, message = plugin.send(force=True)
+            self.assertTrue(ok)
+            self.assertIn("sent 1 report", message)
+            self.assertEqual([entry[0] for entry in sent], ["connect", "tls", "login", "message", "quit"])
+            self.assertFalse(plugin.due(101.0))
+            self.assertEqual(plugin.snapshot()["recipients"], 1)
+
 
     def test_plugin_marketplace_checks_https_index_and_reports_updates(self):
         ns = load_runtime("PluginMarketplace")
@@ -745,6 +783,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             monitor._doh = FakeConfigurable({"action": "warn"})
             monitor._ids = FakeConfigurable({"rules": 0})
             monitor._geo_fence = FakeConfigurable({"mode": "disabled"})
+            monitor._report_email = FakeConfigurable({"enabled": False})
             monitor._geo_w = FakeConfigurable({"provider": "maxmind"})
             monitor._tls_w = FakeConfigurable({"enabled": True})
 
@@ -755,7 +794,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(monitor._timer.interval, 5000)
             self.assertTrue(monitor._last_config_reload)
             self.assertEqual(monitor._quota.calls[-1][0], "load")
-            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._geo_w, monitor._tls_w):
+            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
 
