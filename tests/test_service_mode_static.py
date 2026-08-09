@@ -139,7 +139,7 @@ class ServiceModeStaticTests(unittest.TestCase):
             "_ps_literal", "_fw_enum", "_fw_profile", "_fw_protocol", "_fw_ports",
             "_fw_address", "_fw_program", "_build_new_firewall_rule_cmd",
             "_build_remove_firewall_rule_cmd", "_build_set_firewall_rule_enabled_cmd",
-            "_build_rule_exists_cmd",
+            "_build_set_firewall_rule_cmd", "_build_rule_exists_cmd",
         )
         cmd = ns["_build_new_firewall_rule_cmd"](
             "PW_Bob's;Rule",
@@ -156,6 +156,10 @@ class ServiceModeStaticTests(unittest.TestCase):
         self.assertIn("Remove-NetFirewallRule -DisplayName 'PW_Bob''s;Rule'", ns["_build_remove_firewall_rule_cmd"]("PW_Bob's;Rule"))
         self.assertIn("Set-NetFirewallRule -DisplayName 'PW_Bob''s;Rule' -Enabled False", ns["_build_set_firewall_rule_enabled_cmd"]("PW_Bob's;Rule", False))
         self.assertIn("Get-NetFirewallRule -DisplayName 'PW_Bob''s;Rule'", ns["_build_rule_exists_cmd"]("PW_Bob's;Rule"))
+        updated = ns["_build_set_firewall_rule_cmd"]("PW_Bob's;Rule", {"action": "Allow", "profile": "Private", "description": "reviewer's rule"})
+        self.assertIn("-Action Allow", updated)
+        self.assertIn("-Profile Private", updated)
+        self.assertIn("-Description 'reviewer''s rule'", updated)
 
     def test_firewall_command_builders_reject_unstructured_values(self):
         ns = load_helpers(
@@ -212,6 +216,19 @@ class ServiceModeStaticTests(unittest.TestCase):
             "class RuleScheduleDialog",
             "Schedule...",
             "self._apply_schedules(force=True)",
+        ):
+            self.assertIn(token, TEXT)
+
+    def test_bulk_edit_and_dependency_graph_are_wired(self):
+        for token in (
+            "def _build_set_firewall_rule_cmd",
+            "def build_firewall_dependency_graph",
+            "def firewall_rule_dependencies",
+            "def find_firewall_rules",
+            "def bulk_update",
+            "class FirewallBulkEditDialog",
+            "class FirewallDependencyDialog",
+            "Dependency Graph",
         ):
             self.assertIn(token, TEXT)
 

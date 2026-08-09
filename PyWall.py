@@ -1374,6 +1374,35 @@ def _build_remove_firewall_rule_cmd(name):
 def _build_set_firewall_rule_enabled_cmd(name, enabled=True):
     return f"Set-NetFirewallRule -DisplayName {_ps_literal(name, 'rule name', 256)} -Enabled {'True' if enabled else 'False'} -ErrorAction Stop"
 
+def _build_set_firewall_rule_cmd(name, changes):
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("At least one firewall rule change is required")
+    parts = ["Set-NetFirewallRule", "-DisplayName", _ps_literal(name, "rule name", 256)]
+    allowed = {"enabled", "action", "direction", "profile", "desc", "description"}
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"Unsupported firewall rule fields: {', '.join(sorted(unknown))}")
+    if "enabled" in changes:
+        enabled = changes["enabled"]
+        if isinstance(enabled, str):
+            enabled = enabled.lower() in ("true", "1", "yes", "on")
+        elif not isinstance(enabled, bool):
+            raise ValueError("enabled must be true or false")
+        parts.extend(["-Enabled", "True" if enabled else "False"])
+    if "action" in changes:
+        parts.extend(["-Action", _fw_enum(changes["action"], {"Allow", "Block"}, "action")])
+    if "direction" in changes:
+        parts.extend(["-Direction", _fw_enum(changes["direction"], {"Inbound", "Outbound"}, "direction")])
+    if "profile" in changes:
+        parts.extend(["-Profile", _fw_profile(changes["profile"])])
+    description = changes.get("description", changes.get("desc"))
+    if description is not None:
+        text = str(description)[:200]
+        if text:
+            parts.extend(["-Description", _ps_literal(text, "description", 200)])
+    parts.extend(["-ErrorAction", "Stop"])
+    return " ".join(parts)
+
 def _export_firewall_config(path):
     if not path: return False, "No export path provided"
     try:
@@ -1422,6 +1451,72 @@ def _fw_rule_diff(before, after):
         if before.get(key) != after.get(key):
             changed.append(f"{key}: {before.get(key)} -> {after.get(key)}")
     return "; ".join(changed)
+
+def _dependency_value(value):
+    text = str(value or "").strip().lower()
+    return "" if text in ("", "-", "any", "*") else text
+
+def build_firewall_dependency_graph(rules):
+    """Build a graph of rules coupled by shared group, program, endpoint, or port."""
+    rules = [rule for rule in (rules or []) if getattr(rule, "name", "")]
+    nodes = {rule.name: {"name": rule.name, "action": rule.action, "enabled": bool(rule.enabled), "source": rule.source} for rule in rules}
+    indexes = defaultdict(lambda: defaultdict(list))
+    for rule in rules:
+        fields = {
+            "group": rule.group,
+            "program": rule.program,
+            "remote_addr": rule.remote_addr,
+            "local_addr": rule.local_addr,
+            "remote_port": rule.remote_port,
+            "local_port": rule.local_port,
+            "protocol": rule.protocol,
+        }
+        for field_name, value in fields.items():
+            normalized = _dependency_value(value)
+            if normalized:
+                indexes[field_name][normalized].append(rule.name)
+    edges = {}
+    for field_name, values in indexes.items():
+        for normalized, names in values.items():
+            unique = list(dict.fromkeys(names))
+            for index, left in enumerate(unique):
+                for right in unique[index + 1:]:
+                    key = tuple(sorted((left, right)))
+                    edges.setdefault(key, []).append(f"shared {field_name}: {normalized}")
+    edge_rows = []
+    degrees = defaultdict(int)
+    for (left, right), reasons in sorted(edges.items()):
+        edge_rows.append({"source": left, "target": right, "reasons": sorted(set(reasons))})
+        degrees[left] += 1; degrees[right] += 1
+    for name, node in nodes.items():
+        node["degree"] = degrees[name]
+    return {"nodes": list(nodes.values()), "edges": edge_rows}
+
+def firewall_rule_dependencies(rules, rule_name):
+    graph = build_firewall_dependency_graph(rules)
+    wanted = str(rule_name or "")
+    related = []
+    for edge in graph["edges"]:
+        if wanted not in (edge["source"], edge["target"]):
+            continue
+        other = edge["target"] if edge["source"] == wanted else edge["source"]
+        related.append({"name": other, "reasons": list(edge["reasons"])})
+    return {"rule": wanted, "related": related, "graph": graph}
+
+def find_firewall_rules(rules, pattern=""):
+    pattern = str(pattern or "").strip().lower()
+    if not pattern:
+        return list(rules or [])
+    matched = []
+    for rule in (rules or []):
+        values = [
+            rule.name, rule.desc, rule.group, rule.program, rule.remote_addr,
+            rule.local_addr, rule.remote_port, rule.local_port, rule.protocol,
+        ]
+        haystack = [str(value or "").lower() for value in values]
+        if any(pattern in value or fnmatch.fnmatchcase(value, pattern) for value in haystack):
+            matched.append(rule)
+    return matched
 
 def _firewall_tamper_log(event):
     try:
@@ -1802,6 +1897,23 @@ class FirewallEngine:
         if ok:
             self._mark_local_change(name); self._invalidate()
         return ok
+    def update_rule(self,name,changes=None,**kwargs):
+        merged=dict(changes or {}); merged.update(kwargs)
+        try: cmd=_build_set_firewall_rule_cmd(name,merged)
+        except ValueError as e: return False,str(e)
+        ok,out=_ps(cmd,15)
+        if ok:
+            self._mark_local_change(name); self._invalidate()
+        return ok,out
+    def bulk_update(self,rules=None,pattern="",changes=None,dry_run=False):
+        candidates=self.get_all_rules(force_refresh=True) if rules is None else list(rules or [])
+        matched=find_firewall_rules(candidates,pattern)
+        if dry_run: return [{"name":rule.name,"matched":True} for rule in matched]
+        results=[]
+        for rule in matched:
+            ok,out=self.update_rule(rule.name,changes or {})
+            results.append({"name":rule.name,"ok":ok,"output":out})
+        return results
     def get_all_rules(self,force_refresh=False):
         with self._cache_lock:
             if not force_refresh and self._rule_cache and (time.time()-self._cache_time)<self._cache_ttl: return list(self._rule_cache)
@@ -4682,6 +4794,8 @@ class FirewallTab(QWidget):
         tb.addWidget(_make_toolbar_btn("+ New Rule","primary",self._new_rule))
         tb.addWidget(_make_toolbar_btn("Refresh","dim",self._do_search))
         tb.addWidget(_make_toolbar_btn("Schedules","primary",self._open_schedules))
+        tb.addWidget(_make_toolbar_btn("Bulk Edit","warning",self._open_bulk_edit))
+        tb.addWidget(_make_toolbar_btn("Dependency Graph","dim",self._open_dependencies))
         tb.addWidget(_make_toolbar_btn("Restore Drift","warning",self._restore_tamper))
         tb.addWidget(_make_toolbar_btn("Accept Drift","dim",self._accept_tamper))
         self.del_all_btn=_make_toolbar_btn("Delete All HG","danger",self._delete_all_hg); tb.addWidget(self.del_all_btn)
@@ -4733,6 +4847,7 @@ class FirewallTab(QWidget):
         menu=QMenu(self); menu.setStyleSheet(_CTX_STYLE)
         menu.addAction("Disable" if is_on else "Enable").triggered.connect(lambda:self._toggle_rule(name,not is_on))
         menu.addAction("Schedule...").triggered.connect(lambda:self._open_schedules(name))
+        menu.addAction("Dependencies...").triggered.connect(lambda:self._open_dependencies(name))
         menu.addAction("Delete Rule").triggered.connect(lambda:self._delete_rule(name))
         menu.addAction("Copy Name").triggered.connect(lambda:QApplication.clipboard().setText(name))
         menu.exec_(self.table.viewport().mapToGlobal(pos))
@@ -4772,6 +4887,13 @@ class FirewallTab(QWidget):
         dlg.exec_()
         self._apply_schedules()
         self._do_search()
+    def _open_bulk_edit(self):
+        dlg=FirewallBulkEditDialog(self,self._rules)
+        dlg.exec_()
+        self._do_search()
+    def _open_dependencies(self,rule_name=""):
+        dlg=FirewallDependencyDialog(self,self._rules,rule_name)
+        dlg.exec_()
     def _new_rule(self):
         dlg=NewRuleDialog(self)
         if dlg.exec_(): self._do_search()
@@ -4883,6 +5005,72 @@ class RuleScheduleDialog(QDialog):
             self.status.setText("Select a schedule first")
             return
         if rule_scheduler.remove(ident): self._reload(); self.status.setText("Schedule removed")
+
+class FirewallBulkEditDialog(QDialog):
+    def __init__(self,parent=None,rules=None):
+        super().__init__(parent); self.setWindowTitle("Bulk Edit Firewall Rules"); self.setMinimumWidth(760); self.rules=list(rules or [])
+        self.setStyleSheet(f"QDialog{{background:{C['base']};}}QLabel{{color:{C['text']};}}")
+        lo=QVBoxLayout(self); lo.setSpacing(8); lo.setContentsMargins(16,16,16,16)
+        intro=QLabel("Preview matching rules before applying a safe field-level update. Names, programs, groups, endpoints, ports, and descriptions are searchable.")
+        intro.setWordWrap(True); intro.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(intro)
+        form=QGridLayout(); form.setHorizontalSpacing(8); form.setVerticalSpacing(6)
+        form.addWidget(QLabel("Pattern:"),0,0); self.pattern=QLineEdit(); self.pattern.setPlaceholderText("blank = all; supports * and ?"); form.addWidget(self.pattern,0,1,1,5)
+        form.addWidget(QLabel("Action:"),1,0); self.action=QComboBox(); self.action.addItems(["No change","Allow","Block"]); form.addWidget(self.action,1,1)
+        form.addWidget(QLabel("Enabled:"),1,2); self.enabled=QComboBox(); self.enabled.addItems(["No change","Enable","Disable"]); form.addWidget(self.enabled,1,3)
+        form.addWidget(QLabel("Profile:"),1,4); self.profile=QComboBox(); self.profile.addItems(["No change","Any","Domain","Private","Public"]); form.addWidget(self.profile,1,5)
+        form.addWidget(QLabel("Description:"),2,0); self.description=QLineEdit(); self.description.setPlaceholderText("blank = leave unchanged"); form.addWidget(self.description,2,1,1,5)
+        lo.addLayout(form)
+        row=QHBoxLayout(); row.addStretch(); row.addWidget(_make_toolbar_btn("Preview","dim",self._preview)); row.addWidget(_make_toolbar_btn("Apply","warning",self._apply)); lo.addLayout(row)
+        self.table=QTableWidget(0,3); self.table.setHorizontalHeaderLabels(["Rule","Action","Current"]); self.table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.verticalHeader().setVisible(False); lo.addWidget(self.table,1)
+        self.status=QLabel(""); self.status.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(self.status)
+        self._preview()
+    def _changes(self):
+        changes={}
+        if self.action.currentIndex(): changes["action"]=self.action.currentText()
+        if self.enabled.currentIndex(): changes["enabled"]=self.enabled.currentIndex()==1
+        if self.profile.currentIndex(): changes["profile"]=self.profile.currentText()
+        if self.description.text().strip(): changes["description"]=self.description.text().strip()
+        return changes
+    def _matched(self): return find_firewall_rules(self.rules,self.pattern.text())
+    def _preview(self):
+        matched=self._matched(); self.table.setRowCount(len(matched))
+        for row,rule in enumerate(matched):
+            self.table.setItem(row,0,QTableWidgetItem(rule.name)); self.table.setItem(row,1,QTableWidgetItem(rule.action))
+            self.table.setItem(row,2,QTableWidgetItem("Enabled" if rule.enabled else "Disabled"))
+        self.status.setText(f"{len(matched)} rule(s) match")
+    def _apply(self):
+        changes=self._changes(); matched=self._matched()
+        if not matched:
+            self.status.setText("No rules match the pattern")
+            return
+        if not changes:
+            self.status.setText("Choose at least one field to change")
+            return
+        results=fw.bulk_update(self.rules,self.pattern.text(),changes)
+        ok=sum(1 for result in results if result.get("ok")); failed=len(results)-ok
+        self.status.setText(f"Updated {ok} rule(s)" + (f"; {failed} failed" if failed else ""))
+        self._preview()
+
+class FirewallDependencyDialog(QDialog):
+    def __init__(self,parent=None,rules=None,rule_name=""):
+        super().__init__(parent); self.setWindowTitle("Firewall Rule Dependency Graph"); self.setMinimumWidth(700); self.rules=list(rules or [])
+        self.setStyleSheet(f"QDialog{{background:{C['base']};}}QLabel{{color:{C['text']};}}")
+        lo=QVBoxLayout(self); lo.setSpacing(8); lo.setContentsMargins(16,16,16,16)
+        intro=QLabel("Rules are connected when they share a group, program, endpoint, port, or protocol. Shared values are shown as edge reasons before a delete or bulk edit.")
+        intro.setWordWrap(True); intro.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(intro)
+        row=QHBoxLayout(); row.addWidget(QLabel("Focus rule:")); self.rule_cb=QComboBox(); names=[rule.name for rule in self.rules if getattr(rule,"name","")]; self.rule_cb.addItems(names); row.addWidget(self.rule_cb,1); lo.addLayout(row)
+        self.table=QTableWidget(0,2); self.table.setHorizontalHeaderLabels(["Related rule","Shared dependency"]); self.table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.verticalHeader().setVisible(False); lo.addWidget(self.table,1)
+        self.status=QLabel(""); self.status.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); lo.addWidget(self.status)
+        close=QPushButton("Close"); close.clicked.connect(self.accept); row2=QHBoxLayout(); row2.addStretch(); row2.addWidget(close); lo.addLayout(row2)
+        self.rule_cb.currentTextChanged.connect(self._refresh)
+        if rule_name: self.rule_cb.setCurrentText(rule_name)
+        self._refresh(self.rule_cb.currentText())
+    def _refresh(self,rule_name=""):
+        result=firewall_rule_dependencies(self.rules,rule_name); related=result.get("related",[]); self.table.setRowCount(len(related))
+        for row,item in enumerate(related):
+            self.table.setItem(row,0,QTableWidgetItem(item["name"])); self.table.setItem(row,1,QTableWidgetItem("; ".join(item["reasons"])))
+        self.status.setText(f"{len(result.get('graph',{}).get('nodes',[]))} nodes, {len(result.get('graph',{}).get('edges',[]))} edges; {len(related)} related to {rule_name or 'selection'}")
 
 
 # ─── Log Tab ─────────────────────────────────────────────────────────────────

@@ -47,10 +47,12 @@ BASE_NAMES = {
     "_build_new_firewall_rule_cmd",
     "_build_remove_firewall_rule_cmd",
     "_build_set_firewall_rule_enabled_cmd",
+    "_build_set_firewall_rule_cmd",
     "_build_rule_exists_cmd",
     "_firewall_tamper_log",
     "_fw_rule_diff",
     "_fw_rule_snapshot",
+    "_dependency_value",
     "CONFIG_SCHEMA_VERSION",
     "GEOIP_HTTPS_ENDPOINT",
     "PLUGIN_ALLOWED_HOOKS",
@@ -106,6 +108,9 @@ BASE_NAMES = {
     "RULE_SCHEDULES_PATH",
     "SCHEDULE_DAYS",
     "_SCHEDULE_DAY_INDEX",
+    "build_firewall_dependency_graph",
+    "firewall_rule_dependencies",
+    "find_firewall_rules",
 }
 
 class FakeSignal:
@@ -230,6 +235,38 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_firewall_bulk_edit_and_dependency_graph(self):
+        ns = load_runtime("FirewallEngine")
+        calls = []
+
+        def fake_ps(cmd, timeout=20):
+            calls.append((cmd, timeout))
+            return True, "updated"
+
+        ns["_ps"] = fake_ps
+        engine = ns["FirewallEngine"]()
+        rules = [
+            ns["FWRule"](name="PW_Telemetry", program=r"C:\Apps\agent.exe", remote_port="443", action="Block"),
+            ns["FWRule"](name="PW_Telemetry_Backup", program=r"C:\Apps\agent.exe", remote_port="443", action="Allow"),
+            ns["FWRule"](name="PW_Other", program=r"C:\Apps\other.exe", remote_port="80", action="Block"),
+        ]
+        preview = engine.bulk_update(rules, "telemetry", {"action": "Allow"}, dry_run=True)
+        self.assertEqual([row["name"] for row in preview], ["PW_Telemetry", "PW_Telemetry_Backup"])
+        results = engine.bulk_update(rules, "telemetry", {"action": "Allow"})
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(row["ok"] for row in results))
+        self.assertIn("-Action Allow", calls[0][0])
+
+        graph = ns["build_firewall_dependency_graph"](rules)
+        self.assertEqual(len(graph["nodes"]), 3)
+        deps = ns["firewall_rule_dependencies"](rules, "PW_Telemetry")
+        related = {row["name"] for row in deps["related"]}
+        self.assertIn("PW_Telemetry_Backup", related)
+        self.assertNotIn("PW_Other", related)
+
+        with self.assertRaises(ValueError):
+            ns["_build_set_firewall_rule_cmd"]("PW_Test", {"action": "Block; Stop-Process"})
+
     def test_rule_scheduler_cross_midnight_persists_and_applies(self):
         ns = load_runtime("RuleScheduler")
 

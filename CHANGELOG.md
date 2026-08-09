@@ -6,6 +6,8 @@ All notable changes to PyWall will be documented in this file.
 
 - Added: Persistent per-rule local-time schedules with cross-midnight support, shared by the firewall tab and headless service mode.
 - Added: Firewall Rules UI for creating, toggling, removing, and applying scheduled enable/disable windows.
+- Added: Preview-first bulk firewall rule editing with validated action, enabled state, profile, and description updates.
+- Added: Firewall dependency graph view showing shared groups, programs, endpoints, ports, and protocols before rule changes.
 
 ## [v4.2.0] - 2026-06-30
 

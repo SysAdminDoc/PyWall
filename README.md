@@ -60,6 +60,8 @@ Full management of **all** Windows Firewall rules (not just ones PyWall created)
 - Per-rule local-time schedules can enable or disable managed rules, including cross-midnight windows; the GUI and headless service share `rule_schedules.json`
 - Destructive firewall reset first writes a timestamped `.wfw` rollback export and exposes restore/import from the Tools tab
 - Managed `PW_` and legacy `HG_` rules are checked for external create/delete/enable/disable drift on refresh, logged with before/after snapshots, and can be restored or accepted from the firewall tab
+- Dependency Graph explains shared groups, programs, endpoints, ports, and protocols before destructive edits
+- Bulk Edit previews pattern matches and safely applies action, enabled state, profile, or description changes
 
 ### Toast Notifications
 
@@ -290,6 +292,8 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
 | `FirewallRuleTableModel` | QAbstractTableModel-backed firewall rule table for large rule sets |
 | `RuleScheduler` | Persistent local-time rule windows with cross-midnight enforcement in GUI and service mode |
+| `FirewallBulkEditDialog` | Preview-first pattern matching and safe multi-rule field updates |
+| `FirewallDependencyDialog` | Shared-input dependency graph for rule review before deletion or edits |
 | `NotificationController` | Centralized tray notification gating with severity filter, snooze, warmup, and digest |
 | `DisplayFilter` | Wireshark-style field-based filter parser for history and live connection views |
 | `create_forensic_bundle` | Timestamped ZIP incident archive with history, config, logs, and firewall rules |
