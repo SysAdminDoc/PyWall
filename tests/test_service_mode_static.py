@@ -278,6 +278,18 @@ class ServiceModeStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, TEXT)
 
+    def test_external_notification_adapters_are_wired(self):
+        for token in (
+            '"external_notifiers"',
+            "class ExternalNotifier",
+            "https://api.pushover.net/1/messages.json",
+            "https://ntfy.sh",
+            "def notify(self, title, message",
+            "self._external_notifier.notify",
+            "Bearer",
+        ):
+            self.assertIn(token, TEXT)
+
     def test_runtime_dependencies_are_pinned_and_not_auto_installed(self):
         requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("psutil==7.2.2", requirements)

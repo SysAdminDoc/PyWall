@@ -219,6 +219,7 @@ CONFIG_DEFAULTS = {
     "geoip_mmdb_path": "",
     "geoip_fence": {"mode": "disabled", "countries": [], "action": "block"},
     "report_email": {"enabled": False, "interval_hours": 24, "smtp_host": "", "smtp_port": 587, "username": "", "password": "", "from": "", "to": [], "use_tls": True},
+    "external_notifiers": {"enabled": False, "minimum_severity": "medium", "pushover": {"enabled": False, "endpoint": "https://api.pushover.net/1/messages.json", "token": "", "user": ""}, "ntfy": {"enabled": False, "endpoint": "https://ntfy.sh", "topic": "", "token": ""}},
     "plugins_enabled": False,
     "plugin_marketplace_url": PLUGIN_MARKETPLACE_URL,
     "plugin_enabled_ids": [],
@@ -3054,8 +3055,60 @@ class ScheduledReportEmail:
         with self._lock: cfg=dict(self._config); warnings=list(self._warnings); last=self._last_sent
         return {"enabled":bool(cfg.get("enabled")),"interval_hours":cfg.get("interval_hours",24),"last_sent":last,"due":self.due(),"recipients":len(cfg.get("to",[])),"warnings":warnings}
 
+class ExternalNotifier:
+    """Default-disabled HTTPS notification adapters for Pushover and ntfy."""
+    def __init__(self, config=None, opener=None):
+        self.opener=opener or urllib.request.urlopen; self._lock=Lock(); self._config={}; self._warnings=[]; self._sent=0; self.configure(config or {})
+    def configure(self, config=None, mtime=None):
+        raw=(config or {}).get("external_notifiers",{}) if isinstance(config or {},dict) else {}
+        if not isinstance(raw,dict): raw={}
+        warnings=[]; minimum=str(raw.get("minimum_severity","medium") or "medium").lower()
+        if minimum not in SEVERITY_LEVELS: warnings.append("external_notifiers.minimum_severity must be low, medium, or high"); minimum="medium"
+        providers={}
+        for name in ("pushover","ntfy"):
+            item=raw.get(name,{}) if isinstance(raw.get(name,{}),dict) else {}
+            endpoint=str(item.get("endpoint", "") or "").strip(); enabled=bool(item.get("enabled",False))
+            if endpoint and not endpoint.lower().startswith("https://"): warnings.append(f"external_notifiers.{name}.endpoint must use https://"); enabled=False
+            if any(ch in endpoint for ch in ("\r","\n")): warnings.append(f"external_notifiers.{name}.endpoint contains control characters"); enabled=False
+            providers[name]=dict(item,endpoint=endpoint,enabled=enabled)
+        enabled=bool(raw.get("enabled",False))
+        with self._lock: self._config={"enabled":enabled,"minimum_severity":minimum,"pushover":providers["pushover"],"ntfy":providers["ntfy"]}; self._warnings=warnings
+        return list(warnings)
+    def _post(self, request):
+        with self.opener(request,timeout=15) as response:
+            response.read(1024*1024)
+        return True
+    def notify(self, title, message, severity="medium", event_key=""):
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings)
+        if warnings: return {"ok":False,"sent":0,"errors":list(warnings)}
+        if not cfg.get("enabled"): return {"ok":True,"sent":0,"errors":[]}
+        if SEVERITY_LEVELS.get(str(severity).lower(),0)<SEVERITY_LEVELS.get(cfg.get("minimum_severity","medium"),1): return {"ok":True,"sent":0,"errors":[]}
+        results=[]; errors=[]
+        pushover=cfg.get("pushover",{})
+        if pushover.get("enabled"):
+            if not pushover.get("token") or not pushover.get("user"): errors.append("Pushover requires token and user")
+            else:
+                data=urllib.parse.urlencode({"token":pushover["token"],"user":pushover["user"],"title":str(title)[:250],"message":str(message)[:4000]}).encode()
+                try: self._post(urllib.request.Request(pushover["endpoint"],data=data,headers={"Content-Type":"application/x-www-form-urlencoded"},method="POST")); results.append("pushover")
+                except Exception as e: errors.append(f"Pushover: {e}")
+        ntfy=cfg.get("ntfy",{})
+        if ntfy.get("enabled"):
+            topic=str(ntfy.get("topic","") or "").strip(); endpoint=str(ntfy.get("endpoint","") or "").rstrip("/")
+            if not topic or not endpoint: errors.append("ntfy requires endpoint and topic")
+            else:
+                url=f"{endpoint}/{urllib.parse.quote(topic.strip('/'),safe='/-_.')}"
+                headers={"Title":str(title)[:250],"Priority":"default"}
+                if ntfy.get("token"): headers["Authorization"]=f"Bearer {ntfy['token']}"
+                try: self._post(urllib.request.Request(url,data=str(message).encode("utf-8"),headers=headers,method="POST")); results.append("ntfy")
+                except Exception as e: errors.append(f"ntfy: {e}")
+        with self._lock: self._sent+=len(results)
+        return {"ok":not errors,"sent":len(results),"providers":results,"errors":errors}
+    def snapshot(self):
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings); sent=self._sent
+        return {"enabled":bool(cfg.get("enabled")),"minimum_severity":cfg.get("minimum_severity","medium"),"pushover":bool(cfg.get("pushover",{}).get("enabled")),"ntfy":bool(cfg.get("ntfy",{}).get("enabled")),"sent":sent,"warnings":warnings}
+
 # ─── Forensic Export Bundle ──────────────────────────────────────────────────
-_REDACT_KEYS = {"vt_api_key","service_token","api_key","password","secret"}
+_REDACT_KEYS = {"vt_api_key","service_token","api_key","password","secret","token"}
 
 def _redact_config(cfg):
     out={}
@@ -3915,6 +3968,7 @@ class HeadlessMonitor(QObject):
         self._ids = IDSRuleEngine("PyWallService")
         self._geo_fence = GeoIPFence("PyWallService")
         self._report_email = ScheduledReportEmail()
+        self._external_notifier = ExternalNotifier()
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -3989,6 +4043,7 @@ class HeadlessMonitor(QObject):
     def _on_dns_blocked(self, ev):
         domain = ev.get("domain", "")
         self.db.log_event(domain, "blocked", ev.get("process", ""), "Blocked by hosts file in service mode")
+        self._notify_external("Blocked domain", domain, "low")
 
     def _on_connections(self, conns):
         self._last_connection_count = len(conns)
@@ -3996,12 +4051,16 @@ class HeadlessMonitor(QObject):
         if live: self.conn_db.insert_batch(live)
         for ev in self._quota.check(live, db=self.db):
             _service_log(f"Quota exceeded for {ev.app}: {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}; blocked={ev.blocked}; {ev.message}")
+            self._notify_external("Bandwidth quota", f"{ev.app}: {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}", "medium")
         for ev in self._doh.check(live, db=self.db):
             _service_log(f"DoH {ev.action}: {ev.app} -> {ev.endpoint}; blocked={ev.blocked}; {ev.message}")
+            self._notify_external("DoH endpoint", f"{ev.app} -> {ev.endpoint}", "medium")
         for hit in self._ids.check(live, db=self.db):
             _service_log(f"IDS {hit['rule']}: {hit['app']} -> {hit['endpoint']}; blocked={hit['blocked']}; {hit['message']}")
+            self._notify_external("IDS match", f"{hit['app']} -> {hit['endpoint']}", "high")
         for event in self._geo_fence.check(live, db=self.db):
             _service_log(f"GeoIP fence {event['action']}: {event['app']} -> {event['ip']}; blocked={event['blocked']}; {event['message']}")
+            self._notify_external("GeoIP fence", f"{event['app']} -> {event['ip']}", "high")
         self._enforce_threats()
 
     def snapshot(self):
@@ -4035,6 +4094,7 @@ class HeadlessMonitor(QObject):
             "geoip": self._geo_w.snapshot(),
             "geoip_fence": self._geo_fence.snapshot(),
             "report_email": self._report_email.snapshot(),
+            "external_notifiers": self._external_notifier.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
             "firewall_tamper": fw.tamper_summary(),
@@ -4101,6 +4161,7 @@ class HeadlessMonitor(QObject):
         self._ids.configure(cfg, result.mtime)
         fence_warnings=self._geo_fence.configure(cfg, result.mtime) or []
         report_warnings=self._report_email.configure(cfg, result.mtime) or []
+        notifier_warnings=self._external_notifier.configure(cfg, result.mtime) or []
         self._geo_w.configure(cfg, result.mtime)
         self._tls_w.configure(cfg, result.mtime)
         self._config_mtime = result.mtime
@@ -4108,12 +4169,18 @@ class HeadlessMonitor(QObject):
         self._last_config_reload = f"recovered: {stamp}" if result.recovered else f"warnings: {stamp}" if result.warnings else stamp
         for warning in fence_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in report_warnings: _service_log(f"Config warning: {warning}", "WARNING")
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
+        for warning in notifier_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, notifiers={self._external_notifier.snapshot().get('sent',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
+        self._notify_external("Firewall block", f"{ci.proc} -> {ci.ra}:{ci.rp}", "low")
     def _on_event_connections(self, evts):
         if evts: self.conn_db.insert_batch(evts)
+
+    def _notify_external(self, title, message, severity):
+        result=self._external_notifier.notify(title,message,severity)
+        for error in result.get("errors",[]): _service_log(error,"WARNING")
 
     def _schedule_snapshot(self):
         scheduler = globals().get("rule_scheduler")
@@ -4168,6 +4235,7 @@ class HeadlessMonitor(QObject):
             self._processed_threats.add(key)
             mitre = f"{evt.mitre_tactic} / {evt.mitre_technique}" if evt.mitre_technique else "Unmapped"
             self.db.log_event(evt.source_ip, "threat", "PyWallService", f"{evt.type} [{mitre}]: {evt.details}")
+            self._notify_external(f"Threat: {evt.type}", f"{evt.source_ip}: {evt.details}", evt.severity)
             if self.auto_block and evt.severity == "high":
                 self._block_ip_all_directions(evt.source_ip, evt.type)
 
@@ -5871,7 +5939,7 @@ class MainWindow(QMainWindow):
         self._notif=NotificationController(self._config_result.data)
 
         # Core objects
-        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI"); self._geo_fence=GeoIPFence("PyWallGUI"); self._geo_fence.configure(self._config_result.data)
+        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI"); self._geo_fence=GeoIPFence("PyWallGUI"); self._geo_fence.configure(self._config_result.data); self._external_notifier=ExternalNotifier(self._config_result.data)
 
         # Background workers
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
@@ -6023,6 +6091,7 @@ class MainWindow(QMainWindow):
     def _on_blocked(self,ev):
         self.db.log_event(ev.get('domain',''),'blocked',ev.get('process',''),'Blocked by hosts file')
         self._diag.on_blocked(ev)
+        self._notify_external("Blocked domain",ev.get('domain',''),"low")
         if not (hasattr(self,'_tray') and self._tray): return
         domain = ev.get('domain','')
         if self._notif.should_notify(f"block:{domain}", severity="low", title="Blocked", message=domain):
@@ -6080,6 +6149,7 @@ class MainWindow(QMainWindow):
         key=f"quota:{ev.period}:{ev.key}"
         title="Bandwidth quota blocked" if ev.blocked else "Bandwidth quota exceeded"
         msg=f"{title}: {ev.app} {_fmt_bytes(ev.used)} / {_fmt_bytes(ev.limit)}"
+        self._notify_external(title,msg,"medium")
         if self._notif.should_notify(key, severity="medium", title=title, message=msg):
             self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
 
@@ -6089,6 +6159,7 @@ class MainWindow(QMainWindow):
         key=f"doh:{ev.endpoint}:{ev.app}"
         title="DoH endpoint blocked" if ev.blocked else "DoH endpoint detected"
         msg=f"{title}: {ev.app} -> {ev.endpoint}"
+        self._notify_external(title,msg,"medium")
         if self._notif.should_notify(key, severity="medium", title=title, message=msg):
             self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
 
@@ -6098,26 +6169,34 @@ class MainWindow(QMainWindow):
         key=f"ids:{hit.get('rule')}:{hit.get('endpoint')}:{hit.get('app')}"
         title="IDS rule blocked" if hit.get("blocked") else "IDS rule matched"
         msg=f"{title}: {hit.get('rule')} {hit.get('app')} -> {hit.get('endpoint')}"
+        self._notify_external(title,msg,"high")
         if self._notif.should_notify(key, severity="high", title=title, message=msg):
             self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
 
     def _on_geoip_fence_event(self,event):
         self._update_status(f"GeoIP fence {event.get('action','warn')} {event.get('ip','')}")
+        title="GeoIP fence blocked" if event.get("blocked") else "GeoIP fence matched"
+        message=f"{title}: {event.get('app','?')} -> {event.get('ip','?')} ({event.get('cc','-')})"
+        self._notify_external(title,message,"high" if event.get("blocked") else "medium")
         tray=getattr(self,"_tray",None)
         if not tray: return
         key=f"geoip-fence:{event.get('ip')}"
-        title="GeoIP fence blocked" if event.get("blocked") else "GeoIP fence matched"
-        message=f"{title}: {event.get('app','?')} -> {event.get('ip','?')} ({event.get('cc','-')})"
         if self._notif.should_notify(key, severity="high" if event.get("blocked") else "medium", title=title, message=message):
             tray.showMessage(APP_NAME,message,QSystemTrayIcon.Warning,4000)
 
     def _on_fw_block(self,ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra,'fw_blocked',ci.proc,f'FW blocked: {ci.ra}:{ci.rp}')
-        if not (hasattr(self,'_tray') and self._tray): return
         key=f"fw:{ci.ra}"
         msg=f"FW Blocked: {ci.proc} \u2192 {ci.ra}"
+        self._notify_external("FW Blocked",msg,"low")
+        if not (hasattr(self,'_tray') and self._tray): return
         if self._notif.should_notify(key, severity="low", title="FW Blocked", message=msg):
             self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 2000)
+
+    def _notify_external(self,title,message,severity):
+        result=self._external_notifier.notify(title,message,severity)
+        errors=result.get("errors",[])
+        if errors: self._sbar_msg.setText(errors[0][:180])
 
     def _flush_digest(self):
         items=self._notif.drain_digest()

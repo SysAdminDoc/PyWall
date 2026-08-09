@@ -119,7 +119,7 @@ One-click incident bundle from the Tools tab: produces a timestamped ZIP archive
 
 ### Notification Controls
 
-Configurable notification fatigue controls: severity threshold filtering (low/medium/high), per-alert snooze with cooldown, startup warmup suppression, and optional periodic digest of suppressed alerts.
+Configurable notification fatigue controls: severity threshold filtering (low/medium/high), per-alert snooze with cooldown, startup warmup suppression, and optional periodic digest of suppressed alerts. Default-disabled HTTPS adapters can send high-value alerts to Pushover or ntfy when operator-provided tokens/topics are configured.
 
 ### Bandwidth Quotas
 
@@ -199,6 +199,7 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
 | `geoip_fence` | `{ "mode": "disabled", "countries": [], "action": "block" }` | Optional country policy: `allow` or `deny` two-letter country codes, with `warn` or `block` action |
 | `report_email` | disabled SMTP settings | Optional scheduled daily/weekly usage report delivery; requires an operator-provided SMTP host, sender, recipients, and credentials |
+| `external_notifiers` | disabled | Optional Pushover/ntfy HTTPS delivery with severity threshold and operator-provided credentials |
 | `plugins_enabled` | `false` | Global plugin execution gate; manifests are scanned but not executable unless this is true |
 | `plugin_marketplace_url` | `""` | Optional HTTPS JSON index URL used for pointer/version checks; no code is downloaded |
 | `plugin_enabled_ids` | `[]` | Explicit allowlist of plugin IDs that may execute declared hooks |
@@ -294,6 +295,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `PluginMarketplace` | HTTPS-only marketplace pointer and version checker; downloads no plugin code |
 | `GeoIPFence` | Default-disabled country allow/deny adapter with deduplicated firewall enforcement and service status evidence |
 | `ScheduledReportEmail` | Default-disabled SMTP adapter that attaches generated CSV/HTML reports and persists its cadence |
+| `ExternalNotifier` | Default-disabled HTTPS Pushover and ntfy adapters with severity filtering and token redaction |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |

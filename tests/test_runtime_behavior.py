@@ -17,6 +17,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib
+import urllib.parse
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -120,6 +123,7 @@ BASE_NAMES = {
     "batch_connection_targets",
     "GeoIPFence",
     "ScheduledReportEmail",
+    "ExternalNotifier",
 }
 
 class FakeSignal:
@@ -194,7 +198,7 @@ def load_runtime(*names):
         "threading": threading,
         "time": time,
         "TEvent": threading.Event,
-        "urllib": __import__("urllib.request"),
+        "urllib": urllib,
         "webbrowser": __import__("webbrowser"),
         "QObject": object,
         "QTimer": object,
@@ -248,6 +252,36 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_external_notifier_uses_https_pushover_and_ntfy_transports(self):
+        ns = load_runtime("ExternalNotifier")
+        requests = []
+
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, exc_type, exc, tb): return False
+            def read(self, *args): return b"ok"
+
+        def opener(request, timeout=15):
+            requests.append((request, timeout))
+            return FakeResponse()
+
+        cfg = {"external_notifiers": {
+            "enabled": True,
+            "minimum_severity": "low",
+            "pushover": {"enabled": True, "endpoint": "https://api.example.test/messages", "token": "app-token", "user": "user-token"},
+            "ntfy": {"enabled": True, "endpoint": "https://ntfy.example.test", "topic": "security/alerts", "token": "ntfy-token"},
+        }}
+        notifier = ns["ExternalNotifier"](cfg, opener=opener)
+        result = notifier.notify("Threat", "blocked endpoint", "high")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sent"], 2)
+        self.assertEqual(requests[0][0].full_url, "https://api.example.test/messages")
+        self.assertEqual(requests[1][0].full_url, "https://ntfy.example.test/security/alerts")
+        self.assertIn(b"app-token", requests[0][0].data)
+        self.assertEqual(notifier.notify("Low", "ignored", "low")["sent"], 2)
+        rejected = ns["ExternalNotifier"]({"external_notifiers": {"enabled": True, "pushover": {"enabled": True, "endpoint": "http://plain.test"}}})
+        self.assertFalse(rejected.snapshot()["pushover"])
+
     def test_geoip_fence_allowlist_warns_and_blocks_once(self):
         ns = load_runtime("GeoIPFence")
         calls = []
@@ -784,6 +818,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             monitor._ids = FakeConfigurable({"rules": 0})
             monitor._geo_fence = FakeConfigurable({"mode": "disabled"})
             monitor._report_email = FakeConfigurable({"enabled": False})
+            monitor._external_notifier = FakeConfigurable({"enabled": False})
             monitor._geo_w = FakeConfigurable({"provider": "maxmind"})
             monitor._tls_w = FakeConfigurable({"enabled": True})
 
@@ -794,7 +829,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(monitor._timer.interval, 5000)
             self.assertTrue(monitor._last_config_reload)
             self.assertEqual(monitor._quota.calls[-1][0], "load")
-            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._geo_w, monitor._tls_w):
+            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
 
