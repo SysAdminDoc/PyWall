@@ -38,6 +38,8 @@ python PyWall.py
 
 Dependencies are pinned in `requirements.txt` and must be installed before launch. PyWall auto-elevates to admin and configures Windows firewall audit logging automatically.
 
+For headless automation, enable the token-authenticated API in `config.json` or run `python PyWall.py api serve --token "replace-with-a-long-token"`. Query it with `python PyWall.py api status --token "replace-with-a-long-token"`. Import `PyWall.psm1` for PowerShell commands such as `Block-PyWallIP` and `Allow-PyWallPort`.
+
 ---
 
 ## Features
@@ -201,6 +203,8 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `geoip_fence` | `{ "mode": "disabled", "countries": [], "action": "block" }` | Optional country policy: `allow` or `deny` two-letter country codes, with `warn` or `block` action |
 | `report_email` | disabled SMTP settings | Optional scheduled daily/weekly usage report delivery; requires an operator-provided SMTP host, sender, recipients, and credentials |
 | `external_notifiers` | disabled | Optional Pushover/ntfy HTTPS delivery with severity threshold and operator-provided credentials |
+| `rest_api` | disabled | Optional bearer-token automation API; loopback HTTP is the default, while non-loopback listeners require TLS certificate/key paths |
+| `fleet_agents` | `[]` | Optional HTTPS PyWall agent list for read-only status/threat aggregation and explicit managed-rule push |
 | `plugins_enabled` | `false` | Global plugin execution gate; manifests are scanned but not executable unless this is true |
 | `plugin_marketplace_url` | `""` | Optional HTTPS JSON index URL used for pointer/version checks; no code is downloaded |
 | `plugin_enabled_ids` | `[]` | Explicit allowlist of plugin IDs that may execute declared hooks |
@@ -244,6 +248,7 @@ rule suspicious_powershell {
 | `PyQt5` | GUI |
 | `psutil` | Process and connection enumeration |
 | `maxminddb` | Optional local MaxMind-compatible GeoIP database reader |
+| `cryptography` | AES-GCM and PBKDF2 primitives for encrypted config exports |
 | `pywin32` | Windows Service install/start/stop/status control |
 
 If dependencies are missing, startup exits with the exact `pip install -r requirements.txt` command to run.
@@ -299,6 +304,8 @@ geoip_update_state.json  Last MaxMind database update/check timestamps
 | `ScheduledReportEmail` | Default-disabled SMTP adapter that attaches generated CSV/HTML reports and persists its cadence |
 | `ExternalNotifier` | Default-disabled HTTPS Pushover and ntfy adapters with severity filtering and token redaction |
 | `MaxMindDBUpdater` | Default-disabled HTTPS database updater with checksum verification, format validation, and atomic replacement |
+| `LocalRestAPI` | Default-disabled bearer-token API for status, threats, firewall actions, managed-rule push, fleet operations, and encrypted config export |
+| `FleetAgentClient` / `FleetManager` | HTTPS remote-agent status/rule client with read-only fleet snapshots and aggregated threat timeline |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |
@@ -310,6 +317,12 @@ geoip_update_state.json  Last MaxMind database update/check timestamps
 | `DisplayFilter` | Wireshark-style field-based filter parser for history and live connection views |
 | `create_forensic_bundle` | Timestamped ZIP incident archive with history, config, logs, and firewall rules |
 | `MainWindow` | PyQt5 GUI: 10 tabs, toasts, tray, WFC-style rule editor |
+
+### Automation and fleet API
+
+The local API is disabled by default. Enable `rest_api` with a token of at least 16 characters; it binds to loopback HTTP by default. A non-loopback listener must provide `tls_cert` and `tls_key`, and fleet agent URLs are HTTPS-only. Endpoints include `GET /v1/status`, `GET /v1/rules`, `GET /v1/threats`, `POST /v1/firewall/block-ip`, `POST /v1/firewall/allow-port`, `POST /v1/rules/push`, `GET /v1/fleet`, and encrypted `POST /v1/config/export`.
+
+Rule pushes are limited to managed `PW_`/legacy `HG_` rules and are never performed automatically.
 
 ---
 

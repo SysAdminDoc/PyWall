@@ -7,9 +7,10 @@ monitoring. Block domains via hosts file OR firewall rules. Full local system co
 import multiprocessing
 multiprocessing.freeze_support()
 
-import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io, html
-import tempfile, webbrowser, socket, datetime, ipaddress, logging, smtplib
+import sys, os, subprocess, json, sqlite3, re, shutil, time, threading, hashlib, csv, io, html, base64
+import tempfile, webbrowser, socket, datetime, ipaddress, logging, smtplib, ssl
 import argparse, signal, hmac, secrets, fnmatch
+import http.server
 from email.message import EmailMessage
 from pathlib import Path
 from collections import OrderedDict, defaultdict
@@ -59,7 +60,7 @@ def _missing_dependency_message(missing):
     )
 
 def _check_dependencies():
-    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil'), ('maxminddb', 'maxminddb')]
+    deps = [('PyQt5', 'PyQt5'), ('psutil', 'psutil'), ('maxminddb', 'maxminddb'), ('cryptography', 'cryptography')]
     if sys.platform == 'win32':
         deps.append(('pywin32', 'win32serviceutil'))
     missing = []
@@ -222,6 +223,8 @@ CONFIG_DEFAULTS = {
     "geoip_fence": {"mode": "disabled", "countries": [], "action": "block"},
     "report_email": {"enabled": False, "interval_hours": 24, "smtp_host": "", "smtp_port": 587, "username": "", "password": "", "from": "", "to": [], "use_tls": True},
     "external_notifiers": {"enabled": False, "minimum_severity": "medium", "pushover": {"enabled": False, "endpoint": "https://api.pushover.net/1/messages.json", "token": "", "user": ""}, "ntfy": {"enabled": False, "endpoint": "https://ntfy.sh", "topic": "", "token": ""}},
+    "rest_api": {"enabled": False, "host": "127.0.0.1", "port": 8765, "token": "", "tls_cert": "", "tls_key": ""},
+    "fleet_agents": [],
     "plugins_enabled": False,
     "plugin_marketplace_url": PLUGIN_MARKETPLACE_URL,
     "plugin_enabled_ids": [],
@@ -2164,6 +2167,10 @@ class FirewallEngine:
         nm=f"{FW_PFX}Block_Port{port}_{proto}_{direction[:3]}"
         if self.rule_exists(nm): return True,"Rule already exists"
         return self.create_rule(nm,direction,"Block",remote_port=str(port),protocol=proto,desc="Port blocked by PyWall")
+    def allow_port(self,port,proto="TCP",direction="Outbound"):
+        nm=f"{FW_PFX}Allow_Port{port}_{proto}_{direction[:3]}"
+        if self.rule_exists(nm): return True,"Rule already exists"
+        return self.create_rule(nm,direction,"Allow",remote_port=str(port),protocol=proto,desc="Port allowed by PyWall")
     def get_profile_status(self):
         ok,out=_ps("Get-NetFirewallProfile | Select-Object Name, Enabled | ConvertTo-Json -Compress",15)
         result={"Domain":True,"Private":True,"Public":True}
@@ -4032,6 +4039,227 @@ class ServiceIPCServer:
             return {"ok": True, "status": self.monitor.snapshot()}
         return {"ok": False, "error": f"Unknown command: {cmd}"}
 
+def _api_json_safe(value):
+    if value is None or isinstance(value,(str,int,float,bool)): return value
+    if isinstance(value,dict): return {str(k):_api_json_safe(v) for k,v in value.items()}
+    if isinstance(value,(list,tuple,set)): return [_api_json_safe(v) for v in value]
+    fields=getattr(value,"__dataclass_fields__",{})
+    if fields: return {name:_api_json_safe(getattr(value,name,None)) for name in fields}
+    return str(value)
+
+def encrypt_config_export_bytes(passphrase, config=None, config_path=CONFIG_PATH):
+    """Encrypt a config export using PBKDF2-HMAC-SHA256 and AES-GCM."""
+    if not isinstance(passphrase,str) or len(passphrase)<8: raise ValueError("passphrase must be at least 8 characters")
+    if config is None:
+        try:
+            with open(config_path,"r",encoding="utf-8") as f: config=json.load(f)
+        except Exception as e: raise ValueError(f"config read failed: {e}")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    iterations=600000; salt=secrets.token_bytes(16); nonce=secrets.token_bytes(12)
+    key=PBKDF2HMAC(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=iterations).derive(passphrase.encode("utf-8"))
+    plaintext=json.dumps(_api_json_safe(config),sort_keys=True,separators=(",",":")).encode("utf-8")
+    ciphertext=AESGCM(key).encrypt(nonce,plaintext,b"PyWall config export v1")
+    envelope={"format":"PyWallConfig","version":1,"kdf":"PBKDF2-HMAC-SHA256","iterations":iterations,"salt":base64.b64encode(salt).decode(),"nonce":base64.b64encode(nonce).decode(),"ciphertext":base64.b64encode(ciphertext).decode()}
+    return b"PWCFG1\n"+json.dumps(envelope,sort_keys=True,separators=(",",":")).encode("utf-8")
+
+def decrypt_config_export_bytes(blob, passphrase):
+    if not isinstance(passphrase,str) or len(passphrase)<8: raise ValueError("passphrase must be at least 8 characters")
+    raw=blob.split(b"\n",1)[1] if isinstance(blob,bytes) and blob.startswith(b"PWCFG1\n") else blob
+    envelope=json.loads(raw.decode("utf-8"))
+    if envelope.get("format")!="PyWallConfig" or envelope.get("version")!=1: raise ValueError("unsupported config export format")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    salt=base64.b64decode(envelope["salt"]); nonce=base64.b64decode(envelope["nonce"]); iterations=int(envelope["iterations"])
+    key=PBKDF2HMAC(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=iterations).derive(passphrase.encode("utf-8"))
+    plaintext=AESGCM(key).decrypt(nonce,base64.b64decode(envelope["ciphertext"]),b"PyWall config export v1")
+    return json.loads(plaintext.decode("utf-8"))
+
+def export_encrypted_config(path, passphrase, config_path=CONFIG_PATH):
+    if not path: raise ValueError("output path is required")
+    payload=encrypt_config_export_bytes(passphrase,config_path=config_path); path=os.path.abspath(path); os.makedirs(os.path.dirname(path),exist_ok=True); tmp=path+".tmp"
+    with open(tmp,"wb") as f: f.write(payload); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,path); return path
+
+class LocalRestAPI:
+    """Loopback-only bearer-token API for automation and fleet agents."""
+    MAX_BODY=1024*1024
+    def __init__(self, monitor=None, config=None):
+        self.monitor=monitor; self._lock=Lock(); self._server=None; self._thread=None; self._warnings=[]; self._config={"enabled":False,"host":"127.0.0.1","port":8765,"token":""}; self.configure(config or {})
+    def configure(self, config=None, mtime=None):
+        raw=(config or {}).get("rest_api",{}) if isinstance(config or {},dict) and isinstance((config or {}).get("rest_api",{}),dict) else {}
+        enabled=bool(raw.get("enabled",False)); host=str(raw.get("host","127.0.0.1") or "127.0.0.1").strip(); token=str(raw.get("token","") or ""); tls_cert=str(raw.get("tls_cert","") or "").strip(); tls_key=str(raw.get("tls_key","") or "").strip()
+        warnings=[]
+        try: port=int(raw.get("port",8765) or 8765)
+        except: port=8765; warnings.append("rest_api.port must be an integer")
+        if (tls_cert and not tls_key) or (tls_key and not tls_cert): warnings.append("rest_api.tls_cert and rest_api.tls_key must be configured together"); enabled=False
+        if host not in ("127.0.0.1","localhost","::1") and not (tls_cert and tls_key): warnings.append("non-loopback rest_api.host requires TLS certificate and key"); enabled=False
+        if port<1 or port>65535: warnings.append("rest_api.port must be between 1 and 65535"); port=8765
+        if enabled and len(token)<16: warnings.append("rest_api.token must be at least 16 characters when enabled"); enabled=False
+        with self._lock: self._config={"enabled":enabled,"host":"127.0.0.1" if host=="localhost" else host,"port":port,"token":token,"tls_cert":tls_cert,"tls_key":tls_key}; self._warnings=warnings
+        return list(warnings)
+    def _authorized(self, headers):
+        with self._lock: token=self._config.get("token","")
+        auth=headers.get("Authorization","") if hasattr(headers,"get") else ""
+        supplied=auth[7:] if str(auth).lower().startswith("bearer ") else ""
+        return bool(token) and hmac.compare_digest(str(supplied),token)
+    def _rule_data(self):
+        try: return _api_json_safe(fw.get_all_rules(force_refresh=True))
+        except Exception as e: return {"error":str(e)}
+    def _threat_data(self): return _api_json_safe(threats.get_events(200))
+    def _push_rules(self, rules):
+        if not isinstance(rules,list) or len(rules)>100: return {"ok":False,"error":"rules must be a list of at most 100 entries"}
+        results=[]
+        for item in rules:
+            if not isinstance(item,dict): results.append({"ok":False,"error":"rule must be an object"}); continue
+            name=str(item.get("name","") or "").strip()
+            if not _is_managed_rule_name(name): results.append({"name":name,"ok":False,"error":"only managed PW_/HG_ rule names may be pushed"}); continue
+            values={key:item.get(key,"") for key in ("direction","action","remote_addr","remote_port","local_addr","local_port","protocol","program","profile","desc","enabled")}
+            try:
+                exists=fw.rule_exists(name)
+                if exists: ok,out=fw.update_rule(name,{key:values[key] for key in ("action","enabled","profile","desc") if key in values})
+                else: ok,out=fw.create_rule(name,values.get("direction") or "Outbound",values.get("action") or "Block",remote_addr=values.get("remote_addr") or "",remote_port=values.get("remote_port") or "",local_addr=values.get("local_addr") or "",local_port=values.get("local_port") or "",protocol=values.get("protocol") or "",program=values.get("program") or "",profile=values.get("profile") or "Any",desc=values.get("desc") or "",enabled=values.get("enabled",True))
+                results.append({"name":name,"ok":bool(ok),"output":str(out)})
+            except Exception as e: results.append({"name":name,"ok":False,"error":str(e)})
+        return {"ok":all(item.get("ok") for item in results),"results":results}
+    def dispatch(self, method, path, body=None, headers=None):
+        headers=headers or {}; method=str(method).upper(); parsed=urllib.parse.urlsplit(path); route=parsed.path
+        if not self._authorized(headers): return 401,{"ok":False,"error":"Unauthorized"}
+        if method=="GET" and route=="/v1/status": return 200,{"ok":True,"status":_api_json_safe(self.monitor.snapshot() if self.monitor else {})}
+        if method=="GET" and route=="/v1/rules": return 200,{"ok":True,"rules":self._rule_data()}
+        if method=="GET" and route=="/v1/threats": return 200,{"ok":True,"threats":self._threat_data()}
+        if method=="GET" and route=="/v1/fleet":
+            if self.monitor and hasattr(self.monitor,"_fleet"): self.monitor._fleet.refresh()
+            return 200,{"ok":True,"fleet":_api_json_safe(self.monitor._fleet.snapshot() if self.monitor and hasattr(self.monitor,"_fleet") else {})}
+        if method!="POST": return 404,{"ok":False,"error":"Not found"}
+        if not isinstance(body,dict): return 400,{"ok":False,"error":"JSON object required"}
+        if route=="/v1/firewall/block-ip":
+            ip=str(body.get("ip","") or "").strip(); direction=str(body.get("direction","Outbound") or "Outbound")
+            try: ipaddress.ip_address(ip)
+            except ValueError: return 400,{"ok":False,"error":"invalid IP address"}
+            if direction not in ("Inbound","Outbound"): return 400,{"ok":False,"error":"direction must be Inbound or Outbound"}
+            ok,out=fw.block_ip(ip,direction); return 200 if ok else 500,{"ok":bool(ok),"output":str(out)}
+        if route=="/v1/firewall/allow-port":
+            try: port=int(body.get("port"))
+            except: return 400,{"ok":False,"error":"port must be an integer"}
+            proto=str(body.get("protocol","TCP") or "TCP").upper(); direction=str(body.get("direction","Outbound") or "Outbound")
+            if not 1<=port<=65535 or proto not in ("TCP","UDP","Any") or direction not in ("Inbound","Outbound"): return 400,{"ok":False,"error":"invalid port, protocol, or direction"}
+            ok,out=fw.allow_port(port,proto,direction); return 200 if ok else 500,{"ok":bool(ok),"output":str(out)}
+        if route=="/v1/rules/push": return (200 if isinstance(body.get("rules"),list) else 400),self._push_rules(body.get("rules"))
+        if route=="/v1/fleet/refresh":
+            if not self.monitor or not hasattr(self.monitor,"_fleet"): return 503,{"ok":False,"error":"fleet manager unavailable"}
+            self.monitor._fleet.refresh(); return 200,{"ok":True,"fleet":self.monitor._fleet.snapshot()}
+        if route=="/v1/fleet/push":
+            if not self.monitor or not hasattr(self.monitor,"_fleet"): return 503,{"ok":False,"error":"fleet manager unavailable"}
+            return 200,{"ok":True,"results":self.monitor._fleet.push_rules(body.get("rules",[]),body.get("agent_ids"))}
+        if route=="/v1/config/export":
+            try: payload=encrypt_config_export_bytes(str(body.get("passphrase","") or "")); return 200,{"ok":True,"format":"PWCFG1","payload":base64.b64encode(payload).decode("ascii")}
+            except Exception as e: return 400,{"ok":False,"error":str(e)}
+        return 404,{"ok":False,"error":"Not found"}
+    def _handler(self):
+        api=self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self,*args): pass
+            def _send(self,status,payload):
+                raw=json.dumps(payload,default=_api_json_safe).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
+            def _request(self):
+                length=int(self.headers.get("Content-Length","0") or 0)
+                if length>api.MAX_BODY: self._send(413,{"ok":False,"error":"request too large"}); return
+                raw=self.rfile.read(length) if length else b""; body=None
+                if raw:
+                    try: body=json.loads(raw.decode("utf-8"))
+                    except: self._send(400,{"ok":False,"error":"invalid JSON"}); return
+                status,payload=api.dispatch(self.command,self.path,body,self.headers); self._send(status,payload)
+            def do_GET(self): self._request()
+            def do_POST(self): self._request()
+        return Handler
+    def start(self):
+        with self._lock:
+            cfg=dict(self._config); warnings=list(self._warnings)
+        if warnings or not cfg.get("enabled"): return False,"; ".join(warnings) if warnings else "disabled"
+        if self._server is not None: return True,"already running"
+        try:
+            self._server=http.server.ThreadingHTTPServer((cfg["host"],cfg["port"]),self._handler()); self._server.daemon_threads=True
+            if cfg.get("tls_cert") and cfg.get("tls_key"):
+                context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version=ssl.TLSVersion.TLSv1_2; context.load_cert_chain(cfg["tls_cert"],cfg["tls_key"]); self._server.socket=context.wrap_socket(self._server.socket,server_side=True)
+            self._thread=threading.Thread(target=self._server.serve_forever,name="PyWallRestAPI",daemon=True); self._thread.start(); return True,f"listening on {cfg['host']}:{cfg['port']}"
+        except Exception as e: self._server=None; return False,str(e)
+    def stop(self):
+        server=self._server; self._server=None
+        if server is not None:
+            try: server.shutdown(); server.server_close()
+            except: pass
+        if self._thread: self._thread.join(timeout=2); self._thread=None
+    def snapshot(self):
+        with self._lock: cfg=dict(self._config); warnings=list(self._warnings); running=self._server is not None
+        return {"enabled":bool(cfg.get("enabled")),"host":cfg.get("host","127.0.0.1"),"port":cfg.get("port",8765),"tls":bool(cfg.get("tls_cert") and cfg.get("tls_key")),"configured":bool(cfg.get("token")),"running":running,"warnings":warnings}
+
+class FleetAgentClient:
+    """HTTPS client for another PyWall LocalRestAPI instance."""
+    def __init__(self, opener=None): self.opener=opener or urllib.request.urlopen
+    def _request(self, agent, method, route, payload=None):
+        url=str(agent.get("url","") or "").rstrip("/")+route
+        if not url.lower().startswith("https://"): raise ValueError("fleet agent URL must use https://")
+        headers={"Authorization":f"Bearer {agent.get('token','')}","Accept":"application/json"}; data=None
+        if payload is not None: data=json.dumps(payload).encode("utf-8"); headers["Content-Type"]="application/json"
+        request=urllib.request.Request(url,data=data,headers=headers,method=method)
+        with self.opener(request,timeout=20) as response:
+            raw=response.read(2*1024*1024+1)
+            if len(raw)>2*1024*1024: raise ValueError("agent response exceeds 2 MiB")
+            result=json.loads(raw.decode("utf-8")) if raw else {}
+            status=int(getattr(response,"status",200) or 200)
+        if status>=400 or not result.get("ok",False): raise ValueError(result.get("error",f"agent returned HTTP {status}"))
+        return result
+    def status(self,agent): return self._request(agent,"GET","/v1/status").get("status",{})
+    def threats(self,agent): return self._request(agent,"GET","/v1/threats").get("threats",[])
+    def push_rules(self,agent,rules): return self._request(agent,"POST","/v1/rules/push",{"rules":rules})
+
+class FleetManager:
+    """Configured remote-agent status, rule push, and threat timeline aggregator."""
+    def __init__(self, config=None, client=None):
+        self.client=client or FleetAgentClient(); self._lock=Lock(); self._agents=[]; self._warnings=[]; self._statuses={}; self._timeline=[]; self._last_refresh=0
+        self.configure(config or {})
+    def configure(self, config=None, mtime=None):
+        raw=(config or {}).get("fleet_agents",[]) if isinstance(config or {},dict) else []; raw=raw if isinstance(raw,list) else []
+        agents=[]; warnings=[]; seen=set()
+        for item in raw[:100]:
+            if not isinstance(item,dict): warnings.append("fleet_agents entries must be objects"); continue
+            ident=str(item.get("id","") or "").strip(); url=str(item.get("url","") or "").strip(); token=str(item.get("token","") or "")
+            if not re.match(r"^[A-Za-z0-9_.-]{1,80}$",ident) or ident in seen: warnings.append(f"invalid or duplicate fleet agent id: {ident}"); continue
+            if not url.lower().startswith("https://"): warnings.append(f"fleet agent {ident} URL must use https://"); continue
+            if len(token)<16: warnings.append(f"fleet agent {ident} token must be at least 16 characters"); continue
+            seen.add(ident); agents.append({"id":ident,"name":str(item.get("name",ident) or ident),"url":url.rstrip("/"),"token":token})
+        with self._lock: self._agents=agents; self._warnings=warnings
+        return list(warnings)
+    def refresh(self):
+        with self._lock: agents=[dict(a) for a in self._agents]
+        statuses={}; timeline=[]
+        for agent in agents:
+            try:
+                status=self.client.status(agent); events=self.client.threats(agent); statuses[agent["id"]]={"id":agent["id"],"name":agent["name"],"url":agent["url"],"online":True,"status":status,"error":""}
+                for event in events if isinstance(events,list) else []: timeline.append(dict(_api_json_safe(event),agent_id=agent["id"],agent_name=agent["name"]))
+            except Exception as e: statuses[agent["id"]]={"id":agent["id"],"name":agent["name"],"url":agent["url"],"online":False,"status":{},"error":str(e)}
+        timeline.sort(key=lambda item:str(item.get("ts", "")),reverse=True)
+        with self._lock: self._statuses=statuses; self._timeline=timeline[:500]; self._last_refresh=time.time()
+        return list(statuses.values())
+    def push_rules(self, rules, agent_ids=None):
+        with self._lock: agents=[dict(a) for a in self._agents if agent_ids is None or a["id"] in set(agent_ids or [])]
+        results=[]
+        for agent in agents:
+            try: results.append({"agent_id":agent["id"],"name":agent["name"],"ok":True,"response":self.client.push_rules(agent,rules)})
+            except Exception as e: results.append({"agent_id":agent["id"],"name":agent["name"],"ok":False,"error":str(e)})
+        return results
+    def threat_timeline(self, limit=200):
+        with self._lock: return list(self._timeline[:max(1,int(limit or 200))])
+    def snapshot(self):
+        with self._lock: agents=[dict(a,token="") for a in self._agents]; statuses=dict(self._statuses); warnings=list(self._warnings); last=self._last_refresh; timeline=len(self._timeline)
+        summarized=[]
+        for agent in agents:
+            item=dict(agent); item.update(statuses.get(agent["id"],{"online":False,"status":{},"error":"not checked"})); item["token"]=""; summarized.append(item)
+        return {"configured":len(agents),"online":sum(1 for item in statuses.values() if item.get("online")),"last_refresh":last,"agents":summarized,"timeline_events":timeline,"warnings":warnings}
+
 class HeadlessMonitor(QObject):
     def __init__(self, auto_block=True, poll_seconds=2.0):
         super().__init__()
@@ -4047,6 +4275,7 @@ class HeadlessMonitor(QObject):
         self._report_email = ScheduledReportEmail()
         self._external_notifier = ExternalNotifier()
         self._mmdb_updater = MaxMindDBUpdater()
+        self._fleet = FleetManager()
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -4058,6 +4287,7 @@ class HeadlessMonitor(QObject):
         self._evt_w = EvtWorker()
         self._timer = QTimer(self)
         self._ipc = ServiceIPCServer(self)
+        self._rest_api = LocalRestAPI(self)
         self._restored_state = self._load_service_state()
         self._processed_threats = set()
         self._blocked_ips = set(self._restored_state.get("auto_blocked_ip_values", []))
@@ -4080,6 +4310,8 @@ class HeadlessMonitor(QObject):
         self._apply_schedules(force=True)
         plugins = self._plugins.scan()
         _service_log(f"Plugin guardrails scanned: {plugins.summary()}")
+        rest_ok,rest_msg=self._rest_api.start()
+        if not rest_ok and rest_msg not in ("disabled",""): _service_log(f"REST API disabled: {rest_msg}","WARNING")
         self._save_service_state(clean_shutdown=False)
         self._dns_w.start(); self._who_w.start(); self._geo_w.start(); self._sign_w.start(); self._tls_w.start()
         self._dns_mon.status_changed.connect(self._on_status)
@@ -4103,6 +4335,7 @@ class HeadlessMonitor(QObject):
         _service_log("Headless monitor stopping")
         self._timer.stop()
         self._ipc.stop()
+        self._rest_api.stop()
         for worker in (self._dns_mon, self._conn_w, self._evt_w, self._dns_w, self._who_w, self._geo_w, self._sign_w, self._tls_w):
             try: worker.stop()
             except: pass
@@ -4174,6 +4407,8 @@ class HeadlessMonitor(QObject):
             "report_email": self._report_email.snapshot(),
             "external_notifiers": self._external_notifier.snapshot(),
             "geoip_mmdb_update": self._mmdb_updater.snapshot(),
+            "fleet": self._fleet.snapshot(),
+            "rest_api": self._rest_api.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
             "firewall_tamper": fw.tamper_summary(),
@@ -4242,6 +4477,13 @@ class HeadlessMonitor(QObject):
         report_warnings=self._report_email.configure(cfg, result.mtime) or []
         notifier_warnings=self._external_notifier.configure(cfg, result.mtime) or []
         mmdb_warnings=self._mmdb_updater.configure(cfg, result.mtime) or []
+        rest_warnings=self._rest_api.configure(cfg, result.mtime) or []
+        fleet_warnings=self._fleet.configure(cfg, result.mtime) or []
+        rest_state=self._rest_api.snapshot()
+        if rest_state.get("running") and not rest_state.get("enabled"): self._rest_api.stop()
+        elif rest_state.get("enabled") and not rest_state.get("running"):
+            rest_ok,rest_msg=self._rest_api.start()
+            if not rest_ok and rest_msg not in ("disabled",""): rest_warnings.append(rest_msg)
         self._geo_w.configure(cfg, result.mtime)
         self._tls_w.configure(cfg, result.mtime)
         self._config_mtime = result.mtime
@@ -4251,6 +4493,8 @@ class HeadlessMonitor(QObject):
         for warning in report_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in notifier_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in mmdb_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        for warning in rest_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        for warning in fleet_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, notifiers={self._external_notifier.snapshot().get('sent',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
@@ -4357,6 +4601,26 @@ def run_headless_service(stop_event=None, auto_block=True, poll_seconds=2.0):
         guard.stop()
         monitor.stop()
 
+def _run_api_foreground(token, host="127.0.0.1", port=8765, auto_block=True, poll_seconds=2.0):
+    app = QCoreApplication.instance()
+    if app is None: app = QCoreApplication([APP_NAME, "api-serve"])
+    stop_event=threading.Event()
+    def _stop(*_): stop_event.set()
+    for sig_name in ("SIGINT","SIGTERM"):
+        sig=getattr(signal,sig_name,None)
+        if sig is not None:
+            try: signal.signal(sig,_stop)
+            except: pass
+    monitor=HeadlessMonitor(auto_block=auto_block,poll_seconds=poll_seconds); monitor.start()
+    monitor._rest_api.configure({"rest_api":{"enabled":True,"host":host,"port":port,"token":token}})
+    ok,msg=monitor._rest_api.start()
+    if not ok:
+        _service_log(f"REST API failed to start: {msg}","ERROR"); monitor.stop(); return 2
+    guard=QTimer()
+    guard.timeout.connect(lambda: app.quit() if stop_event.is_set() else None); guard.start(1000)
+    try: return app.exec_()
+    finally: guard.stop(); monitor.stop()
+
 def _run_service_foreground(auto_block=True, poll_seconds=2.0):
     stop_event = threading.Event()
     def _stop(*_):
@@ -4399,17 +4663,64 @@ def _build_cli_parser():
     run.add_argument("--poll-seconds", type=float, default=2.0)
     report = sub.add_parser("report", help="Export daily and weekly app usage reports")
     report.add_argument("--output", default=REPORT_DIR, help="Report output directory")
+    api = sub.add_parser("api", help="Query or serve the token-authenticated local REST API")
+    api.add_argument("action", choices=["serve","status","block-ip","allow-port","fleet-status","fleet-refresh","fleet-push","export-config"])
+    api.add_argument("--url", default="http://127.0.0.1:8765")
+    api.add_argument("--token", default="")
+    api.add_argument("--host", default="127.0.0.1")
+    api.add_argument("--listen-port", type=int, default=8765)
+    api.add_argument("--ip", default="")
+    api.add_argument("--direction", choices=["Inbound","Outbound"], default="Outbound")
+    api.add_argument("--port", type=int, default=0)
+    api.add_argument("--protocol", choices=["TCP","UDP","Any"], default="TCP")
+    api.add_argument("--passphrase", default="")
+    api.add_argument("--output", default="")
+    api.add_argument("--rules-file", default="")
+    api.add_argument("--agent-id", action="append", default=[])
+    api.add_argument("--no-auto-block", action="store_true")
+    api.add_argument("--poll-seconds", type=float, default=2.0)
     return parser
 
 def _dispatch_cli(argv):
     if not argv: return None
-    if argv[0] not in ("service", "service-run", "report", "-h", "--help"): return None
+    if argv[0] not in ("service", "service-run", "report", "api", "-h", "--help"): return None
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
     if args.command == "report":
         for item in export_usage_reports(args.output):
             print(f"{item['period']}: {item['rows']} apps -> {item['csv']} | {item['html']}")
         return 0
+    if args.command == "api":
+        if args.action=="serve":
+            if len(args.token)<16: print("--token must be at least 16 characters",file=sys.stderr); return 2
+            return _run_api_foreground(args.token,args.host,args.listen_port,auto_block=not args.no_auto_block,poll_seconds=args.poll_seconds)
+        if len(args.token)<16: print("--token must be at least 16 characters",file=sys.stderr); return 2
+        parsed_url=urllib.parse.urlsplit(args.url)
+        if parsed_url.scheme not in ("http","https") or not parsed_url.netloc: print("--url must be an HTTP(S) URL",file=sys.stderr); return 2
+        if parsed_url.hostname not in ("127.0.0.1","localhost","::1") and parsed_url.scheme!="https": print("non-loopback API URLs must use HTTPS",file=sys.stderr); return 2
+        if args.action=="status": route="/v1/status"; payload=None; method="GET"
+        elif args.action=="block-ip": route="/v1/firewall/block-ip"; payload={"ip":args.ip,"direction":args.direction}; method="POST"
+        elif args.action=="allow-port": route="/v1/firewall/allow-port"; payload={"port":args.port,"protocol":args.protocol,"direction":args.direction}; method="POST"
+        elif args.action=="fleet-status": route="/v1/fleet"; payload=None; method="GET"
+        elif args.action=="fleet-refresh": route="/v1/fleet/refresh"; payload={}; method="POST"
+        elif args.action=="fleet-push":
+            if not args.rules_file: print("--rules-file is required for fleet-push",file=sys.stderr); return 2
+            try:
+                with open(args.rules_file,"r",encoding="utf-8") as f: rules=json.load(f)
+            except Exception as e: print(f"rules file read failed: {e}",file=sys.stderr); return 2
+            if not isinstance(rules,list): print("--rules-file must contain a JSON array",file=sys.stderr); return 2
+            route="/v1/fleet/push"; payload={"rules":rules,"agent_ids":args.agent_id or None}; method="POST"
+        else: route="/v1/config/export"; payload={"passphrase":args.passphrase}; method="POST"
+        try:
+            request=urllib.request.Request(args.url.rstrip("/")+route,data=json.dumps(payload).encode("utf-8") if payload is not None else None,headers={"Authorization":f"Bearer {args.token}","Content-Type":"application/json"},method=method)
+            with urllib.request.urlopen(request,timeout=20) as response: result=json.loads(response.read(2*1024*1024).decode("utf-8"))
+        except Exception as e: print(f"API request failed: {e}",file=sys.stderr); return 1
+        if args.action=="export-config" and result.get("ok"):
+            if not args.output: print("--output is required for export-config",file=sys.stderr); return 2
+            path=os.path.abspath(args.output); os.makedirs(os.path.dirname(path),exist_ok=True)
+            with open(path,"wb") as f: f.write(base64.b64decode(result["payload"]))
+            print(path); return 0
+        print(json.dumps(result,indent=2,sort_keys=True)); return 0 if result.get("ok") else 1
     if args.command == "service-run" or (args.command == "service" and args.action == "run"):
         return _run_service_foreground(auto_block=not args.no_auto_block, poll_seconds=args.poll_seconds)
     if args.command == "service":
@@ -5813,10 +6124,28 @@ class HistoryTab(QWidget):
         except Exception as e: self.count_lbl.setText(f"Export failed: {e}")
 
 
+# ─── Fleet View ──────────────────────────────────────────────────────────────
+class FleetViewDialog(QDialog):
+    def __init__(self, manager, parent=None):
+        super().__init__(parent); self.manager=manager; self.setWindowTitle("PyWall Fleet View"); self.resize(900,560)
+        lo=QVBoxLayout(self); top=QHBoxLayout(); top.addWidget(QLabel("Configured HTTPS PyWall agents")); top.addStretch(); top.addWidget(_make_toolbar_btn("Refresh Fleet","primary",self.refresh)); lo.addLayout(top)
+        self.table=QTableWidget(0,5); self.table.setHorizontalHeaderLabels(["Agent","Endpoint","Online","Version","Error"]); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.horizontalHeader().setStretchLastSection(True); lo.addWidget(self.table,1)
+        self.timeline=QTableWidget(0,5); self.timeline.setHorizontalHeaderLabels(["Time","Agent","Type","Severity","Details"]); self.timeline.setEditTriggers(QTableWidget.NoEditTriggers); self.timeline.horizontalHeader().setStretchLastSection(True); lo.addWidget(QLabel("Aggregated threat timeline")); lo.addWidget(self.timeline,1); self.refresh()
+    def refresh(self):
+        rows=self.manager.refresh(); self.table.setRowCount(len(rows))
+        for i,row in enumerate(rows):
+            status=row.get("status",{}) if isinstance(row.get("status",{}),dict) else {}
+            values=[row.get("name",row.get("id","")),row.get("url",""),"Yes" if row.get("online") else "No",status.get("version", "-"),row.get("error","")]
+            for j,value in enumerate(values): self.table.setItem(i,j,QTableWidgetItem(str(value)))
+        events=self.manager.threat_timeline(200); self.timeline.setRowCount(len(events))
+        for i,event in enumerate(events):
+            values=[event.get("ts",""),event.get("agent_name",event.get("agent_id","")),event.get("type",""),event.get("severity",""),event.get("details","")]
+            for j,value in enumerate(values): self.timeline.setItem(i,j,QTableWidgetItem(str(value)))
+
 # ─── Tools Tab ───────────────────────────────────────────────────────────────
 class ToolsTab(QWidget):
     def __init__(self,db,hm):
-        super().__init__(); self.db=db; self.hm=hm; self._build()
+        super().__init__(); self.db=db; self.hm=hm; self.fleet=FleetManager(load_runtime_config().data); self._build()
     def _build(self):
         lo=QVBoxLayout(self); lo.setContentsMargins(20,16,20,16); lo.setSpacing(10)
         # Background service tools
@@ -5846,6 +6175,7 @@ class ToolsTab(QWidget):
         g3l.addWidget(_make_toolbar_btn("Export Usage Reports","primary",self._export_usage_reports))
         g3l.addWidget(_make_toolbar_btn("Forensic Bundle","primary",self._create_forensic_bundle))
         g3l.addWidget(_make_toolbar_btn("Update MaxMind DB","dim",self._update_maxmind))
+        g3l.addWidget(_make_toolbar_btn("Fleet View","dim",self._fleet_view))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
         # Plugin trust boundary tools
         gplug=QGroupBox("Plugin Guardrails"); gplugl=QVBoxLayout(gplug)
@@ -5964,6 +6294,8 @@ class ToolsTab(QWidget):
         if result.get("updated"): self.slbl.setText(f"MaxMind database updated: {os.path.basename(result.get('path',''))}")
         elif result.get("reason")=="disabled": self.slbl.setText("MaxMind database updater is disabled in config")
         else: self.slbl.setText(f"MaxMind update failed: {result.get('reason','unknown error')}")
+    def _fleet_view(self):
+        FleetViewDialog(self.fleet,self).exec_()
     def _create_forensic_bundle(self):
         path,_=QFileDialog.getSaveFileName(self,"Save Forensic Bundle",os.path.join(REPORT_DIR,f"pywall-incident-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),"ZIP files (*.zip)")
         if not path: return

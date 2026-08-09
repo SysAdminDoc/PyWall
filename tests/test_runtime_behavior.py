@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import ast
+import base64
 import datetime
 import hashlib
 import hmac
+import http
 import ipaddress
 import json
 import os
@@ -126,6 +128,12 @@ BASE_NAMES = {
     "GEOIP_UPDATE_STATE_PATH",
     "ScheduledReportEmail",
     "ExternalNotifier",
+    "_api_json_safe",
+    "encrypt_config_export_bytes",
+    "decrypt_config_export_bytes",
+    "LocalRestAPI",
+    "FleetAgentClient",
+    "FleetManager",
 }
 
 class FakeSignal:
@@ -168,6 +176,7 @@ def load_runtime(*names):
             nodes.append(node)
     ns = {
         "argparse": __import__("argparse"),
+        "base64": base64,
         "csv": __import__("csv"),
         "datetime": datetime,
         "defaultdict": defaultdict,
@@ -176,6 +185,7 @@ def load_runtime(*names):
         "fnmatch": __import__("fnmatch"),
         "hmac": hmac,
         "html": __import__("html"),
+        "http": http,
         "hashlib": hashlib,
         "ipaddress": ipaddress,
         "io": __import__("io"),
@@ -255,6 +265,58 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_local_rest_api_auth_actions_and_encrypted_export(self):
+        ns = load_runtime("LocalRestAPI", "encrypt_config_export_bytes", "decrypt_config_export_bytes")
+        monitor = SimpleNamespace(snapshot=lambda: {"version": "test", "status": "RUNNING"})
+        token = "local-api-token-123456"
+        api = ns["LocalRestAPI"](monitor, {"rest_api": {"enabled": True, "host": "127.0.0.1", "port": 9876, "token": token}})
+        self.assertEqual(api.dispatch("GET", "/v1/status", headers={})[0], 401)
+        headers = {"Authorization": f"Bearer {token}"}
+        status, payload = api.dispatch("GET", "/v1/status", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"]["version"], "test")
+        calls = []
+        ns["fw"] = SimpleNamespace(
+            block_ip=lambda ip, direction: (calls.append(("block", ip, direction)) or (True, "ok")),
+            allow_port=lambda port, protocol, direction: (calls.append(("allow", port, protocol, direction)) or (True, "ok")),
+            get_all_rules=lambda force_refresh=False: [],
+        )
+        result = api.dispatch("POST", "/v1/firewall/block-ip", {"ip": "2001:db8::1", "direction": "Inbound"}, headers)
+        self.assertEqual(result[0], 200)
+        self.assertEqual(calls[0], ("block", "2001:db8::1", "Inbound"))
+        self.assertEqual(api.dispatch("POST", "/v1/firewall/allow-port", {"port": 443, "protocol": "TCP"}, headers)[0], 200)
+        self.assertEqual(calls[1], ("allow", 443, "TCP", "Outbound"))
+        pathlib.Path(ns["CONFIG_PATH"]).write_text("{}", encoding="utf-8")
+        export_status, export = api.dispatch("POST", "/v1/config/export", {"passphrase": "correct horse battery staple"}, headers)
+        self.assertEqual(export_status, 200)
+        blob = base64.b64decode(export["payload"])
+        decoded = ns["decrypt_config_export_bytes"](blob, "correct horse battery staple")
+        self.assertEqual(decoded, {})
+
+    def test_fleet_manager_validates_agents_aggregates_and_pushes(self):
+        ns = load_runtime("FleetManager")
+
+        class FakeClient:
+            def __init__(self): self.pushed = []
+            def status(self, agent): return {"version": "4.2.0", "agent": agent["id"]}
+            def threats(self, agent): return [{"ts": "2026-08-09 12:00:00", "type": "PORT_SCAN", "severity": "high"}]
+            def push_rules(self, agent, rules): self.pushed.append((agent["id"], rules)); return {"ok": True, "results": [{"ok": True}]}
+
+        client = FakeClient()
+        config = {"fleet_agents": [
+            {"id": "east", "name": "East", "url": "https://east.example.test", "token": "east-token-123456"},
+            {"id": "bad", "url": "http://plain.example.test", "token": "bad-token-123456"},
+        ]}
+        manager = ns["FleetManager"](config, client=client)
+        self.assertEqual(manager.snapshot()["configured"], 1)
+        self.assertTrue(manager.snapshot()["warnings"])
+        rows = manager.refresh()
+        self.assertTrue(rows[0]["online"])
+        self.assertEqual(manager.snapshot()["online"], 1)
+        self.assertEqual(manager.threat_timeline()[0]["agent_id"], "east")
+        results = manager.push_rules([{ "name": "PW_Block_Test", "direction": "Outbound", "action": "Block" }], ["east"])
+        self.assertTrue(results[0]["ok"])
+        self.assertEqual(client.pushed[0][0], "east")
     def test_external_notifier_uses_https_pushover_and_ntfy_transports(self):
         ns = load_runtime("ExternalNotifier")
         requests = []
@@ -865,6 +927,8 @@ class RuntimeBehaviorTests(unittest.TestCase):
             monitor._report_email = FakeConfigurable({"enabled": False})
             monitor._external_notifier = FakeConfigurable({"enabled": False})
             monitor._mmdb_updater = FakeConfigurable({"enabled": False})
+            monitor._rest_api = FakeConfigurable({"enabled": False})
+            monitor._fleet = FakeConfigurable({"configured": 0})
             monitor._geo_w = FakeConfigurable({"provider": "maxmind"})
             monitor._tls_w = FakeConfigurable({"enabled": True})
 
@@ -875,7 +939,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(monitor._timer.interval, 5000)
             self.assertTrue(monitor._last_config_reload)
             self.assertEqual(monitor._quota.calls[-1][0], "load")
-            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._mmdb_updater, monitor._geo_w, monitor._tls_w):
+            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._mmdb_updater, monitor._rest_api, monitor._fleet, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
 

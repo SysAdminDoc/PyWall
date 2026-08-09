@@ -11,8 +11,10 @@ import unittest
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "PyWall.py"
 README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+POWERSHELL_MODULE = pathlib.Path(__file__).resolve().parents[1] / "PyWall.psm1"
 TEXT = SRC.read_text(encoding="utf-8")
 README_TEXT = README.read_text(encoding="utf-8")
+POWERSHELL_TEXT = POWERSHELL_MODULE.read_text(encoding="utf-8")
 TREE = ast.parse(TEXT)
 
 
@@ -302,11 +304,30 @@ class ServiceModeStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, TEXT)
 
+    def test_local_rest_and_fleet_api_are_wired(self):
+        for token in (
+            '"rest_api"',
+            '"fleet_agents"',
+            "class LocalRestAPI",
+            "class FleetAgentClient",
+            "class FleetManager",
+            "Bearer",
+            "/v1/status",
+            "/v1/rules/push",
+            "encrypt_config_export_bytes",
+            "PBKDF2-HMAC-SHA256",
+            "AESGCM",
+        ):
+            self.assertIn(token, TEXT)
+        for token in ("function Block-PyWallIP", "function Allow-PyWallPort", "function Export-PyWallConfig", "Invoke-RestMethod", "/v1/status", "/v1/config/export"):
+            self.assertIn(token, POWERSHELL_TEXT)
+
     def test_runtime_dependencies_are_pinned_and_not_auto_installed(self):
         requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("psutil==7.2.2", requirements)
         self.assertIn("PyQt5==5.15.11", requirements)
         self.assertIn("maxminddb==3.1.1", requirements)
+        self.assertIn("cryptography==50.0.0", requirements)
         self.assertIn('pywin32==312; sys_platform == "win32"', requirements)
         self.assertNotIn("requests", requirements)
         self.assertNotIn("pip', 'install", TEXT)

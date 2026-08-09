@@ -14,6 +14,8 @@ All notable changes to PyWall will be documented in this file.
 - Added: Default-disabled scheduled SMTP delivery for daily/weekly usage CSV and HTML reports with persisted cadence and attachment size limits.
 - Added: Default-disabled HTTPS Pushover and ntfy notification adapters with severity filtering, bearer support, and redacted provider tokens.
 - Added: Default-disabled MaxMind-compatible database updater with HTTPS-only downloads, SHA-256 verification, format validation, persisted cadence, and atomic replacement.
+- Added: Default-disabled bearer-token REST API for loopback automation, safe firewall actions, managed-rule push, fleet operations, and AES-GCM encrypted config export.
+- Added: HTTPS fleet agent client/manager with read-only status, explicit managed-rule distribution, aggregated threat timeline, and PowerShell module commands.
 
 ## [v4.2.0] - 2026-06-30
 
