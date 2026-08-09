@@ -44,7 +44,7 @@ Dependencies are pinned in `requirements.txt` and must be installed before launc
 
 ### Live Connection Monitor
 
-Real-time table of every TCP/UDP connection on the system with process name, PID, svchost service names, parent process, UWP/package identity where visible, signer trust, remote IP, hostname, port, protocol, country, traffic category, and reputation score. Connections are resolved in the background via DNS, WHOIS, HTTPS/local GeoIP, and signer workers. Traffic is auto-categorized into groups like Streaming, Gaming, Social Media, Ads/Tracking, and more.
+Real-time table of every TCP/UDP connection on the system with process name, PID, svchost service names, parent process, UWP/package identity where visible, signer trust, remote IP, hostname, port, protocol, country, traffic category, and reputation score. Connections are resolved in the background via DNS, WHOIS, HTTPS/local GeoIP, and signer workers. Traffic is auto-categorized into groups like Streaming, Gaming, Social Media, Ads/Tracking, and more. Extended selection supports one-click batch firewall or hosts-file actions for unknown public endpoints.
 
 ### WFC-Style Rules Panel
 

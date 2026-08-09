@@ -855,6 +855,25 @@ class CI:
     category:str=""; bytes_sent:int=0; bytes_recv:int=0
     event_source:str=""; event_id:int=0; event_record_id:int=0; rule_name:str=""; filter_id:str=""
 
+def batch_connection_targets(conns, unknown_only=True):
+    """Return deduplicated public remote endpoints suitable for batch firewall actions."""
+    targets={}
+    for ci in (conns or []):
+        if unknown_only and str(ci.stat or "-") not in ("-", ""):
+            continue
+        ip=str(ci.ra or "").strip()
+        if not ip or ip in ("*", "-", "0.0.0.0", "::", "::0") or PRIV_RE.match(ip):
+            continue
+        direction="Inbound" if str(ci.dir or "").lower() in ("in", "inbound", "listen") else "Outbound"
+        key=(ip,direction)
+        entry=targets.setdefault(key,{"ip":ip,"direction":direction,"processes":set(),"hosts":set()})
+        if ci.proc and ci.proc not in ("?","-"): entry["processes"].add(ci.proc)
+        if ci.host and ci.host not in ("-","..."): entry["hosts"].add(ci.host.lower())
+    return [
+        dict(entry, processes=sorted(entry["processes"]), hosts=sorted(entry["hosts"]))
+        for _,entry in sorted(targets.items())
+    ]
+
 @dataclass
 class LearningReviewGroup:
     key:str=""; proc:str=""; path:str=""; signer:str="-"; parent:str="-"
@@ -4495,19 +4514,21 @@ class ConnectionsTab(QWidget):
         cat_cb.currentTextChanged.connect(lambda v:setattr(self,'_filter_cat',v)); tb.addWidget(cat_cb)
         self._view_cb=QComboBox(); self._view_cb.addItems(["Connections","Signer Groups"])
         self._view_cb.currentTextChanged.connect(self._on_view_change); tb.addWidget(self._view_cb)
+        self._batch_block_btn=_make_toolbar_btn("Block selected unknown","danger",self._batch_block_selected); tb.addWidget(self._batch_block_btn)
+        self._batch_hosts_btn=_make_toolbar_btn("Hosts block selected","warning",self._batch_hosts_selected); tb.addWidget(self._batch_hosts_btn)
         tb.addStretch()
         self.count_lbl=QLabel("0 connections"); self.count_lbl.setStyleSheet(f"color:{C['overlay']};font-size:11px;"); tb.addWidget(self.count_lbl)
         lo.addLayout(tb)
         splitter=QSplitter(Qt.Horizontal)
         self.table=QTableWidget(0,20)
         cols=["Time","Dir","Proto","Local","L.Port","Remote","R.Port","Hostname","Process","PID","Service","Parent","Package","Signer","Owner","Country","Category","Sent","Recv","Status"]
-        self.table.setHorizontalHeaderLabels(cols); self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setHorizontalHeaderLabels(cols); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         _a11y_table(self.table,"Live connections table","Live connection rows with text status, process identity, signer, service, country, and byte counters")
         self.table.verticalHeader().setVisible(False); self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setIconSize(QSize(16,16))
         widths=[58,35,38,100,50,110,50,150,100,42,95,110,130,120,90,65,75,70,70,90]
         for i,w in enumerate(widths): self.table.setColumnWidth(i,w)
-        self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self._ctx_menu)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self._ctx_menu); self.table.itemSelectionChanged.connect(self._update_batch_state)
         self.table.currentCellChanged.connect(self._on_select); splitter.addWidget(self.table)
         rp=QWidget(); rl=QVBoxLayout(rp); rl.setContentsMargins(6,0,0,0)
         rl.addWidget(QLabel("Connection Detail")); self.detail=QTextEdit(); self.detail.setReadOnly(True); self.detail.setMaximumHeight(200)
@@ -4577,6 +4598,43 @@ class ConnectionsTab(QWidget):
         if ci.host and ci.host not in ("-","..."): menu.addAction(f"Research ({ci.host})").triggered.connect(lambda:open_research(ci.host))
         menu.addAction(f"Copy IP ({ci.ra})").triggered.connect(lambda:QApplication.clipboard().setText(ci.ra))
         menu.exec_(self.table.viewport().mapToGlobal(pos))
+    def _selected_cis(self):
+        if self._view_cb.currentText()!="Connections": return []
+        selected=[]; seen=set()
+        for index in self.table.selectionModel().selectedRows():
+            row=index.row()
+            if 0<=row<len(self._filtered) and row not in seen:
+                selected.append(self._filtered[row]); seen.add(row)
+        return selected
+    def _update_batch_state(self):
+        count=len(self._selected_cis())
+        self._batch_block_btn.setEnabled(count>0); self._batch_hosts_btn.setEnabled(count>0)
+        if count: self.count_lbl.setText(f"{count} selected | {len(self._filtered)}/{len(self._data)} connections")
+    def _batch_block_selected(self):
+        selected=self._selected_cis(); targets=batch_connection_targets(selected,unknown_only=True)
+        if not targets:
+            self.count_lbl.setText("No public unknown endpoints selected")
+            return
+        success=0; failures=[]
+        for target in targets:
+            ok,out=fw.block_ip(target["ip"],target["direction"])
+            if ok: success+=1
+            else: failures.append(f"{target['ip']}: {out}")
+        self._refresh_rules()
+        msg=f"Blocked {success}/{len(targets)} selected endpoint(s)"
+        if failures: msg+=f"; {failures[0]}"
+        self.count_lbl.setText(msg)
+        tray=getattr(self.window(),"_tray",None)
+        if tray: tray.showMessage(APP_NAME,msg,QSystemTrayIcon.Warning,3000)
+    def _batch_hosts_selected(self):
+        selected=self._selected_cis(); domains=sorted({host for target in batch_connection_targets(selected,unknown_only=True) for host in target["hosts"] if looks_like_domain(host)})
+        if not domains:
+            self.count_lbl.setText("No resolved domains selected")
+            return
+        for domain in domains: self._hosts_block_domain(domain)
+        msg=f"Hosts-blocked {len(domains)} selected domain(s)"; self.count_lbl.setText(msg)
+        tray=getattr(self.window(),"_tray",None)
+        if tray: tray.showMessage(APP_NAME,msg,QSystemTrayIcon.Warning,3000)
     def _fw_block_ip(self,ip,direction="Outbound"):
         ok,out=fw.block_ip(ip,direction); self._refresh_rules()
     def _fw_block_program(self,path):
@@ -4670,6 +4728,7 @@ class ConnectionsTab(QWidget):
         if self._view_cb.currentText()=="Signer Groups": self._show_signer_groups()
         else: self._update_table()
     def _on_view_change(self,text):
+        self._batch_block_btn.setEnabled(text=="Connections"); self._batch_hosts_btn.setEnabled(text=="Connections")
         if text=="Signer Groups": self._show_signer_groups()
         else: self._update_table()
     def _show_signer_groups(self):

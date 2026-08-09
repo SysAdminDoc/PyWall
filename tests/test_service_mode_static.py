@@ -232,6 +232,18 @@ class ServiceModeStaticTests(unittest.TestCase):
         ):
             self.assertIn(token, TEXT)
 
+    def test_multi_select_connection_actions_are_wired(self):
+        for token in (
+            "def batch_connection_targets",
+            "ExtendedSelection",
+            "Block selected unknown",
+            "Hosts block selected",
+            "def _batch_block_selected",
+            "def _batch_hosts_selected",
+            "selectedRows()",
+        ):
+            self.assertIn(token, TEXT)
+
     def test_runtime_dependencies_are_pinned_and_not_auto_installed(self):
         requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("psutil==7.2.2", requirements)

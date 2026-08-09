@@ -111,6 +111,7 @@ BASE_NAMES = {
     "build_firewall_dependency_graph",
     "firewall_rule_dependencies",
     "find_firewall_rules",
+    "batch_connection_targets",
 }
 
 class FakeSignal:
@@ -235,6 +236,22 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_batch_connection_targets_deduplicate_public_unknown_endpoints(self):
+        ns = load_runtime("batch_connection_targets")
+        ci = ns["CI"]
+        targets = ns["batch_connection_targets"]([
+            ci(ra="203.0.113.10", dir="Out", proc="one.exe", host="api.example.test"),
+            ci(ra="203.0.113.10", dir="Out", proc="two.exe", host="api.example.test"),
+            ci(ra="203.0.113.10", dir="Out", proc="blocked.exe", stat="FW:BLOCKED"),
+            ci(ra="192.168.1.20", dir="Out", proc="lan.exe"),
+            ci(ra="198.51.100.4", dir="Listen", proc="server.exe", host="service.example.test"),
+        ])
+        self.assertEqual(len(targets), 2)
+        outbound = next(item for item in targets if item["direction"] == "Outbound")
+        self.assertEqual(outbound["processes"], ["one.exe", "two.exe"])
+        inbound = next(item for item in targets if item["direction"] == "Inbound")
+        self.assertEqual(inbound["hosts"], ["service.example.test"])
+
     def test_firewall_bulk_edit_and_dependency_graph(self):
         ns = load_runtime("FirewallEngine")
         calls = []
