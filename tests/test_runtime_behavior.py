@@ -69,6 +69,10 @@ BASE_NAMES = {
     "ConfigLoadResult",
     "PluginManifest",
     "PluginScanResult",
+    "PluginRegistry",
+    "PluginMarketplaceResult",
+    "PluginMarketplace",
+    "_plugin_version_key",
     "looks_like_domain",
     "get_root_domain",
     "normalize_line",
@@ -199,6 +203,7 @@ def load_runtime(*names):
         "DB_PATH": os.path.join(tempfile.gettempdir(), "pywall-test.db"),
         "FEED_CACHE_DIR": os.path.join(tempfile.gettempdir(), "pywall-feed-cache"),
         "PLUGINS_DIR": os.path.join(tempfile.gettempdir(), "pywall-plugins"),
+        "PLUGIN_MARKETPLACE_URL": "",
         "PLUGIN_LOG_PATH": os.path.join(tempfile.gettempdir(), "plugin_events.log"),
         "FW_TAMPER_LOG_PATH": os.path.join(tempfile.gettempdir(), "firewall_tamper.log"),
         "FW_PFX": "PW_",
@@ -236,6 +241,39 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_plugin_marketplace_checks_https_index_and_reports_updates(self):
+        ns = load_runtime("PluginMarketplace")
+
+        class FakeResponse:
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self): return self
+            def __exit__(self, exc_type, exc, tb): return False
+            def read(self, *args): return self.payload
+
+        local = SimpleNamespace(scan=lambda log_errors=False: SimpleNamespace(
+            plugins=[SimpleNamespace(plugin_id="demo.plugin", version="1.0.0")]
+        ))
+        payload = json.dumps({"plugins": [
+            {"id": "demo.plugin", "name": "Demo", "version": "1.2.0", "url": "https://example.test/demo"},
+            {"id": "old.plugin", "version": "2.0.0", "url": "https://example.test/old"},
+            {"id": "unsafe.plugin", "version": "1.0.0", "url": "http://example.test/unsafe"},
+        ]}).encode()
+        calls = []
+        def opener(request, timeout=15):
+            calls.append((request.full_url, timeout))
+            return FakeResponse(payload)
+
+        market = ns["PluginMarketplace"](registry=local, url="https://example.test/index.json", opener=opener)
+        result = market.check()
+        self.assertEqual(len(result.plugins), 2)
+        self.assertEqual([item["id"] for item in result.updates], ["demo.plugin"])
+        self.assertEqual(calls[0][0], "https://example.test/index.json")
+        self.assertTrue(result.checked_at)
+        self.assertIn("https", result.plugins[0]["url"])
+
+        rejected = market.check("http://example.test/index.json")
+        self.assertIn("https://", rejected.errors[0])
+
     def test_batch_connection_targets_deduplicate_public_unknown_endpoints(self):
         ns = load_runtime("batch_connection_targets")
         ci = ns["CI"]

@@ -161,6 +161,7 @@ TRANSLATION_DIR = os.path.join(CONFIG_DIR, "translations")
 PLUGIN_LOG_PATH = os.path.join(CONFIG_DIR, "plugin_events.log")
 FW_TAMPER_LOG_PATH = os.path.join(CONFIG_DIR, "firewall_tamper.log")
 PLUGIN_MANIFEST_NAMES = ("pywall-plugin.json", "plugin.json")
+PLUGIN_MARKETPLACE_URL = ""
 PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,79}$")
 PLUGIN_ALLOWED_HOOKS = {
     "connection_observed",
@@ -215,6 +216,7 @@ CONFIG_DEFAULTS = {
     "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
     "geoip_mmdb_path": "",
     "plugins_enabled": False,
+    "plugin_marketplace_url": PLUGIN_MARKETPLACE_URL,
     "plugin_enabled_ids": [],
     "plugin_disabled_ids": [],
     "auto_block_inbound": True,
@@ -268,6 +270,8 @@ def _coerce_config_value(key, value):
     if key == "geoip_provider" and text.lower() not in ("ipwhois","maxmind","disabled"):
         raise ValueError("must be ipwhois, maxmind, or disabled")
     if key == "geoip_https_endpoint" and text and not text.lower().startswith("https://"):
+        raise ValueError("must start with https://")
+    if key == "plugin_marketplace_url" and text and not text.lower().startswith("https://"):
         raise ValueError("must start with https://")
     if key == "notif_severity_threshold" and text.lower() not in ("low","medium","high"):
         raise ValueError("must be low, medium, or high")
@@ -621,6 +625,93 @@ class PluginRegistry:
         permissions.setdefault("network",[])
         permissions.setdefault("files",[])
         return permissions
+
+@dataclass
+class PluginMarketplaceResult:
+    source_url:str=""; checked_at:str=""; plugins:list=field(default_factory=list)
+    updates:list=field(default_factory=list); errors:list=field(default_factory=list)
+
+    def summary(self):
+        return {
+            "source_url": self.source_url,
+            "checked_at": self.checked_at,
+            "available": len(self.plugins),
+            "updates": len(self.updates),
+            "errors": list(self.errors),
+        }
+
+def _plugin_version_key(value):
+    parts=[int(part) for part in re.findall(r"\d+",str(value or ""))[:4]]
+    return tuple((parts + [0,0,0,0])[:4])
+
+class PluginMarketplace:
+    """Check a HTTPS plugin index without downloading or executing plugin code."""
+    def __init__(self, registry=None, url=PLUGIN_MARKETPLACE_URL, opener=None):
+        self.registry=registry or PluginRegistry()
+        self.url=str(url or "").strip()
+        self.opener=opener or urllib.request.urlopen
+
+    def _local_versions(self):
+        result={}
+        for plugin in self.registry.scan(log_errors=False).plugins:
+            if plugin.plugin_id: result[plugin.plugin_id]=plugin.version
+        return result
+
+    def _read_index(self, raw):
+        if isinstance(raw,bytes): raw=raw.decode("utf-8",errors="replace")
+        data=json.loads(raw)
+        entries=data.get("plugins",[]) if isinstance(data,dict) else data
+        if not isinstance(entries,list): raise ValueError("marketplace index plugins must be a list")
+        clean=[]; errors=[]
+        for entry in entries:
+            if not isinstance(entry,dict):
+                errors.append("marketplace entry must be an object"); continue
+            plugin_id=_safe_plugin_id(entry.get("id"))
+            version=str(entry.get("version") or "").strip()
+            url=str(entry.get("url") or entry.get("homepage") or "").strip()
+            if not plugin_id or not version:
+                errors.append("marketplace entry needs a valid id and version"); continue
+            if url and not url.lower().startswith("https://"):
+                errors.append(f"{plugin_id}: plugin pointer must use https://"); continue
+            checksum=str(entry.get("sha256") or "").strip().lower()
+            if checksum and not re.match(r"^[0-9a-f]{64}$",checksum):
+                errors.append(f"{plugin_id}: sha256 must be 64 hex characters"); continue
+            clean.append({
+                "id":plugin_id,
+                "name":str(entry.get("name") or plugin_id).strip(),
+                "version":version,
+                "url":url,
+                "sha256":checksum,
+                "description":str(entry.get("description") or "").strip(),
+            })
+        return clean,errors
+
+    def check(self, url=None):
+        target=str(url if url is not None else self.url).strip()
+        result=PluginMarketplaceResult(source_url=target,checked_at=datetime.datetime.now().isoformat(timespec="seconds"))
+        if not target:
+            result.errors.append("Marketplace URL is not configured")
+            return result
+        if not target.lower().startswith("https://"):
+            result.errors.append("Marketplace URL must use https://")
+            return result
+        try:
+            request=urllib.request.Request(target,headers={"User-Agent":f"{APP_NAME}/{APP_VERSION}"})
+            try:
+                with self.opener(request,timeout=15) as response:
+                    raw=response.read(1024*1024+1)
+            except TypeError:
+                with self.opener(request,timeout=15) as response:
+                    raw=response.read()
+            if len(raw)>1024*1024:
+                raise ValueError("marketplace index exceeds 1 MiB")
+            result.plugins,result.errors=self._read_index(raw)
+        except Exception as e:
+            result.errors.append(f"marketplace check failed: {e}")
+            return result
+        local=self._local_versions()
+        result.updates=[entry for entry in result.plugins if entry["id"] in local and _plugin_version_key(entry["version"])>_plugin_version_key(local[entry["id"]])]
+        return result
 
 def _service_log(msg, level="INFO"):
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} [{level}] {msg}"
@@ -5461,12 +5552,17 @@ class ToolsTab(QWidget):
         g3l.addWidget(_make_toolbar_btn("Forensic Bundle","primary",self._create_forensic_bundle))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
         # Plugin trust boundary tools
-        gplug=QGroupBox("Plugin Guardrails"); gplugl=QHBoxLayout(gplug)
+        gplug=QGroupBox("Plugin Guardrails"); gplugl=QVBoxLayout(gplug)
+        plug_row=QHBoxLayout()
         self.plugin_lbl=QLabel("Plugins not scanned")
         self.plugin_lbl.setStyleSheet(f"color:{C['subtext']};font-size:11px;")
-        gplugl.addWidget(self.plugin_lbl,1)
-        gplugl.addWidget(_make_toolbar_btn("Scan Plugins","primary",self._scan_plugins))
-        gplugl.addWidget(_make_toolbar_btn("Open Plugin Folder","dim",self._open_plugins))
+        plug_row.addWidget(self.plugin_lbl,1)
+        plug_row.addWidget(_make_toolbar_btn("Scan Plugins","primary",self._scan_plugins))
+        plug_row.addWidget(_make_toolbar_btn("Open Plugin Folder","dim",self._open_plugins))
+        gplugl.addLayout(plug_row)
+        market_row=QHBoxLayout(); market_row.addWidget(QLabel("Marketplace index:"))
+        self.market_url=QLineEdit(load_runtime_config().data.get("plugin_marketplace_url",PLUGIN_MARKETPLACE_URL)); self.market_url.setPlaceholderText("https://..."); market_row.addWidget(self.market_url,1)
+        market_row.addWidget(_make_toolbar_btn("Check Marketplace","dim",self._check_marketplace)); gplugl.addLayout(market_row)
         lo.addWidget(gplug)
         # Import tools
         g4=QGroupBox("External Import"); g4l=QVBoxLayout(g4)
@@ -5593,6 +5689,15 @@ class ToolsTab(QWidget):
         os.makedirs(PLUGINS_DIR,exist_ok=True)
         if sys.platform=='win32': os.startfile(PLUGINS_DIR)
         else: subprocess.Popen(['xdg-open',PLUGINS_DIR])
+    def _check_marketplace(self):
+        result=PluginMarketplace(url=self.market_url.text().strip()).check()
+        if result.errors:
+            self.slbl.setText(result.errors[0][:200]); return
+        if result.updates:
+            names=", ".join(item["id"] for item in result.updates[:5])
+            self.slbl.setText(f"Marketplace: {len(result.updates)} update(s) available ({names}); no code downloaded")
+        else:
+            self.slbl.setText(f"Marketplace checked: {len(result.plugins)} plugin pointer(s); no updates available")
     def _import_paste(self):
         lines=[l.strip().lower() for l in self.paste.toPlainText().splitlines() if l.strip() and not l.strip().startswith('#')]
         domains=[d for d in lines if looks_like_domain(d)]
