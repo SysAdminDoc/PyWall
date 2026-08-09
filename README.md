@@ -83,6 +83,7 @@ Toggle in the toolbar. Automatically creates block rules for flagged connections
 - MITRE ATT&CK mapping on detector hits (`T1046` network service discovery and `T1110` brute force)
 - Optional TLS SNI ingestion from mitmproxy/Lumen-style JSONL, CSV, or text logs
 - DNS-over-HTTPS endpoint detection with configurable `warn`, `block`, or `ignore` action
+- Optional GeoIP fencing plugin policy for country allowlists or denylists with warn/block enforcement after enrichment
 - Periodic outbound beacon detection for low-reputation or unattributed endpoints
 - IDS-lite YARA-style rule file for connection metadata matches
 - Custom IP/domain blocklist enforcement
@@ -196,6 +197,7 @@ Settings live in `%APPDATA%/PyWall/config.json`. PyWall writes `schema_version`,
 | `geoip_provider` | `ipwhois` | GeoIP source: `ipwhois`, `maxmind`, or `disabled`; plaintext providers are not used |
 | `geoip_https_endpoint` | `https://ipwho.is/{ip}` | HTTPS GeoIP endpoint template used by the default provider |
 | `geoip_mmdb_path` | `""` | Optional local MaxMind-compatible `.mmdb` database path; used before network lookup or exclusively with `geoip_provider: "maxmind"` |
+| `geoip_fence` | `{ "mode": "disabled", "countries": [], "action": "block" }` | Optional country policy: `allow` or `deny` two-letter country codes, with `warn` or `block` action |
 | `plugins_enabled` | `false` | Global plugin execution gate; manifests are scanned but not executable unless this is true |
 | `plugin_marketplace_url` | `""` | Optional HTTPS JSON index URL used for pointer/version checks; no code is downloaded |
 | `plugin_enabled_ids` | `[]` | Explicit allowlist of plugin IDs that may execute declared hooks |
@@ -289,6 +291,7 @@ reports/       Daily and weekly CSV/HTML app usage reports
 | `export_usage_reports` | Daily and weekly app usage report writer for CSV and HTML |
 | `PluginRegistry` | Passive manifest scanner with hook/permission validation, trust-state reporting, and default-deny execution gates |
 | `PluginMarketplace` | HTTPS-only marketplace pointer and version checker; downloads no plugin code |
+| `GeoIPFence` | Default-disabled country allow/deny adapter with deduplicated firewall enforcement and service status evidence |
 | `HeadlessMonitor` | Service-mode DNS, connection, event, history, config reload, restored state, IPC, and threat auto-block loop |
 | `ServiceIPCServer` | Token-authenticated pywin32 named-pipe status server |
 | `PyWallWindowsService` | pywin32 Windows Service wrapper |

@@ -116,6 +116,7 @@ BASE_NAMES = {
     "firewall_rule_dependencies",
     "find_firewall_rules",
     "batch_connection_targets",
+    "GeoIPFence",
 }
 
 class FakeSignal:
@@ -241,6 +242,23 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_geoip_fence_allowlist_warns_and_blocks_once(self):
+        ns = load_runtime("GeoIPFence")
+        calls = []
+        ns["fw"] = SimpleNamespace(block_ip=lambda ip, direction: (calls.append((ip, direction)) or (True, "ok")))
+        fence = ns["GeoIPFence"]("test")
+        warnings = fence.configure({"geoip_fence": {"mode": "allow", "countries": ["US"], "action": "block"}})
+        self.assertEqual(warnings, [])
+        allowed = ns["CI"](ra="203.0.113.1", cc="US", country="United States", proc="ok.exe", dir="Out")
+        denied = ns["CI"](ra="203.0.113.2", cc="DE", country="Germany", proc="bad.exe", dir="Out")
+        events = fence.check([allowed, denied, denied])
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["blocked"])
+        self.assertEqual(calls, [("203.0.113.2", "Outbound")])
+        self.assertEqual(fence.snapshot()["matched"], 2)
+        self.assertEqual(fence.configure({"geoip_fence": {"mode": "allow", "countries": [], "action": "block"}}), ["geoip_fence requires at least one country"])
+        self.assertEqual(fence.snapshot()["mode"], "disabled")
+
     def test_plugin_marketplace_checks_https_index_and_reports_updates(self):
         ns = load_runtime("PluginMarketplace")
 
@@ -726,6 +744,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             monitor._quota = FakeConfigurable({"configured": 1})
             monitor._doh = FakeConfigurable({"action": "warn"})
             monitor._ids = FakeConfigurable({"rules": 0})
+            monitor._geo_fence = FakeConfigurable({"mode": "disabled"})
             monitor._geo_w = FakeConfigurable({"provider": "maxmind"})
             monitor._tls_w = FakeConfigurable({"enabled": True})
 
@@ -736,7 +755,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(monitor._timer.interval, 5000)
             self.assertTrue(monitor._last_config_reload)
             self.assertEqual(monitor._quota.calls[-1][0], "load")
-            for worker in (monitor._doh, monitor._ids, monitor._geo_w, monitor._tls_w):
+            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
 

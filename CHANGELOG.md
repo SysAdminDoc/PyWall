@@ -10,6 +10,7 @@ All notable changes to PyWall will be documented in this file.
 - Added: Firewall dependency graph view showing shared groups, programs, endpoints, ports, and protocols before rule changes.
 - Added: Extended connection selection with deduplicated batch firewall and hosts-file actions for unknown public endpoints.
 - Added: HTTPS-only plugin marketplace pointer/version checks with no automatic download or execution path.
+- Added: Default-disabled GeoIP country fencing with allow/deny policies, warn/block actions, deduplicated firewall enforcement, and service evidence.
 
 ## [v4.2.0] - 2026-06-30
 

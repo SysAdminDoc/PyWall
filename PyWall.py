@@ -215,6 +215,7 @@ CONFIG_DEFAULTS = {
     "geoip_provider": "ipwhois",
     "geoip_https_endpoint": GEOIP_HTTPS_ENDPOINT,
     "geoip_mmdb_path": "",
+    "geoip_fence": {"mode": "disabled", "countries": [], "action": "block"},
     "plugins_enabled": False,
     "plugin_marketplace_url": PLUGIN_MARKETPLACE_URL,
     "plugin_enabled_ids": [],
@@ -2373,6 +2374,62 @@ class RuleScheduler:
 fw = FirewallEngine()
 rule_scheduler = RuleScheduler(fw)
 
+class GeoIPFence:
+    """Optional country allow/deny policy applied to enriched live connections."""
+    def __init__(self, source="PyWall"):
+        self.source=source; self._lock=Lock(); self._mode="disabled"; self._countries=set(); self._action="block"; self._blocked=set(); self._warnings=[]; self._checked=0; self._matched=0
+    def configure(self, config=None, mtime=None):
+        raw=(config or {}).get("geoip_fence",{}) if isinstance(config or {},dict) else {}
+        if not isinstance(raw,dict): raw={}
+        mode=str(raw.get("mode","disabled") or "disabled").strip().lower()
+        action=str(raw.get("action","block") or "block").strip().lower()
+        countries=set()
+        for item in raw.get("countries",[]) if isinstance(raw.get("countries",[]),list) else []:
+            value=str(item or "").strip().upper()
+            if re.match(r"^[A-Z]{2}$",value): countries.add(value)
+        warnings=[]
+        if mode not in ("disabled","allow","deny"): warnings.append("geoip_fence.mode must be disabled, allow, or deny"); mode="disabled"
+        if action not in ("warn","block"): warnings.append("geoip_fence.action must be warn or block"); action="block"
+        if mode != "disabled" and not countries: warnings.append("geoip_fence requires at least one country"); mode="disabled"
+        with self._lock:
+            self._mode=mode; self._countries=countries; self._action=action; self._warnings=warnings; self._blocked=set()
+        return list(warnings)
+    def _matches(self, ci):
+        cc=str(getattr(ci,"cc","") or "").strip().upper()
+        country=str(getattr(ci,"country","") or "").strip().upper()
+        if cc in self._countries: return True
+        return any(value and value in country for value in self._countries)
+    def check(self, conns, db=None):
+        with self._lock:
+            mode=self._mode; countries=set(self._countries); action=self._action
+        if mode == "disabled": return []
+        events=[]
+        for ci in (conns or []):
+            ip=str(getattr(ci,"ra","") or "").strip()
+            if not ip or ip in ("*","-") or PRIV_RE.match(ip): continue
+            with self._lock: self._checked+=1
+            in_set=self._matches(ci)
+            violation=(mode == "allow" and not in_set) or (mode == "deny" and in_set)
+            if not violation: continue
+            with self._lock: self._matched+=1
+            key=f"{ip}:{getattr(ci,'dir','Out')}"
+            with self._lock:
+                if key in self._blocked: continue
+                self._blocked.add(key)
+            blocked=False; message=f"GeoIP fence {mode} policy matched {getattr(ci,'country','-')} ({getattr(ci,'cc','-')})"
+            if action == "block":
+                direction="Inbound" if str(getattr(ci,"dir","Out")).lower() in ("in","inbound","listen") else "Outbound"
+                ok,_=fw.block_ip(ip,direction); blocked=bool(ok)
+            event={"ip":ip,"country":getattr(ci,"country","-"),"cc":getattr(ci,"cc",""),"app":getattr(ci,"proc","?"),"action":action,"blocked":blocked,"message":message}
+            events.append(event)
+            if db is not None:
+                try: db.log_event(ip,"geoip_fence",getattr(ci,"proc","?"),message)
+                except: pass
+        return events
+    def snapshot(self):
+        with self._lock:
+            return {"mode":self._mode,"action":self._action,"countries":sorted(self._countries),"checked":self._checked,"matched":self._matched,"blocked":len(self._blocked),"warnings":list(self._warnings)}
+
 # ─── Hosts File Manager ─────────────────────────────────────────────────────
 class HostsFileManager:
     def __init__(self): self.path=HOSTS_PATH; self.entries=[]; self.raw=[]
@@ -3783,6 +3840,7 @@ class HeadlessMonitor(QObject):
         self._quota = BandwidthQuotaEnforcer("PyWallService")
         self._doh = DoHDetector("PyWallService")
         self._ids = IDSRuleEngine("PyWallService")
+        self._geo_fence = GeoIPFence("PyWallService")
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -3868,6 +3926,8 @@ class HeadlessMonitor(QObject):
             _service_log(f"DoH {ev.action}: {ev.app} -> {ev.endpoint}; blocked={ev.blocked}; {ev.message}")
         for hit in self._ids.check(live, db=self.db):
             _service_log(f"IDS {hit['rule']}: {hit['app']} -> {hit['endpoint']}; blocked={hit['blocked']}; {hit['message']}")
+        for event in self._geo_fence.check(live, db=self.db):
+            _service_log(f"GeoIP fence {event['action']}: {event['app']} -> {event['ip']}; blocked={event['blocked']}; {event['message']}")
         self._enforce_threats()
 
     def snapshot(self):
@@ -3899,6 +3959,7 @@ class HeadlessMonitor(QObject):
             "doh": self._doh.snapshot(),
             "ids": self._ids.snapshot(),
             "geoip": self._geo_w.snapshot(),
+            "geoip_fence": self._geo_fence.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
             "firewall_tamper": fw.tamper_summary(),
@@ -3963,12 +4024,14 @@ class HeadlessMonitor(QObject):
         self._quota.load_config(cfg, result.mtime)
         self._doh.configure(cfg, result.mtime)
         self._ids.configure(cfg, result.mtime)
+        fence_warnings=self._geo_fence.configure(cfg, result.mtime) or []
         self._geo_w.configure(cfg, result.mtime)
         self._tls_w.configure(cfg, result.mtime)
         self._config_mtime = result.mtime
         stamp = datetime.datetime.now().isoformat(timespec="seconds")
         self._last_config_reload = f"recovered: {stamp}" if result.recovered else f"warnings: {stamp}" if result.warnings else stamp
-        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
+        for warning in fence_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra, "fw_blocked", ci.proc, f"FW blocked: {ci.ra}:{ci.rp}")
@@ -5728,7 +5791,7 @@ class MainWindow(QMainWindow):
         self._notif=NotificationController(self._config_result.data)
 
         # Core objects
-        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI")
+        self.db=HostsDB(); self.hm=HostsFileManager(); self.conn_db=ConnDB(); self._quota=BandwidthQuotaEnforcer("PyWallGUI"); self._doh=DoHDetector("PyWallGUI"); self._ids=IDSRuleEngine("PyWallGUI"); self._geo_fence=GeoIPFence("PyWallGUI"); self._geo_fence.configure(self._config_result.data)
 
         # Background workers
         self._dns_w=DNSResolveWorker(); self._dns_w.start()
@@ -5921,6 +5984,8 @@ class MainWindow(QMainWindow):
             self._on_doh_event(ev)
         for hit in self._ids.check(live, db=self.db):
             self._on_ids_hit(hit)
+        for event in self._geo_fence.check(live, db=self.db):
+            self._on_geoip_fence_event(event)
 
     def _on_evt_batch(self,evts):
         if evts:
@@ -5955,6 +6020,16 @@ class MainWindow(QMainWindow):
         msg=f"{title}: {hit.get('rule')} {hit.get('app')} -> {hit.get('endpoint')}"
         if self._notif.should_notify(key, severity="high", title=title, message=msg):
             self._tray.showMessage(APP_NAME, msg, QSystemTrayIcon.Warning, 4000)
+
+    def _on_geoip_fence_event(self,event):
+        self._update_status(f"GeoIP fence {event.get('action','warn')} {event.get('ip','')}")
+        tray=getattr(self,"_tray",None)
+        if not tray: return
+        key=f"geoip-fence:{event.get('ip')}"
+        title="GeoIP fence blocked" if event.get("blocked") else "GeoIP fence matched"
+        message=f"{title}: {event.get('app','?')} -> {event.get('ip','?')} ({event.get('cc','-')})"
+        if self._notif.should_notify(key, severity="high" if event.get("blocked") else "medium", title=title, message=message):
+            tray.showMessage(APP_NAME,message,QSystemTrayIcon.Warning,4000)
 
     def _on_fw_block(self,ci):
         self.db.log_event(ci.host if ci.host not in ("-","...") else ci.ra,'fw_blocked',ci.proc,f'FW blocked: {ci.ra}:{ci.rp}')
