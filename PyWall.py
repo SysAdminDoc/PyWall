@@ -225,6 +225,8 @@ CONFIG_DEFAULTS = {
     "external_notifiers": {"enabled": False, "minimum_severity": "medium", "pushover": {"enabled": False, "endpoint": "https://api.pushover.net/1/messages.json", "token": "", "user": ""}, "ntfy": {"enabled": False, "endpoint": "https://ntfy.sh", "topic": "", "token": ""}},
     "rest_api": {"enabled": False, "host": "127.0.0.1", "port": 8765, "token": "", "tls_cert": "", "tls_key": ""},
     "fleet_agents": [],
+    "vpn_awareness_enabled": True,
+    "hyperv_awareness_enabled": True,
     "plugins_enabled": False,
     "plugin_marketplace_url": PLUGIN_MARKETPLACE_URL,
     "plugin_enabled_ids": [],
@@ -768,7 +770,13 @@ IGNORED_DOMAINS = {'localhost','localhost.localdomain','local','broadcasthost','
 DOMAIN_RE = re.compile(r'^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$')
 IPV4_RE = re.compile(r'^(25[0-5]|2[0-4]\d|[01]?\d\d?\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$')
 WILDCARD_RE = re.compile(r'^\*\.?(.*)')
-PRIV_RE = re.compile(r'^(0\.0\.0\.0|127\.|::1$|::$|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|fe80:|fd)')
+class _PrivateIPPattern:
+    """Regex-compatible matcher that treats every non-global IP as local/reserved."""
+    def match(self, value):
+        text=str(value or "").strip()
+        try: return bool(text) and not ipaddress.ip_address(text).is_global
+        except ValueError: return bool(re.match(r'^(0\.0\.0\.0|127\.|169\.254\.|::1$|::$|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|fe80:|fc|fd)',text,re.IGNORECASE))
+PRIV_RE = _PrivateIPPattern()
 PORTS = {20:"FTP-D",21:"FTP",22:"SSH",25:"SMTP",53:"DNS",80:"HTTP",110:"POP3",123:"NTP",
          135:"RPC",143:"IMAP",389:"LDAP",443:"HTTPS",445:"SMB",993:"IMAPS",995:"POP3S",
          1433:"MSSQL",3306:"MySQL",3389:"RDP",5353:"mDNS",5432:"Postgres",5900:"VNC",8080:"Alt-HTTP"}
@@ -2442,6 +2450,70 @@ class GeoIPFence:
     def snapshot(self):
         with self._lock:
             return {"mode":self._mode,"action":self._action,"countries":sorted(self._countries),"checked":self._checked,"matched":self._matched,"blocked":len(self._blocked),"warnings":list(self._warnings)}
+
+class VPNInterfaceDetector:
+    """Detect WireGuard/OpenVPN-style adapters without changing firewall policy."""
+    def __init__(self, source="PyWall"):
+        self.source=source; self._lock=Lock(); self._enabled=True; self._interfaces=[]; self._warnings=[]
+    def configure(self, config=None, mtime=None):
+        cfg=config if isinstance(config,dict) else {}; enabled=cfg.get("vpn_awareness_enabled",True)
+        if isinstance(enabled,str): enabled=enabled.lower() in ("1","true","yes","on")
+        with self._lock: self._enabled=bool(enabled); self._warnings=[]
+        return []
+    def scan(self, adapters=None):
+        with self._lock: enabled=self._enabled
+        if not enabled: return []
+        if adapters is None:
+            try: adapters={name:[{"address":item.address,"family":str(getattr(item.family,"name",item.family))} for item in values] for name,values in psutil.net_if_addrs().items()}
+            except Exception as e:
+                with self._lock: self._warnings=[str(e)]
+                return []
+        found=[]
+        for name, raw in (adapters or {}).items():
+            label=str(name or ""); details=""; addresses=[]; status="unknown"
+            if isinstance(raw,dict): details=str(raw.get("description","") or ""); status=str(raw.get("status","unknown") or "unknown"); values=raw.get("addresses",[])
+            else: values=raw
+            identity=f"{label} {details}".lower()
+            kind="WireGuard" if any(token in identity for token in ("wireguard","wire guard","wg-","wg0")) else "OpenVPN" if any(token in identity for token in ("openvpn","tap","tun")) else ""
+            if not kind: continue
+            for value in values or []:
+                address=value.get("address","") if isinstance(value,dict) else str(value or "")
+                address=str(address).split("%",1)[0].strip()
+                if address and address not in addresses: addresses.append(address)
+            found.append({"name":label,"description":details,"kind":kind,"status":status,"addresses":addresses})
+        with self._lock: self._interfaces=found
+        return list(found)
+    def snapshot(self):
+        with self._lock: return {"enabled":self._enabled,"interfaces":[dict(item,addresses=list(item.get("addresses",[]))) for item in self._interfaces],"warnings":list(self._warnings)}
+
+class HyperVSwitchInventory:
+    """Read-only Hyper-V virtual-switch inventory for firewall context."""
+    def __init__(self, source="PyWall"):
+        self.source=source; self._lock=Lock(); self._enabled=True; self._switches=[]; self._warnings=[]
+    def configure(self, config=None, mtime=None):
+        cfg=config if isinstance(config,dict) else {}; enabled=cfg.get("hyperv_awareness_enabled",True)
+        if isinstance(enabled,str): enabled=enabled.lower() in ("1","true","yes","on")
+        with self._lock: self._enabled=bool(enabled); self._warnings=[]
+        return []
+    def scan(self, switches=None):
+        with self._lock: enabled=self._enabled
+        if not enabled: return []
+        if switches is None:
+            ok,out=_ps("Get-VMSwitch -ErrorAction SilentlyContinue | Select-Object Name,SwitchType,NetAdapterName,Status | ConvertTo-Json -Compress",15)
+            if not ok or not out: switches=[]
+            else:
+                try: switches=json.loads(out); switches=switches if isinstance(switches,list) else [switches]
+                except Exception as e:
+                    with self._lock: self._warnings=[str(e)]
+                    switches=[]
+        found=[]
+        for item in switches or []:
+            if not isinstance(item,dict): continue
+            found.append({"name":str(item.get("Name",item.get("name","")) or ""),"switch_type":str(item.get("SwitchType",item.get("switch_type","")) or ""),"adapter":str(item.get("NetAdapterName",item.get("adapter","")) or ""),"status":str(item.get("Status",item.get("status","")) or "")})
+        with self._lock: self._switches=found
+        return list(found)
+    def snapshot(self):
+        with self._lock: return {"enabled":self._enabled,"switches":[dict(item) for item in self._switches],"warnings":list(self._warnings)}
 
 class MaxMindDBUpdater:
     """Default-disabled HTTPS MaxMind-compatible database updater."""
@@ -4276,6 +4348,8 @@ class HeadlessMonitor(QObject):
         self._external_notifier = ExternalNotifier()
         self._mmdb_updater = MaxMindDBUpdater()
         self._fleet = FleetManager()
+        self._vpn = VPNInterfaceDetector("PyWallService")
+        self._hyperv = HyperVSwitchInventory("PyWallService")
         self._dns_w = DNSResolveWorker()
         self._who_w = WhoWorker()
         self._geo_w = GeoIPWorker()
@@ -4408,6 +4482,8 @@ class HeadlessMonitor(QObject):
             "external_notifiers": self._external_notifier.snapshot(),
             "geoip_mmdb_update": self._mmdb_updater.snapshot(),
             "fleet": self._fleet.snapshot(),
+            "vpn_interfaces": self._vpn.snapshot(),
+            "hyperv_switches": self._hyperv.snapshot(),
             "rest_api": self._rest_api.snapshot(),
             "tls_sni": self._tls_w.snapshot(),
             "plugins": self._plugins.scan(log_errors=False).summary(),
@@ -4479,6 +4555,8 @@ class HeadlessMonitor(QObject):
         mmdb_warnings=self._mmdb_updater.configure(cfg, result.mtime) or []
         rest_warnings=self._rest_api.configure(cfg, result.mtime) or []
         fleet_warnings=self._fleet.configure(cfg, result.mtime) or []
+        vpn_warnings=self._vpn.configure(cfg, result.mtime) or []
+        hyperv_warnings=self._hyperv.configure(cfg, result.mtime) or []
         rest_state=self._rest_api.snapshot()
         if rest_state.get("running") and not rest_state.get("enabled"): self._rest_api.stop()
         elif rest_state.get("enabled") and not rest_state.get("running"):
@@ -4495,6 +4573,8 @@ class HeadlessMonitor(QObject):
         for warning in mmdb_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in rest_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         for warning in fleet_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        for warning in vpn_warnings: _service_log(f"Config warning: {warning}", "WARNING")
+        for warning in hyperv_warnings: _service_log(f"Config warning: {warning}", "WARNING")
         _service_log(f"Config reloaded: auto_block {old_auto}->{self.auto_block}, poll {old_poll}->{self.poll_seconds}s, quotas {self._quota.snapshot().get('configured',0)}, doh={self._doh.snapshot().get('action')}, ids={self._ids.snapshot().get('rules',0)}, geoip={self._geo_w.snapshot().get('provider')}, geoip_fence={self._geo_fence.snapshot().get('mode')}, notifiers={self._external_notifier.snapshot().get('sent',0)}, tls_sni={self._tls_w.snapshot().get('enabled')}")
 
     def _on_fw_blocked(self, ci):
@@ -6145,7 +6225,7 @@ class FleetViewDialog(QDialog):
 # ─── Tools Tab ───────────────────────────────────────────────────────────────
 class ToolsTab(QWidget):
     def __init__(self,db,hm):
-        super().__init__(); self.db=db; self.hm=hm; self.fleet=FleetManager(load_runtime_config().data); self._build()
+        super().__init__(); self.db=db; self.hm=hm; self.fleet=FleetManager(load_runtime_config().data); self.vpn=VPNInterfaceDetector("PyWallGUI"); self.vpn.configure(load_runtime_config().data); self.hyperv=HyperVSwitchInventory("PyWallGUI"); self.hyperv.configure(load_runtime_config().data); self._build()
     def _build(self):
         lo=QVBoxLayout(self); lo.setContentsMargins(20,16,20,16); lo.setSpacing(10)
         # Background service tools
@@ -6176,6 +6256,8 @@ class ToolsTab(QWidget):
         g3l.addWidget(_make_toolbar_btn("Forensic Bundle","primary",self._create_forensic_bundle))
         g3l.addWidget(_make_toolbar_btn("Update MaxMind DB","dim",self._update_maxmind))
         g3l.addWidget(_make_toolbar_btn("Fleet View","dim",self._fleet_view))
+        g3l.addWidget(_make_toolbar_btn("Scan VPN Adapters","dim",self._scan_vpn))
+        g3l.addWidget(_make_toolbar_btn("Hyper-V Switches","dim",self._scan_hyperv))
         g3l.addWidget(_make_toolbar_btn("Open Config Folder","dim",self._open_config)); g3l.addStretch(); lo.addWidget(g3)
         # Plugin trust boundary tools
         gplug=QGroupBox("Plugin Guardrails"); gplugl=QVBoxLayout(gplug)
@@ -6296,6 +6378,10 @@ class ToolsTab(QWidget):
         else: self.slbl.setText(f"MaxMind update failed: {result.get('reason','unknown error')}")
     def _fleet_view(self):
         FleetViewDialog(self.fleet,self).exec_()
+    def _scan_vpn(self):
+        found=self.vpn.scan(); self.slbl.setText("VPN adapters: " + ", ".join(f"{item['kind']} ({item['name']})" for item in found) if found else "No WireGuard/OpenVPN adapters detected")
+    def _scan_hyperv(self):
+        found=self.hyperv.scan(); self.slbl.setText("Hyper-V switches: " + ", ".join(item["name"] or "(unnamed)" for item in found) if found else "No Hyper-V virtual switches detected or Hyper-V is unavailable")
     def _create_forensic_bundle(self):
         path,_=QFileDialog.getSaveFileName(self,"Save Forensic Bundle",os.path.join(REPORT_DIR,f"pywall-incident-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),"ZIP files (*.zip)")
         if not path: return

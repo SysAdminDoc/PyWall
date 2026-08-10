@@ -322,6 +322,18 @@ class ServiceModeStaticTests(unittest.TestCase):
         for token in ("function Block-PyWallIP", "function Allow-PyWallPort", "function Export-PyWallConfig", "Invoke-RestMethod", "/v1/status", "/v1/config/export"):
             self.assertIn(token, POWERSHELL_TEXT)
 
+    def test_ipv6_address_audit_is_wired(self):
+        for token in ("class _PrivateIPPattern", "ipaddress.ip_address(text).is_global", "fe80:", "fc|fd"):
+            self.assertIn(token, TEXT)
+
+    def test_vpn_interface_awareness_is_wired(self):
+        for token in ("vpn_awareness_enabled", "class VPNInterfaceDetector", "WireGuard", "OpenVPN", "Scan VPN Adapters", '"vpn_interfaces"'):
+            self.assertIn(token, TEXT)
+
+    def test_hyperv_switch_inventory_is_wired(self):
+        for token in ("hyperv_awareness_enabled", "class HyperVSwitchInventory", "Get-VMSwitch", "Hyper-V Switches", '"hyperv_switches"'):
+            self.assertIn(token, TEXT)
+
     def test_runtime_dependencies_are_pinned_and_not_auto_installed(self):
         requirements = (pathlib.Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("psutil==7.2.2", requirements)

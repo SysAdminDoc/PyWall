@@ -128,6 +128,9 @@ BASE_NAMES = {
     "GEOIP_UPDATE_STATE_PATH",
     "ScheduledReportEmail",
     "ExternalNotifier",
+    "_PrivateIPPattern",
+    "VPNInterfaceDetector",
+    "HyperVSwitchInventory",
     "_api_json_safe",
     "encrypt_config_export_bytes",
     "decrypt_config_export_bytes",
@@ -265,6 +268,30 @@ def load_runtime(*names):
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
+    def test_ipv4_and_ipv6_non_global_address_filtering(self):
+        matcher = load_runtime("_PrivateIPPattern")["_PrivateIPPattern"]()
+        self.assertTrue(matcher.match("10.0.0.1"))
+        self.assertTrue(matcher.match("fe80::1"))
+        self.assertTrue(matcher.match("fc00::1"))
+        self.assertFalse(matcher.match("2001:4860:4860::8888"))
+        self.assertFalse(matcher.match("8.8.8.8"))
+
+    def test_vpn_interface_detection_classifies_wireguard_and_openvpn(self):
+        detector = load_runtime("VPNInterfaceDetector")["VPNInterfaceDetector"]()
+        found = detector.scan({
+            "WireGuard Tunnel": {"description": "WireGuard", "status": "up", "addresses": ["10.8.0.2", "fd00::2%12"]},
+            "OpenVPN TAP": {"description": "OpenVPN TAP Adapter", "status": "up", "addresses": ["10.9.0.2"]},
+            "Ethernet": {"description": "Intel Ethernet", "status": "up", "addresses": ["192.168.1.10"]},
+        })
+        self.assertEqual([item["kind"] for item in found], ["WireGuard", "OpenVPN"])
+        self.assertEqual(found[0]["addresses"], ["10.8.0.2", "fd00::2"])
+
+    def test_hyperv_inventory_normalizes_switch_records(self):
+        inventory = load_runtime("HyperVSwitchInventory")["HyperVSwitchInventory"]()
+        found = inventory.scan([{"Name": "PyWall External", "SwitchType": "External", "NetAdapterName": "Ethernet", "Status": "Up"}, {"name": "Default Switch", "switch_type": "Internal"}])
+        self.assertEqual(found[0]["name"], "PyWall External")
+        self.assertEqual(found[0]["switch_type"], "External")
+        self.assertEqual(found[1]["name"], "Default Switch")
     def test_local_rest_api_auth_actions_and_encrypted_export(self):
         ns = load_runtime("LocalRestAPI", "encrypt_config_export_bytes", "decrypt_config_export_bytes")
         monitor = SimpleNamespace(snapshot=lambda: {"version": "test", "status": "RUNNING"})
@@ -929,6 +956,8 @@ class RuntimeBehaviorTests(unittest.TestCase):
             monitor._mmdb_updater = FakeConfigurable({"enabled": False})
             monitor._rest_api = FakeConfigurable({"enabled": False})
             monitor._fleet = FakeConfigurable({"configured": 0})
+            monitor._vpn = FakeConfigurable({"enabled": True, "interfaces": []})
+            monitor._hyperv = FakeConfigurable({"enabled": True, "switches": []})
             monitor._geo_w = FakeConfigurable({"provider": "maxmind"})
             monitor._tls_w = FakeConfigurable({"enabled": True})
 
@@ -939,7 +968,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(monitor._timer.interval, 5000)
             self.assertTrue(monitor._last_config_reload)
             self.assertEqual(monitor._quota.calls[-1][0], "load")
-            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._mmdb_updater, monitor._rest_api, monitor._fleet, monitor._geo_w, monitor._tls_w):
+            for worker in (monitor._doh, monitor._ids, monitor._geo_fence, monitor._report_email, monitor._external_notifier, monitor._mmdb_updater, monitor._rest_api, monitor._fleet, monitor._vpn, monitor._hyperv, monitor._geo_w, monitor._tls_w):
                 self.assertEqual(worker.calls[-1][0], "configure")
                 self.assertEqual(worker.calls[-1][1]["geoip_provider"], "maxmind")
 
